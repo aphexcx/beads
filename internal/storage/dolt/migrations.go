@@ -31,6 +31,7 @@ var migrationsList = []Migration{
 	{"uuid_primary_keys", migrations.MigrateUUIDPrimaryKeys},
 	{"add_no_history_column", migrations.MigrateAddNoHistoryColumn},
 	{"drop_hop_columns", migrations.MigrateDropHOPColumns},
+	{"comment_sync_columns", migrations.MigrateCommentSyncColumns},
 }
 
 // RunMigrations executes all registered Dolt migrations in order.
@@ -51,7 +52,7 @@ func RunMigrations(db *sql.DB) error {
 		"wisp_dependencies", "labels", "wisp_labels", "comments",
 		"wisp_comments", "metadata", "child_counters", "issue_counter",
 		"issue_snapshots", "compaction_snapshots", "federation_peers",
-		"dolt_ignore",
+		"dolt_ignore", "attachments",
 	}
 	for _, table := range migrationTables {
 		_, _ = db.Exec("CALL DOLT_ADD(?)", table)

@@ -267,11 +267,11 @@ func (t *Tracker) FetchComments(ctx context.Context, externalIssueID string, sin
 		if c.User != nil {
 			tc.Author = c.User.Name
 		}
-		if t, err := time.Parse(time.RFC3339, c.CreatedAt); err == nil {
-			tc.CreatedAt = t
+		if ts, err := time.Parse(time.RFC3339, c.CreatedAt); err == nil {
+			tc.CreatedAt = ts
 		}
-		if t, err := time.Parse(time.RFC3339, c.UpdatedAt); err == nil {
-			tc.UpdatedAt = t
+		if ts, err := time.Parse(time.RFC3339, c.UpdatedAt); err == nil {
+			tc.UpdatedAt = ts
 		}
 		result = append(result, tc)
 	}
@@ -302,13 +302,14 @@ func (t *Tracker) FetchAttachments(ctx context.Context, externalIssueID string) 
 			ID:       a.ID,
 			Filename: a.Title,
 			URL:      a.URL,
-			MimeType: a.Metadata.MimeType,
+			// Note: MimeType is not populated because Linear's attachment
+			// API does not expose metadata in the GraphQL schema.
 		}
 		if a.Creator != nil {
 			ta.Creator = a.Creator.Name
 		}
-		if t, err := time.Parse(time.RFC3339, a.CreatedAt); err == nil {
-			ta.CreatedAt = t
+		if ts, err := time.Parse(time.RFC3339, a.CreatedAt); err == nil {
+			ta.CreatedAt = ts
 		}
 		result = append(result, ta)
 	}

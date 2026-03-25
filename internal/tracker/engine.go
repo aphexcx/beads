@@ -161,19 +161,31 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		result.Stats.Errors += pushStats.Errors
 	}
 
+	// Phases 4 & 5 share a cached map of external issue lookups to avoid
+	// redundant FetchIssue calls (N+1 problem).
+	needComments := !opts.NoComments
+	_, hasCommentSyncer := e.Tracker.(CommentSyncer)
+	needAttachments := !opts.NoAttachments && !opts.CommentsOnly
+	_, hasAttachmentFetcher := e.Tracker.(AttachmentFetcher)
+
+	var extIssueCache map[string]*TrackerIssue
+	if (needComments && hasCommentSyncer) || (needAttachments && hasAttachmentFetcher) {
+		extIssueCache = e.buildExtIssueCache(ctx)
+	}
+
 	// Phase 4: Comment sync (if tracker supports it and not disabled)
-	if !opts.NoComments {
+	if needComments {
 		if syncer, ok := e.Tracker.(CommentSyncer); ok {
-			commentStats := e.doCommentSync(ctx, opts, syncer)
+			commentStats := e.doCommentSync(ctx, opts, syncer, extIssueCache)
 			result.Stats.CommentsPulled += commentStats.Pulled
 			result.Stats.CommentsPushed += commentStats.Pushed
 		}
 	}
 
 	// Phase 5: Attachment pull (if tracker supports it and not disabled)
-	if !opts.NoAttachments {
+	if needAttachments {
 		if fetcher, ok := e.Tracker.(AttachmentFetcher); ok {
-			attachStats := e.doAttachmentPull(ctx, opts, fetcher)
+			attachStats := e.doAttachmentPull(ctx, opts, fetcher, extIssueCache)
 			result.Stats.AttachmentsPulled += attachStats.Pulled
 		}
 	}
@@ -673,10 +685,42 @@ type attachmentPullStats struct {
 	Pulled int
 }
 
+// buildExtIssueCache builds a map of beads issueID -> TrackerIssue for all
+// local issues that have an external_ref belonging to this tracker. This is
+// called once and shared by comment sync and attachment pull to eliminate
+// redundant FetchIssue API calls.
+func (e *Engine) buildExtIssueCache(ctx context.Context) map[string]*TrackerIssue {
+	cache := make(map[string]*TrackerIssue)
+
+	filter := types.IssueFilter{}
+	issues, err := e.Store.SearchIssues(ctx, "", filter)
+	if err != nil {
+		e.warn("buildExtIssueCache: failed to search issues: %v", err)
+		return cache
+	}
+
+	for _, issue := range issues {
+		extRef := derefStr(issue.ExternalRef)
+		if extRef == "" || !e.Tracker.IsExternalRef(extRef) {
+			continue
+		}
+		extID := e.Tracker.ExtractIdentifier(extRef)
+		if extID == "" {
+			continue
+		}
+		extIssue, fetchErr := e.Tracker.FetchIssue(ctx, extID)
+		if fetchErr != nil || extIssue == nil {
+			continue
+		}
+		cache[issue.ID] = extIssue
+	}
+	return cache
+}
+
 // doCommentSync synchronizes comments between beads and the external tracker.
 // Pull: For issues with external_ref, fetch remote comments and create locally if not found.
 // Push: For local comments without external_ref, create in the tracker and store the returned ID.
-func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer CommentSyncer) commentSyncStats {
+func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer CommentSyncer, extIssueCache map[string]*TrackerIssue) commentSyncStats {
 	ctx, span := syncTracer.Start(ctx, "tracker.comment_sync",
 		trace.WithAttributes(attribute.String("sync.tracker", e.Tracker.DisplayName())),
 	)
@@ -707,23 +751,36 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 			continue
 		}
 
-		// Extract the external tracker's internal ID for API calls.
-		// For Linear, the external_ref is a URL — we need the tracker's UUID.
-		// We use TrackerIssue.ID which is the internal ID.
-		extID := e.Tracker.ExtractIdentifier(extRef)
-		if extID == "" {
-			continue
-		}
-
-		// Fetch the issue to get its internal tracker ID
-		extIssue, err := e.Tracker.FetchIssue(ctx, extID)
-		if err != nil || extIssue == nil {
+		// Use the pre-built cache to avoid redundant FetchIssue calls.
+		extIssue := extIssueCache[issue.ID]
+		if extIssue == nil {
 			continue
 		}
 
 		// PULL: Fetch remote comments and import missing ones
 		if opts.Pull || (!opts.Pull && !opts.Push) {
-			remoteComments, err := syncer.FetchComments(ctx, extIssue.ID, since)
+			// Determine effective cutoff for this issue. If the issue has never
+			// had comments synced (no local comments with an external_ref), use
+			// zero time to fetch all comments. This prevents suppressing
+			// preexisting comments on issues newly entering sync.
+			issueSince := since
+			if !since.IsZero() {
+				hasExtRefComment := false
+				existingComments, cerr := e.Store.GetIssueComments(ctx, issue.ID)
+				if cerr == nil {
+					for _, ec := range existingComments {
+						if ec.ExternalRef != "" {
+							hasExtRefComment = true
+							break
+						}
+					}
+				}
+				if !hasExtRefComment {
+					issueSince = time.Time{} // zero — fetch all
+				}
+			}
+
+			remoteComments, err := syncer.FetchComments(ctx, extIssue.ID, issueSince)
 			if err != nil {
 				e.warn("Comment sync: failed to fetch comments for %s: %v", issue.ID, err)
 				continue
@@ -788,8 +845,10 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 		}
 	}
 
-	// Update last_comment_sync timestamp
-	if !opts.DryRun && (stats.Pulled > 0 || stats.Pushed > 0) {
+	// Update last_comment_sync timestamp unconditionally after a successful
+	// sync pass, even if no new comments were found. This ensures the cutoff
+	// advances and we don't re-scan the same time window.
+	if !opts.DryRun {
 		lastSync := time.Now().UTC().Format(time.RFC3339)
 		if err := e.Store.SetConfig(ctx, key, lastSync); err != nil {
 			e.warn("Failed to update last_comment_sync: %v", err)
@@ -804,7 +863,7 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 }
 
 // doAttachmentPull fetches attachment metadata from the external tracker and stores locally.
-func (e *Engine) doAttachmentPull(ctx context.Context, opts SyncOptions, fetcher AttachmentFetcher) attachmentPullStats {
+func (e *Engine) doAttachmentPull(ctx context.Context, opts SyncOptions, fetcher AttachmentFetcher, extIssueCache map[string]*TrackerIssue) attachmentPullStats {
 	ctx, span := syncTracer.Start(ctx, "tracker.attachment_pull",
 		trace.WithAttributes(attribute.String("sync.tracker", e.Tracker.DisplayName())),
 	)
@@ -826,14 +885,9 @@ func (e *Engine) doAttachmentPull(ctx context.Context, opts SyncOptions, fetcher
 			continue
 		}
 
-		extID := e.Tracker.ExtractIdentifier(extRef)
-		if extID == "" {
-			continue
-		}
-
-		// Fetch the issue to get its internal tracker ID
-		extIssue, err := e.Tracker.FetchIssue(ctx, extID)
-		if err != nil || extIssue == nil {
+		// Use the pre-built cache to avoid redundant FetchIssue calls.
+		extIssue := extIssueCache[issue.ID]
+		if extIssue == nil {
 			continue
 		}
 
@@ -877,8 +931,9 @@ func (e *Engine) doAttachmentPull(ctx context.Context, opts SyncOptions, fetcher
 		}
 	}
 
-	// Update last_attachment_sync timestamp
-	if !opts.DryRun && stats.Pulled > 0 {
+	// Update last_attachment_sync timestamp unconditionally after a successful
+	// sync pass, even if no new attachments were found.
+	if !opts.DryRun {
 		key := e.Tracker.ConfigPrefix() + ".last_attachment_sync"
 		lastSync := time.Now().UTC().Format(time.RFC3339)
 		if err := e.Store.SetConfig(ctx, key, lastSync); err != nil {

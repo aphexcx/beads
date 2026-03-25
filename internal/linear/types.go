@@ -240,13 +240,10 @@ type CommentCreateResponse struct {
 
 // Attachment represents an attachment from the Linear API.
 type Attachment struct {
-	ID       string `json:"id"`
-	Title    string `json:"title"`
-	Subtitle string `json:"subtitle"`
-	URL      string `json:"url"`
-	Metadata struct {
-		MimeType string `json:"mimeType,omitempty"`
-	} `json:"metadata,omitempty"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Subtitle  string `json:"subtitle"`
+	URL       string `json:"url"`
 	Creator   *User  `json:"creator,omitempty"`
 	CreatedAt string `json:"createdAt"`
 }
