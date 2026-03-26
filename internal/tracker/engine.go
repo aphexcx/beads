@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -757,35 +758,47 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 			continue
 		}
 
-		// PULL: Fetch remote comments and import missing ones
-		if opts.Pull || (!opts.Pull && !opts.Push) {
-			// Determine effective cutoff for this issue. If the issue has never
-			// had comments synced (no local comments with an external_ref), use
-			// zero time to fetch all comments. This prevents suppressing
-			// preexisting comments on issues newly entering sync.
-			issueSince := since
-			if !since.IsZero() {
-				hasExtRefComment := false
-				existingComments, cerr := e.Store.GetIssueComments(ctx, issue.ID)
-				if cerr == nil {
-					for _, ec := range existingComments {
-						if ec.ExternalRef != "" {
-							hasExtRefComment = true
-							break
-						}
+		// Fetch remote comments once per issue for both pull and push phases.
+		// The push phase uses these for text-based dedup as a safety net.
+		// Determine effective cutoff for this issue. If the issue has never
+		// had comments synced (no local comments with an external_ref), use
+		// zero time to fetch all comments. This prevents suppressing
+		// preexisting comments on issues newly entering sync.
+		issueSince := since
+		if !since.IsZero() {
+			hasExtRefComment := false
+			existingComments, cerr := e.Store.GetIssueComments(ctx, issue.ID)
+			if cerr == nil {
+				for _, ec := range existingComments {
+					if ec.ExternalRef != "" {
+						hasExtRefComment = true
+						break
 					}
 				}
-				if !hasExtRefComment {
-					issueSince = time.Time{} // zero — fetch all
-				}
 			}
-
-			remoteComments, err := syncer.FetchComments(ctx, extIssue.ID, issueSince)
-			if err != nil {
-				e.warn("Comment sync: failed to fetch comments for %s: %v", issue.ID, err)
-				continue
+			if !hasExtRefComment {
+				issueSince = time.Time{} // zero — fetch all
 			}
+		}
 
+		var remoteComments []TrackerComment
+		remoteComments, err = syncer.FetchComments(ctx, extIssue.ID, issueSince)
+		if err != nil {
+			e.warn("Comment sync: failed to fetch comments for %s: %v", issue.ID, err)
+			continue
+		}
+
+		// Build a set of remote comment texts for text-based dedup during push.
+		// This prevents re-pushing a comment that already exists in the tracker
+		// (e.g., when a previous push succeeded but the local external_ref
+		// update failed, leaving the comment without an external_ref).
+		remoteTextSet := make(map[string]string) // normalized text → external comment ID
+		for _, rc := range remoteComments {
+			remoteTextSet[normalizeCommentText(rc.Body)] = rc.ID
+		}
+
+		// PULL: Import remote comments that are missing locally
+		if opts.Pull || (!opts.Pull && !opts.Push) {
 			for _, rc := range remoteComments {
 				if opts.DryRun {
 					e.msg("[dry-run] Would import comment from %s on %s", rc.Author, issue.ID)
@@ -828,6 +841,25 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 					continue
 				}
 
+				// Safety check: if a comment with the same text already exists
+				// in the remote tracker, adopt its ID instead of creating a
+				// duplicate. This catches cases where a previous push created
+				// the comment in the tracker but the local external_ref update
+				// failed (crash, DB error, etc.).
+				normalizedLocal := normalizeCommentText(lc.Text)
+				if existingExtID, found := remoteTextSet[normalizedLocal]; found {
+					commentRef := e.Tracker.ConfigPrefix() + ":" + existingExtID
+					if err := e.updateCommentExternalRef(ctx, issue.ID, lc.ID, commentRef); err != nil {
+						e.warn("Comment sync: failed to adopt existing remote comment ref on %s: %v", issue.ID, err)
+					} else {
+						e.msg("Comment sync: adopted existing remote comment for %s (text-based dedup)", issue.ID)
+					}
+					// Remove from remote set so a second local comment with
+					// identical text doesn't also match this same remote comment.
+					delete(remoteTextSet, normalizedLocal)
+					continue
+				}
+
 				// Create in external tracker
 				extCommentID, err := syncer.CreateComment(ctx, extIssue.ID, lc.Text)
 				if err != nil {
@@ -835,10 +867,13 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 					continue
 				}
 
-				// Update local comment with external_ref
+				// Update local comment with external_ref. If this fails, the
+				// comment already exists in the tracker — next sync will catch
+				// it via text-based dedup above instead of creating a duplicate.
 				commentRef := e.Tracker.ConfigPrefix() + ":" + extCommentID
 				if err := e.updateCommentExternalRef(ctx, issue.ID, lc.ID, commentRef); err != nil {
-					e.warn("Comment sync: failed to update comment ref on %s: %v", issue.ID, err)
+					e.warn("Comment sync: CRITICAL — pushed comment to %s but failed to save external_ref (comment %s, ref %s): %v. "+
+						"Text-based dedup will prevent duplication on next sync.", issue.ID, lc.ID, commentRef, err)
 				}
 				stats.Pushed++
 			}
@@ -1029,4 +1064,11 @@ func (e *Engine) warn(format string, args ...interface{}) {
 	if e.OnWarning != nil {
 		e.OnWarning(fmt.Sprintf(format, args...))
 	}
+}
+
+// normalizeCommentText strips leading/trailing whitespace for text-based
+// comment dedup. This handles minor formatting differences between the local
+// copy and the version returned by the external tracker.
+func normalizeCommentText(text string) string {
+	return strings.TrimSpace(text)
 }
