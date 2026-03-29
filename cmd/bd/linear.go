@@ -164,6 +164,7 @@ func init() {
 	linearSyncCmd.Flags().StringSlice("exclude-id", nil, "Exclude issues whose ID contains this substring (can be repeated)")
 	linearSyncCmd.Flags().String("parent", "", "Limit push to this beads ticket and its descendants")
 	linearSyncCmd.Flags().StringSlice("team", nil, "Team ID(s) to sync (overrides configured team_id/team_ids)")
+	linearSyncCmd.Flags().Bool("no-epic-projects", false, "Disable epic-to-project sync")
 
 	linearCmd.AddCommand(linearSyncCmd)
 	linearCmd.AddCommand(linearStatusCmd)
@@ -188,6 +189,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	excludeIDFlag, _ := cmd.Flags().GetStringSlice("exclude-id")
 	parentID, _ := cmd.Flags().GetString("parent")
 	cliTeams, _ := cmd.Flags().GetStringSlice("team")
+	noEpicProjects, _ := cmd.Flags().GetBool("no-epic-projects")
 
 	if parentID != "" && !push {
 		FatalError("--parent requires --push")
@@ -259,6 +261,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	opts.NoAttachments = noAttachments
 	opts.CommentsOnly = commentsOnly
 	opts.ParentID = parentID
+	opts.NoEpicProjects = noEpicProjects
 
 	// Exclude ID patterns: CLI flag overrides config
 	if len(excludeIDFlag) > 0 {
@@ -304,6 +307,12 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 		if result.Stats.Pulled > 0 {
 			fmt.Printf("✓ Pulled %d issues (%d created, %d updated)\n",
 				result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+		}
+		if result.Stats.EpicsPushed > 0 {
+			fmt.Printf("✓ Pushed %d epics as projects\n", result.Stats.EpicsPushed)
+		}
+		if result.Stats.EpicsPulled > 0 {
+			fmt.Printf("✓ Pulled %d projects as epics\n", result.Stats.EpicsPulled)
 		}
 		if result.Stats.Pushed > 0 {
 			fmt.Printf("✓ Pushed %d issues\n", result.Stats.Pushed)

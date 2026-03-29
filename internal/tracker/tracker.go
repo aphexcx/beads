@@ -129,6 +129,45 @@ type AttachmentFetcher interface {
 	FetchAttachments(ctx context.Context, externalIssueID string) ([]TrackerAttachment, error)
 }
 
+// ProjectSyncer is an optional interface that tracker adapters can implement
+// to enable bidirectional epic-to-project synchronization. When implemented,
+// beads epics are synced as tracker projects (not issues), and the parent-child
+// hierarchy is preserved via sub-issue nesting.
+type ProjectSyncer interface {
+	// CreateProject creates a new project in the external tracker from a beads epic.
+	// Returns the project URL and project ID.
+	CreateProject(ctx context.Context, epic *types.Issue) (projectURL string, projectID string, err error)
+
+	// UpdateProject updates an existing project in the external tracker.
+	UpdateProject(ctx context.Context, projectID string, epic *types.Issue) error
+
+	// FetchProjects retrieves projects from the external tracker.
+	// state can be: "all", or tracker-specific states.
+	FetchProjects(ctx context.Context, state string) ([]TrackerProject, error)
+
+	// AssignIssueToProject assigns an issue to a project in the external tracker.
+	AssignIssueToProject(ctx context.Context, issueExternalID, projectID string) error
+
+	// SetIssueParent sets the parent issue for a sub-issue in the external tracker.
+	SetIssueParent(ctx context.Context, issueExternalID, parentExternalID string) error
+
+	// IsProjectRef checks if an external_ref string refers to a project (not an issue).
+	IsProjectRef(ref string) bool
+
+	// ExtractProjectID extracts the project ID from a project URL or returns the ID directly.
+	ExtractProjectID(ref string) string
+}
+
+// TrackerProject represents a project from an external tracker.
+type TrackerProject struct {
+	ID          string
+	Name        string
+	Description string
+	URL         string
+	State       string
+	UpdatedAt   time.Time
+}
+
 // TrackerComment represents a comment from an external tracker.
 type TrackerComment struct {
 	ID        string    // External tracker's comment ID

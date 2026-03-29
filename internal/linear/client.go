@@ -865,9 +865,10 @@ func ExtractLinearIdentifier(url string) string {
 	return ""
 }
 
-// CanonicalizeLinearExternalRef returns a stable Linear issue URL without the slug.
+// CanonicalizeLinearExternalRef returns a stable Linear issue or project URL without the slug.
 // Example: https://linear.app/team/issue/TEAM-123/title -> https://linear.app/team/issue/TEAM-123
-// Returns ok=false if the URL isn't a recognizable Linear issue URL.
+// Example: https://linear.app/team/project/slug-id/title -> https://linear.app/team/project/slug-id
+// Returns ok=false if the URL isn't a recognizable Linear URL.
 func CanonicalizeLinearExternalRef(externalRef string) (canonical string, ok bool) {
 	if externalRef == "" || !IsLinearExternalRef(externalRef) {
 		return "", false
@@ -880,7 +881,7 @@ func CanonicalizeLinearExternalRef(externalRef string) (canonical string, ok boo
 
 	segments := strings.Split(parsed.Path, "/")
 	for i, segment := range segments {
-		if segment == "issue" && i+1 < len(segments) && segments[i+1] != "" {
+		if (segment == "issue" || segment == "project") && i+1 < len(segments) && segments[i+1] != "" {
 			path := "/" + strings.Join(segments[1:i+2], "/")
 			return fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, path), true
 		}
@@ -889,9 +890,29 @@ func CanonicalizeLinearExternalRef(externalRef string) (canonical string, ok boo
 	return "", false
 }
 
-// IsLinearExternalRef checks if an external_ref URL is a Linear issue URL.
+// IsLinearExternalRef checks if an external_ref URL is a Linear issue or project URL.
 func IsLinearExternalRef(externalRef string) bool {
-	return strings.Contains(externalRef, "linear.app/") && strings.Contains(externalRef, "/issue/")
+	if !strings.Contains(externalRef, "linear.app/") {
+		return false
+	}
+	return strings.Contains(externalRef, "/issue/") || strings.Contains(externalRef, "/project/")
+}
+
+// IsLinearProjectRef checks if an external_ref URL is a Linear project URL.
+func IsLinearProjectRef(externalRef string) bool {
+	return strings.Contains(externalRef, "linear.app/") && strings.Contains(externalRef, "/project/")
+}
+
+// ExtractLinearProjectSlug extracts the project slug ID from a Linear project URL.
+// Linear project URLs look like: https://linear.app/team/project/slug-id/title
+func ExtractLinearProjectSlug(url string) string {
+	parts := strings.Split(url, "/")
+	for i, part := range parts {
+		if part == "project" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 // FetchTeams retrieves all teams accessible with the current API key.
@@ -1034,6 +1055,51 @@ func (c *Client) CreateProject(ctx context.Context, name, description, state str
 	}
 
 	return &createResp.ProjectCreate.Project, nil
+}
+
+// FetchProject retrieves a single project by ID from Linear.
+func (c *Client) FetchProject(ctx context.Context, projectID string) (*Project, error) {
+	query := `
+		query Project($id: String!) {
+			project(id: $id) {
+				id
+				name
+				description
+				slugId
+				url
+				state
+				progress
+				createdAt
+				updatedAt
+				completedAt
+			}
+		}
+	`
+
+	req := &GraphQLRequest{
+		Query: query,
+		Variables: map[string]interface{}{
+			"id": projectID,
+		},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch project: %w", err)
+	}
+
+	var resp struct {
+		Project Project `json:"project"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse project response: %w", err)
+	}
+
+	if resp.Project.ID == "" {
+		return nil, nil
+	}
+
+	return &resp.Project, nil
 }
 
 // UpdateProject updates an existing project in Linear.

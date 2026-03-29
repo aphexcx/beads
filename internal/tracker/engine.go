@@ -131,6 +131,18 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		}
 	}
 
+	// Phase 1b: Pull projects as epics (if tracker supports ProjectSyncer)
+	if opts.Pull && !opts.CommentsOnly && !opts.NoEpicProjects {
+		if ps, ok := e.Tracker.(ProjectSyncer); ok {
+			epicsPulled, err := e.doEpicPull(ctx, opts, ps)
+			if err != nil {
+				e.warn("Epic pull failed: %v", err)
+			} else {
+				result.Stats.EpicsPulled = epicsPulled
+			}
+		}
+	}
+
 	// Phase 2: Pull (skip if CommentsOnly)
 	if opts.Pull && !opts.CommentsOnly {
 		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs)
@@ -148,9 +160,24 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		result.Stats.Skipped += pullStats.Skipped
 	}
 
+	// Phase 2b: Push epics as projects (before regular issue push)
+	var epicProjectMap map[string]string // beads epic ID -> Linear project ID
+	if opts.Push && !opts.CommentsOnly && !opts.NoEpicProjects {
+		if ps, ok := e.Tracker.(ProjectSyncer); ok {
+			var epicsPushed int
+			var epicErr error
+			epicProjectMap, epicsPushed, epicErr = e.doEpicSync(ctx, opts, ps)
+			if epicErr != nil {
+				e.warn("Epic sync failed: %v", epicErr)
+			} else {
+				result.Stats.EpicsPushed = epicsPushed
+			}
+		}
+	}
+
 	// Phase 3: Push (skip if CommentsOnly)
 	if opts.Push && !opts.CommentsOnly {
-		pushStats, err := e.doPush(ctx, opts, skipPushIDs, forcePushIDs)
+		pushStats, err := e.doPush(ctx, opts, skipPushIDs, forcePushIDs, epicProjectMap)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("push failed: %v", err)
@@ -208,6 +235,8 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		attribute.Int("sync.comments_pulled", result.Stats.CommentsPulled),
 		attribute.Int("sync.comments_pushed", result.Stats.CommentsPushed),
 		attribute.Int("sync.attachments_pulled", result.Stats.AttachmentsPulled),
+		attribute.Int("sync.epics_pulled", result.Stats.EpicsPulled),
+		attribute.Int("sync.epics_pushed", result.Stats.EpicsPushed),
 	)
 
 	// Update last_sync timestamp
@@ -590,7 +619,7 @@ func parseSyncTime(value string) (time.Time, error) {
 }
 
 // doPush exports beads issues to the external tracker.
-func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs map[string]bool) (*PushStats, error) {
+func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs map[string]bool, epicProjectMap ...map[string]string) (*PushStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.push",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -677,12 +706,62 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 	}
 
+	// Resolve the epic project map from variadic parameter.
+	var epMap map[string]string
+	if len(epicProjectMap) > 0 && epicProjectMap[0] != nil {
+		epMap = epicProjectMap[0]
+	}
+
+	// Pre-build a map of issue ID -> parent epic ID for project assignment.
+	// Also build issueID -> externalID map for parentId linking.
+	_, hasProjectSyncer := e.Tracker.(ProjectSyncer)
+	parentEpicMap := make(map[string]string)  // child issue ID -> parent epic's beads ID
+	parentIssueMap := make(map[string]string) // child issue ID -> parent issue's beads ID (non-epic)
+	issueExtIDMap := make(map[string]string)  // beads issue ID -> external tracker ID
+	if hasProjectSyncer && epMap != nil {
+		for _, issue := range issues {
+			if issue.ExternalRef != nil {
+				extRef := *issue.ExternalRef
+				extID := e.Tracker.ExtractIdentifier(extRef)
+				if extID != "" {
+					issueExtIDMap[issue.ID] = extID
+				}
+			}
+		}
+		// Build parent relationships from dependencies
+		for _, issue := range issues {
+			deps, err := e.Store.GetDependenciesWithMetadata(ctx, issue.ID)
+			if err != nil {
+				continue
+			}
+			for _, dep := range deps {
+				if dep.DependencyType != types.DepParentChild {
+					continue
+				}
+				// dep.Issue is the parent (the issue we depend on)
+				if dep.Issue.IssueType == types.TypeEpic {
+					parentEpicMap[issue.ID] = dep.Issue.ID
+				} else {
+					parentIssueMap[issue.ID] = dep.Issue.ID
+				}
+				break // Only one parent
+			}
+		}
+	}
+
 	for _, issue := range issues {
 		// Limit to parent and its descendants if requested.
 		if descendantSet != nil && !descendantSet[issue.ID] {
 			stats.Skipped++
 			continue
 		}
+
+		// Skip epics when ProjectSyncer is available (they were handled in doEpicSync).
+		if hasProjectSyncer && !opts.NoEpicProjects && issue.IssueType == types.TypeEpic {
+			stats.Skipped++
+			continue
+		}
+
 		// Skip filtered types/states/ephemeral
 		if !e.shouldPushIssue(issue, opts) {
 			stats.Skipped++
@@ -746,6 +825,32 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			if err := e.Store.UpdateIssue(ctx, issue.ID, updates, e.Actor); err != nil {
 				e.warn("Failed to update external_ref for %s: %v", issue.ID, err)
 			}
+
+			// Track the new external ID for parent linking
+			issueExtIDMap[issue.ID] = created.ID
+
+			// Assign to project if parent is an epic with a linked project
+			if ps, ok := e.Tracker.(ProjectSyncer); ok && epMap != nil {
+				if epicID, hasEpicParent := parentEpicMap[issue.ID]; hasEpicParent {
+					if projectID, hasProject := epMap[epicID]; hasProject {
+						if err := ps.AssignIssueToProject(ctx, created.ID, projectID); err != nil {
+							e.warn("Failed to assign %s to project: %v", issue.ID, err)
+						}
+					}
+				}
+			}
+
+			// Set parentId if parent is a non-epic issue that was also pushed
+			if ps, ok := e.Tracker.(ProjectSyncer); ok {
+				if parentID, hasParent := parentIssueMap[issue.ID]; hasParent {
+					if parentExtID, pOk := issueExtIDMap[parentID]; pOk && parentExtID != "" {
+						if err := ps.SetIssueParent(ctx, created.ID, parentExtID); err != nil {
+							e.warn("Failed to set parent for %s: %v", issue.ID, err)
+						}
+					}
+				}
+			}
+
 			stats.Created++
 		} else if !opts.CreateOnly || forceIDs[issue.ID] {
 			// Update existing external issue
@@ -866,6 +971,214 @@ func (e *Engine) renderBatchDryRun(issues []*types.Issue, result *BatchPushResul
 	for _, item := range result.Updated {
 		e.msg("[dry-run] Would update in %s: %s", e.Tracker.DisplayName(), titles[item.LocalID])
 	}
+}
+
+// doEpicSync pushes beads epics as external tracker projects.
+// Returns a map of beads epic ID -> external project ID for child linking, the count of pushed epics, and any error.
+func (e *Engine) doEpicSync(ctx context.Context, opts SyncOptions, ps ProjectSyncer) (map[string]string, int, error) {
+	epicProjectMap := make(map[string]string)
+	pushed := 0
+
+	// Fetch all local issues
+	filter := types.IssueFilter{}
+	issues, err := e.Store.SearchIssues(ctx, "", filter)
+	if err != nil {
+		return nil, 0, fmt.Errorf("searching local issues for epic sync: %w", err)
+	}
+
+	// Pre-fetch remote projects to build a URL -> project ID lookup.
+	// This allows us to resolve project UUIDs from stored URL external_refs.
+	projectURLToID := make(map[string]string)
+	remoteProjects, fetchErr := ps.FetchProjects(ctx, "all")
+	if fetchErr == nil {
+		for _, p := range remoteProjects {
+			projectURLToID[p.URL] = p.ID
+			// Also index by canonical URL
+			if canonical, ok := canonicalizeProjectURL(p.URL); ok {
+				projectURLToID[canonical] = p.ID
+			}
+		}
+	}
+
+	for _, issue := range issues {
+		if issue.IssueType != types.TypeEpic {
+			continue
+		}
+
+		// Skip issues matching exclude ID patterns
+		if isExcludedByIDPattern(issue.ID, opts.ExcludeIDPatterns) {
+			continue
+		}
+
+		// ShouldPush hook: custom filtering
+		if e.PushHooks != nil && e.PushHooks.ShouldPush != nil {
+			if !e.PushHooks.ShouldPush(issue) {
+				continue
+			}
+		}
+
+		extRef := derefStr(issue.ExternalRef)
+
+		if extRef != "" && ps.IsProjectRef(extRef) {
+			// Already linked to a project — resolve the project UUID from the URL.
+			projectID := projectURLToID[extRef]
+			if projectID == "" {
+				// Try canonical form
+				if canonical, ok := canonicalizeProjectURL(extRef); ok {
+					projectID = projectURLToID[canonical]
+				}
+			}
+			if projectID == "" {
+				e.warn("Cannot resolve project ID for epic %s (ref: %s)", issue.ID, extRef)
+				continue
+			}
+
+			if opts.DryRun {
+				e.msg("[dry-run] Would update project for epic: %s", issue.Title)
+				epicProjectMap[issue.ID] = projectID
+				pushed++
+				continue
+			}
+
+			if err := ps.UpdateProject(ctx, projectID, issue); err != nil {
+				e.warn("Failed to update project for epic %s: %v", issue.ID, err)
+				continue
+			}
+			epicProjectMap[issue.ID] = projectID
+			pushed++
+		} else if extRef == "" {
+			// No external ref — create a new project
+			if opts.DryRun {
+				e.msg("[dry-run] Would create project for epic: %s", issue.Title)
+				pushed++
+				continue
+			}
+
+			projectURL, projectID, err := ps.CreateProject(ctx, issue)
+			if err != nil {
+				e.warn("Failed to create project for epic %s: %v", issue.ID, err)
+				continue
+			}
+
+			// Store project URL as external_ref
+			updates := map[string]interface{}{"external_ref": projectURL}
+			if err := e.Store.UpdateIssue(ctx, issue.ID, updates, e.Actor); err != nil {
+				e.warn("Failed to update external_ref for epic %s: %v", issue.ID, err)
+			}
+			epicProjectMap[issue.ID] = projectID
+			pushed++
+		}
+		// If extRef is set but not a project ref (e.g., issue URL), skip — it was already pushed as an issue.
+	}
+
+	return epicProjectMap, pushed, nil
+}
+
+// doEpicPull pulls external tracker projects as beads epics.
+// Returns the number of epics pulled.
+func (e *Engine) doEpicPull(ctx context.Context, opts SyncOptions, ps ProjectSyncer) (int, error) {
+	pulled := 0
+
+	projects, err := ps.FetchProjects(ctx, opts.State)
+	if err != nil {
+		return 0, fmt.Errorf("fetching projects: %w", err)
+	}
+
+	for _, project := range projects {
+		// Check if a local epic with matching external_ref exists
+		existing, _ := e.Store.GetIssueByExternalRef(ctx, project.URL)
+		if existing == nil {
+			// Also try canonical URL
+			if canonical, ok := canonicalizeProjectURL(project.URL); ok {
+				existing, _ = e.Store.GetIssueByExternalRef(ctx, canonical)
+			}
+		}
+
+		if existing != nil {
+			// Update if changed
+			needsUpdate := existing.Title != project.Name ||
+				existing.Description != project.Description
+
+			if !needsUpdate {
+				continue
+			}
+
+			if opts.DryRun {
+				e.msg("[dry-run] Would update epic from project: %s", project.Name)
+				pulled++
+				continue
+			}
+
+			updates := map[string]interface{}{
+				"title":       project.Name,
+				"description": project.Description,
+			}
+			if err := e.Store.UpdateIssue(ctx, existing.ID, updates, e.Actor); err != nil {
+				e.warn("Failed to update epic from project %s: %v", project.Name, err)
+				continue
+			}
+			pulled++
+		} else {
+			// Create new epic
+			if opts.DryRun {
+				e.msg("[dry-run] Would import project as epic: %s", project.Name)
+				pulled++
+				continue
+			}
+
+			epic := &types.Issue{
+				Title:       project.Name,
+				Description: project.Description,
+				IssueType:   types.TypeEpic,
+				Priority:    2, // Default medium
+				Status:      types.StatusOpen,
+				ExternalRef: &project.URL,
+			}
+
+			// Map project state to beads status
+			switch project.State {
+			case "completed", "canceled":
+				epic.Status = types.StatusClosed
+			case "started", "paused":
+				epic.Status = types.StatusInProgress
+			default:
+				epic.Status = types.StatusOpen
+			}
+
+			// GenerateID hook
+			if e.PullHooks != nil && e.PullHooks.GenerateID != nil {
+				if err := e.PullHooks.GenerateID(ctx, epic); err != nil {
+					e.warn("Failed to generate ID for project %s: %v", project.Name, err)
+					continue
+				}
+			}
+
+			if err := e.Store.CreateIssue(ctx, epic, e.Actor); err != nil {
+				e.warn("Failed to create epic for project %s: %v", project.Name, err)
+				continue
+			}
+			pulled++
+		}
+	}
+
+	return pulled, nil
+}
+
+// canonicalizeProjectURL returns a canonical form of a project URL (without trailing slug).
+func canonicalizeProjectURL(projectURL string) (string, bool) {
+	if projectURL == "" {
+		return "", false
+	}
+	// Reuse the general canonicalization logic which now handles /project/ URLs
+	parts := strings.Split(projectURL, "/")
+	for i, part := range parts {
+		if part == "project" && i+1 < len(parts) && parts[i+1] != "" {
+			// Keep up to the slug, drop anything after
+			canonical := strings.Join(parts[:i+2], "/")
+			return canonical, true
+		}
+	}
+	return "", false
 }
 
 // resolveConflicts applies the configured conflict resolution strategy.

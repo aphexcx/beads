@@ -96,6 +96,8 @@ type SyncOptions struct {
 	// ParentID limits push to this beads issue and all its descendants via
 	// parent-child dependencies. Empty means no restriction.
 	ParentID string
+	// NoEpicProjects disables epic-to-project sync even if the tracker supports it.
+	NoEpicProjects bool
 }
 
 // SyncResult is the complete result of a sync operation.
@@ -121,6 +123,8 @@ type SyncStats struct {
 	CommentsPulled    int `json:"comments_pulled,omitempty"`
 	CommentsPushed    int `json:"comments_pushed,omitempty"`
 	AttachmentsPulled int `json:"attachments_pulled,omitempty"`
+	EpicsPulled       int `json:"epics_pulled,omitempty"`
+	EpicsPushed       int `json:"epics_pushed,omitempty"`
 }
 
 // PullStats tracks pull operation results.
