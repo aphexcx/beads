@@ -16,12 +16,13 @@ import (
 )
 
 // projectsQuery is the GraphQL query for fetching projects.
+// Note: Linear's ProjectFilter does not support a "team" field, so we fetch
+// all projects and include teams in the response for client-side filtering.
 const projectsQuery = `
-	query Projects($filter: ProjectFilter!, $first: Int!, $after: String) {
+	query Projects($first: Int!, $after: String) {
 		projects(
 			first: $first
 			after: $after
-			filter: $filter
 		) {
 			nodes {
 				id
@@ -34,6 +35,11 @@ const projectsQuery = `
 				createdAt
 				updatedAt
 				completedAt
+				teams {
+					nodes {
+						id
+					}
+				}
 			}
 			pageInfo {
 				hasNextPage
@@ -949,28 +955,41 @@ func (c *Client) FetchTeams(ctx context.Context) ([]Team, error) {
 
 // FetchProjects retrieves projects from Linear with optional filtering by state.
 // state can be: "planned", "started", "paused", "completed", "canceled", or "all"/"".
+// Projects are fetched without a team filter (Linear's ProjectFilter doesn't support it)
+// and then filtered client-side to only include projects belonging to the configured team.
 func (c *Client) FetchProjects(ctx context.Context, state string) ([]Project, error) {
+	// Local type to unmarshal the nested teams connection from the GraphQL response.
+	type projectWithTeams struct {
+		ID          string  `json:"id"`
+		Name        string  `json:"name"`
+		Description string  `json:"description"`
+		SlugId      string  `json:"slugId"`
+		URL         string  `json:"url"`
+		State       string  `json:"state"`
+		Progress    float64 `json:"progress"`
+		CreatedAt   string  `json:"createdAt"`
+		UpdatedAt   string  `json:"updatedAt"`
+		CompletedAt string  `json:"completedAt,omitempty"`
+		Teams       struct {
+			Nodes []ProjectTeam `json:"nodes"`
+		} `json:"teams"`
+	}
+	type projectsWithTeamsResp struct {
+		Projects struct {
+			Nodes    []projectWithTeams `json:"nodes"`
+			PageInfo struct {
+				HasNextPage bool   `json:"hasNextPage"`
+				EndCursor   string `json:"endCursor"`
+			} `json:"pageInfo"`
+		} `json:"projects"`
+	}
+
 	var allProjects []Project
 	var cursor string
 
-	filter := map[string]interface{}{
-		"team": map[string]interface{}{
-			"id": map[string]interface{}{
-				"eq": c.TeamID,
-			},
-		},
-	}
-
-	if state != "all" && state != "" {
-		filter["state"] = map[string]interface{}{
-			"eq": state,
-		}
-	}
-
 	for {
 		variables := map[string]interface{}{
-			"filter": filter,
-			"first":  MaxPageSize,
+			"first": MaxPageSize,
 		}
 		if cursor != "" {
 			variables["after"] = cursor
@@ -986,17 +1005,50 @@ func (c *Client) FetchProjects(ctx context.Context, state string) ([]Project, er
 			return nil, fmt.Errorf("failed to fetch projects: %w", err)
 		}
 
-		var projectsResp ProjectsResponse
-		if err := json.Unmarshal(data, &projectsResp); err != nil {
+		var resp projectsWithTeamsResp
+		if err := json.Unmarshal(data, &resp); err != nil {
 			return nil, fmt.Errorf("failed to parse projects response: %w", err)
 		}
 
-		allProjects = append(allProjects, projectsResp.Projects.Nodes...)
+		for _, p := range resp.Projects.Nodes {
+			// Client-side team filter: only include projects that belong to our team
+			if c.TeamID != "" {
+				belongsToTeam := false
+				for _, t := range p.Teams.Nodes {
+					if t.ID == c.TeamID {
+						belongsToTeam = true
+						break
+					}
+				}
+				if !belongsToTeam {
+					continue
+				}
+			}
 
-		if !projectsResp.Projects.PageInfo.HasNextPage {
+			// Client-side state filter
+			if state != "all" && state != "" && p.State != state {
+				continue
+			}
+
+			allProjects = append(allProjects, Project{
+				ID:          p.ID,
+				Name:        p.Name,
+				Description: p.Description,
+				SlugId:      p.SlugId,
+				URL:         p.URL,
+				State:       p.State,
+				Progress:    p.Progress,
+				CreatedAt:   p.CreatedAt,
+				UpdatedAt:   p.UpdatedAt,
+				CompletedAt: p.CompletedAt,
+				Teams:       p.Teams.Nodes,
+			})
+		}
+
+		if !resp.Projects.PageInfo.HasNextPage {
 			break
 		}
-		cursor = projectsResp.Projects.PageInfo.EndCursor
+		cursor = resp.Projects.PageInfo.EndCursor
 	}
 
 	return allProjects, nil

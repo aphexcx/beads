@@ -167,6 +167,11 @@ type TeamResponse struct {
 	Team TeamStates `json:"team"`
 }
 
+// ProjectTeam is a minimal team reference returned inside a Project's teams connection.
+type ProjectTeam struct {
+	ID string `json:"id"`
+}
+
 // Project represents a project in Linear.
 type Project struct {
 	ID          string  `json:"id"`
@@ -179,6 +184,9 @@ type Project struct {
 	CreatedAt   string  `json:"createdAt"`
 	UpdatedAt   string  `json:"updatedAt"`
 	CompletedAt string  `json:"completedAt,omitempty"`
+	// Teams captures the nested GraphQL teams { nodes { id } } connection.
+	// Present when fetched via FetchProjects (which requests teams); may be nil from other queries.
+	Teams []ProjectTeam `json:"-"`
 }
 
 // ProjectsResponse represents the response from projects query.

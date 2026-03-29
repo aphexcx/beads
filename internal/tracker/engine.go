@@ -756,10 +756,13 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			continue
 		}
 
-		// Skip epics when ProjectSyncer is available (they were handled in doEpicSync).
+		// Skip top-level epics that were synced as Projects in doEpicSync.
+		// Sub-epics (not in epMap) fall through to be pushed as regular issues with parentId.
 		if hasProjectSyncer && !opts.NoEpicProjects && issue.IssueType == types.TypeEpic {
-			stats.Skipped++
-			continue
+			if epMap != nil && epMap[issue.ID] != "" {
+				stats.Skipped++
+				continue
+			}
 		}
 
 		// Skip filtered types/states/ephemeral
@@ -986,6 +989,34 @@ func (e *Engine) doEpicSync(ctx context.Context, opts SyncOptions, ps ProjectSyn
 		return nil, 0, fmt.Errorf("searching local issues for epic sync: %w", err)
 	}
 
+	// Build a set of all epic IDs so we can identify sub-epics.
+	epicIDs := make(map[string]bool)
+	for _, issue := range issues {
+		if issue.IssueType == types.TypeEpic {
+			epicIDs[issue.ID] = true
+		}
+	}
+
+	// Identify sub-epics: epics whose parent (via parent-child dependency) is also an epic.
+	// Sub-epics should be pushed as regular issues with parentId, not as Projects.
+	subEpicIDs := make(map[string]bool)
+	for _, issue := range issues {
+		if issue.IssueType != types.TypeEpic {
+			continue
+		}
+		deps, depErr := e.Store.GetDependenciesWithMetadata(ctx, issue.ID)
+		if depErr != nil {
+			continue
+		}
+		for _, dep := range deps {
+			if dep.DependencyType == types.DepParentChild && epicIDs[dep.Issue.ID] {
+				// This epic's parent is also an epic — it's a sub-epic.
+				subEpicIDs[issue.ID] = true
+				break
+			}
+		}
+	}
+
 	// Pre-fetch remote projects to build a URL -> project ID lookup.
 	// This allows us to resolve project UUIDs from stored URL external_refs.
 	projectURLToID := make(map[string]string)
@@ -1002,6 +1033,11 @@ func (e *Engine) doEpicSync(ctx context.Context, opts SyncOptions, ps ProjectSyn
 
 	for _, issue := range issues {
 		if issue.IssueType != types.TypeEpic {
+			continue
+		}
+
+		// Skip sub-epics — they will be pushed as regular issues with parentId by doPush.
+		if subEpicIDs[issue.ID] {
 			continue
 		}
 
