@@ -151,6 +151,7 @@ func init() {
 	linearSyncCmd.Flags().Bool("no-comments", false, "Disable comment sync")
 	linearSyncCmd.Flags().Bool("no-attachments", false, "Disable attachment sync")
 	linearSyncCmd.Flags().Bool("comments-only", false, "Sync only comments (skip issue sync)")
+	linearSyncCmd.Flags().StringSlice("exclude-id", nil, "Exclude issues whose ID contains this substring (can be repeated)")
 
 	linearCmd.AddCommand(linearSyncCmd)
 	linearCmd.AddCommand(linearStatusCmd)
@@ -172,6 +173,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	noComments, _ := cmd.Flags().GetBool("no-comments")
 	noAttachments, _ := cmd.Flags().GetBool("no-attachments")
 	commentsOnly, _ := cmd.Flags().GetBool("comments-only")
+	excludeIDFlag, _ := cmd.Flags().GetStringSlice("exclude-id")
 
 	if !dryRun {
 		CheckReadonly("linear sync")
@@ -230,6 +232,21 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	opts.NoComments = noComments
 	opts.NoAttachments = noAttachments
 	opts.CommentsOnly = commentsOnly
+
+	// Exclude ID patterns: CLI flag overrides config
+	if len(excludeIDFlag) > 0 {
+		opts.ExcludeIDPatterns = excludeIDFlag
+	} else {
+		excludeCfg, _ := getLinearConfig(ctx, "linear.exclude_id_patterns")
+		if excludeCfg != "" {
+			for _, p := range strings.Split(excludeCfg, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					opts.ExcludeIDPatterns = append(opts.ExcludeIDPatterns, p)
+				}
+			}
+		}
+	}
 
 	// Map conflict resolution
 	if preferLocal {

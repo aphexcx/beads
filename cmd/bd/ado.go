@@ -151,6 +151,8 @@ func init() {
 	adoSyncCmd.Flags().BoolVar(&adoNoCreate, "no-create", false, "Pull-only mode: never create issues in ADO")
 	adoSyncCmd.Flags().BoolVar(&adoReconcile, "reconcile", false, "Force reconciliation scan for deleted items")
 
+	adoSyncCmd.Flags().StringSlice("exclude-id", nil, "Exclude issues whose ID contains this substring (can be repeated)")
+
 	// Pull filter flags (override config keys ado.filter.*)
 	adoSyncCmd.Flags().StringVar(&adoFilterAreaPath, "area-path", "", "Filter to ADO area path (e.g., \"Project\\Team\")")
 	adoSyncCmd.Flags().StringVar(&adoFilterIterationPath, "iteration-path", "", "Filter to ADO iteration path (e.g., \"Project\\Sprint 1\")")
@@ -507,6 +509,22 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 		Pull:   pull,
 		Push:   push,
 		DryRun: adoSyncDryRun,
+	}
+
+	// Exclude ID patterns: CLI flag overrides config
+	excludeIDFlag, _ := cmd.Flags().GetStringSlice("exclude-id")
+	if len(excludeIDFlag) > 0 {
+		opts.ExcludeIDPatterns = excludeIDFlag
+	} else {
+		excludeCfg := getADOConfigValue(ctx, "ado.exclude_id_patterns")
+		if excludeCfg != "" {
+			for _, p := range strings.Split(excludeCfg, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					opts.ExcludeIDPatterns = append(opts.ExcludeIDPatterns, p)
+				}
+			}
+		}
 	}
 
 	// Map conflict resolution

@@ -455,6 +455,12 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			continue
 		}
 
+		// Skip issues matching exclude ID patterns
+		if isExcludedByIDPattern(issue.ID, opts.ExcludeIDPatterns) {
+			stats.Skipped++
+			continue
+		}
+
 		// ShouldPush hook: custom filtering (prefix filtering, etc.)
 		if e.PushHooks != nil && e.PushHooks.ShouldPush != nil {
 			if !e.PushHooks.ShouldPush(issue) {
@@ -666,6 +672,17 @@ func (e *Engine) shouldPushIssue(issue *types.Issue, opts SyncOptions) bool {
 	return true
 }
 
+// isExcludedByIDPattern returns true if the issue ID matches any of the
+// configured exclude patterns (substring match).
+func isExcludedByIDPattern(issueID string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if pattern != "" && strings.Contains(issueID, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // ResolveState maps a beads status to a tracker state ID using the push state cache.
 // Returns (stateID, ok). Only usable during a push operation after BuildStateCache has run.
 func (e *Engine) ResolveState(status types.Status) (string, bool) {
@@ -749,6 +766,11 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 	for _, issue := range issues {
 		extRef := derefStr(issue.ExternalRef)
 		if extRef == "" || !e.Tracker.IsExternalRef(extRef) {
+			continue
+		}
+
+		// Skip issues matching exclude ID patterns
+		if isExcludedByIDPattern(issue.ID, opts.ExcludeIDPatterns) {
 			continue
 		}
 
@@ -917,6 +939,11 @@ func (e *Engine) doAttachmentPull(ctx context.Context, opts SyncOptions, fetcher
 	for _, issue := range issues {
 		extRef := derefStr(issue.ExternalRef)
 		if extRef == "" || !e.Tracker.IsExternalRef(extRef) {
+			continue
+		}
+
+		// Skip issues matching exclude ID patterns
+		if isExcludedByIDPattern(issue.ID, opts.ExcludeIDPatterns) {
 			continue
 		}
 

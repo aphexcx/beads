@@ -80,6 +80,7 @@ func init() {
 	jiraSyncCmd.Flags().Bool("prefer-jira", false, "Prefer Jira version on conflicts")
 	jiraSyncCmd.Flags().Bool("create-only", false, "Only create new issues, don't update existing")
 	jiraSyncCmd.Flags().String("state", "all", "Issue state to sync: open, closed, all")
+	jiraSyncCmd.Flags().StringSlice("exclude-id", nil, "Exclude issues whose ID contains this substring (can be repeated)")
 
 	jiraCmd.AddCommand(jiraSyncCmd)
 	jiraCmd.AddCommand(jiraStatusCmd)
@@ -94,6 +95,7 @@ func runJiraSync(cmd *cobra.Command, args []string) {
 	preferJira, _ := cmd.Flags().GetBool("prefer-jira")
 	createOnly, _ := cmd.Flags().GetBool("create-only")
 	state, _ := cmd.Flags().GetString("state")
+	excludeIDFlag, _ := cmd.Flags().GetStringSlice("exclude-id")
 
 	if !dryRun {
 		CheckReadonly("jira sync")
@@ -134,6 +136,21 @@ func runJiraSync(cmd *cobra.Command, args []string) {
 		DryRun:     dryRun,
 		CreateOnly: createOnly,
 		State:      state,
+	}
+
+	// Exclude ID patterns: CLI flag overrides config
+	if len(excludeIDFlag) > 0 {
+		opts.ExcludeIDPatterns = excludeIDFlag
+	} else if store != nil {
+		excludeCfg, _ := store.GetConfig(ctx, "jira.exclude_id_patterns")
+		if excludeCfg != "" {
+			for _, p := range strings.Split(excludeCfg, ",") {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					opts.ExcludeIDPatterns = append(opts.ExcludeIDPatterns, p)
+				}
+			}
+		}
 	}
 
 	// Map conflict resolution

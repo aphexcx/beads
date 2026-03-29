@@ -84,6 +84,9 @@ type SyncOptions struct {
 	ExcludeTypes []types.IssueType
 	// ExcludeEphemeral skips ephemeral/wisp issues from push (default behavior in CLI).
 	ExcludeEphemeral bool
+	// ExcludeIDPatterns skips issues whose ID contains any of these substrings.
+	// Applied during push, comment sync, and attachment pull.
+	ExcludeIDPatterns []string
 	// NoComments disables comment sync even if the tracker supports it.
 	NoComments bool
 	// NoAttachments disables attachment sync even if the tracker supports it.
