@@ -247,8 +247,8 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 
 	// Copy comments via INSERT...SELECT (best-effort: log but don't fail promotion)
 	if _, err := s.execContext(ctx, `
-		INSERT IGNORE INTO comments (issue_id, author, text, created_at)
-		SELECT issue_id, author, text, created_at
+		INSERT IGNORE INTO comments (issue_id, author, text, created_at, external_ref, updated_at)
+		SELECT issue_id, author, text, created_at, external_ref, updated_at
 		FROM wisp_comments WHERE issue_id = ?
 	`, id); err != nil {
 		log.Printf("promote %s: failed to copy comments (data may be lost): %v", id, err)
@@ -314,8 +314,8 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 
 	// Copy comments: comments → wisp_comments.
 	if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO wisp_comments (issue_id, author, text, created_at)
-		SELECT issue_id, author, text, created_at
+		INSERT IGNORE INTO wisp_comments (issue_id, author, text, created_at, external_ref, updated_at)
+		SELECT issue_id, author, text, created_at, external_ref, updated_at
 		FROM comments WHERE issue_id = ?
 	`, id); err != nil {
 		log.Printf("demote %s: failed to copy comments (data may be lost): %v", id, err)

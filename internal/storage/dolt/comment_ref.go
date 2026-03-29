@@ -40,3 +40,10 @@ func (s *DoltStore) UpdateCommentExternalRef(ctx context.Context, issueID, comme
 		return issueops.UpdateCommentExternalRefInTx(ctx, tx, issueID, commentID, externalRef)
 	})
 }
+
+// UpdateCommentText updates the text of an existing comment (for edited remote comments).
+func (s *DoltStore) UpdateCommentText(ctx context.Context, issueID, commentID, newText string) error {
+	return s.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return issueops.UpdateCommentTextInTx(ctx, tx, issueID, commentID, newText)
+	})
+}

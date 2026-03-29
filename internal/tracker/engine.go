@@ -694,13 +694,15 @@ func (e *Engine) ResolveState(status types.Status) (string, bool) {
 
 // commentSyncStats tracks comment sync results.
 type commentSyncStats struct {
-	Pulled int
-	Pushed int
+	Pulled     int
+	Pushed     int
+	PullErrors int
 }
 
 // attachmentPullStats tracks attachment pull results.
 type attachmentPullStats struct {
-	Pulled int
+	Pulled     int
+	PullErrors int
 }
 
 // buildExtIssueCache builds a map of beads issueID -> TrackerIssue for all
@@ -820,7 +822,8 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 		}
 
 		// PULL: Import remote comments that are missing locally
-		if opts.Pull || (!opts.Pull && !opts.Push) {
+		didPull := opts.Pull || (!opts.Pull && !opts.Push)
+		if didPull {
 			for _, rc := range remoteComments {
 				if opts.DryRun {
 					e.msg("[dry-run] Would import comment from %s on %s", rc.Author, issue.ID)
@@ -832,12 +835,19 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 				commentRef := e.Tracker.ConfigPrefix() + ":" + rc.ID
 				existing := e.getCommentByExternalRef(ctx, issue.ID, commentRef)
 				if existing != nil {
+					// Update local comment if remote was edited (different body)
+					if rc.Body != existing.Text {
+						if err := e.updateCommentText(ctx, issue.ID, existing.ID, rc.Body); err != nil {
+							e.warn("Comment sync: failed to update edited comment on %s: %v", issue.ID, err)
+						}
+					}
 					continue // Already imported
 				}
 
 				// Import the comment
 				if err := e.importComment(ctx, issue.ID, rc.Author, rc.Body, commentRef, rc.CreatedAt); err != nil {
 					e.warn("Comment sync: failed to import comment on %s: %v", issue.ID, err)
+					stats.PullErrors++
 					continue
 				}
 				stats.Pulled++
@@ -902,10 +912,11 @@ func (e *Engine) doCommentSync(ctx context.Context, opts SyncOptions, syncer Com
 		}
 	}
 
-	// Update last_comment_sync timestamp unconditionally after a successful
-	// sync pass, even if no new comments were found. This ensures the cutoff
-	// advances and we don't re-scan the same time window.
-	if !opts.DryRun {
+	// Only advance last_comment_sync when a pull actually happened and
+	// there were no pull errors. Advancing on push-only or partial failures
+	// would skip remote comments that were never imported.
+	didPullPhase := opts.Pull || (!opts.Pull && !opts.Push)
+	if !opts.DryRun && didPullPhase && stats.PullErrors == 0 {
 		lastSync := time.Now().UTC().Format(time.RFC3339)
 		if err := e.Store.SetConfig(ctx, key, lastSync); err != nil {
 			e.warn("Failed to update last_comment_sync: %v", err)
@@ -956,6 +967,7 @@ func (e *Engine) doAttachmentPull(ctx context.Context, opts SyncOptions, fetcher
 		remoteAttachments, err := fetcher.FetchAttachments(ctx, extIssue.ID)
 		if err != nil {
 			e.warn("Attachment pull: failed to fetch attachments for %s: %v", issue.ID, err)
+			stats.PullErrors++
 			continue
 		}
 
@@ -987,15 +999,17 @@ func (e *Engine) doAttachmentPull(ctx context.Context, opts SyncOptions, fetcher
 			}
 			if err := e.createAttachment(ctx, att); err != nil {
 				e.warn("Attachment pull: failed to create attachment on %s: %v", issue.ID, err)
+				stats.PullErrors++
 				continue
 			}
 			stats.Pulled++
 		}
 	}
 
-	// Update last_attachment_sync timestamp unconditionally after a successful
-	// sync pass, even if no new attachments were found.
-	if !opts.DryRun {
+	// Only advance last_attachment_sync when there were no pull errors.
+	// Advancing on partial failures would skip remote attachments that were
+	// never imported.
+	if !opts.DryRun && stats.PullErrors == 0 {
 		key := e.Tracker.ConfigPrefix() + ".last_attachment_sync"
 		lastSync := time.Now().UTC().Format(time.RFC3339)
 		if err := e.Store.SetConfig(ctx, key, lastSync); err != nil {
@@ -1046,6 +1060,18 @@ func (e *Engine) importComment(ctx context.Context, issueID, author, text, exter
 func (e *Engine) updateCommentExternalRef(ctx context.Context, issueID, commentID, externalRef string) error {
 	if crs, ok := e.Store.(storage.CommentRefStore); ok {
 		return crs.UpdateCommentExternalRef(ctx, issueID, commentID, externalRef)
+	}
+	return nil
+}
+
+// updateCommentText updates the text of an existing comment (for edited remote comments).
+// Uses CommentRefStore (which implies UpdateCommentText support) if available, otherwise is a no-op.
+func (e *Engine) updateCommentText(ctx context.Context, issueID, commentID, newText string) error {
+	type commentTextUpdater interface {
+		UpdateCommentText(ctx context.Context, issueID, commentID, newText string) error
+	}
+	if ctu, ok := e.Store.(commentTextUpdater); ok {
+		return ctu.UpdateCommentText(ctx, issueID, commentID, newText)
 	}
 	return nil
 }

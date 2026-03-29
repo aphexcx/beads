@@ -181,7 +181,7 @@ func DeleteIssuesBySourceRepoInTx(ctx context.Context, tx *sql.Tx, sourceRepo st
 		return 0, nil
 	}
 
-	for _, table := range []string{"dependencies", "events", "comments", "labels"} {
+	for _, table := range []string{"dependencies", "events", "comments", "labels", "attachments"} {
 		for _, id := range issueIDs {
 			if table == "dependencies" {
 				_, err = tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE issue_id = ? OR depends_on_id = ?", table), id, id)
@@ -243,6 +243,7 @@ func updateIssueIDInTx(ctx context.Context, tx *sql.Tx, oldID, newID string, iss
 		{"events", "issue_id"},
 		{"labels", "issue_id"},
 		{"comments", "issue_id"},
+		{"attachments", "issue_id"},
 		{"issue_snapshots", "issue_id"},
 		{"compaction_snapshots", "issue_id"},
 		{"child_counters", "parent_id"},

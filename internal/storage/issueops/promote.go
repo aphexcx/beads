@@ -71,8 +71,8 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx *sql.Tx, id string, actor 
 
 	// Copy comments: wisp_comments → comments (best-effort).
 	if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO comments (issue_id, author, text, created_at)
-		SELECT issue_id, author, text, created_at
+		INSERT IGNORE INTO comments (issue_id, author, text, created_at, external_ref, updated_at)
+		SELECT issue_id, author, text, created_at, external_ref, updated_at
 		FROM wisp_comments WHERE issue_id = ?
 	`, id); err != nil {
 		log.Printf("promote %s: failed to copy comments: %v", id, err)

@@ -10,6 +10,5 @@ CREATE TABLE IF NOT EXISTS attachments (
     creator VARCHAR(255) NOT NULL DEFAULT '',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_attachments_issue (issue_id),
-    INDEX idx_attachments_external_ref (external_ref),
-    CONSTRAINT fk_attachments_issue FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    INDEX idx_attachments_external_ref (external_ref)
 );

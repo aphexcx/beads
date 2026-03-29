@@ -252,6 +252,29 @@ func UpdateCommentExternalRefInTx(ctx context.Context, tx *sql.Tx, issueID, comm
 	return nil
 }
 
+// UpdateCommentTextInTx updates the text of an existing comment within a transaction.
+// Used to sync edited remote comments locally.
+//
+//nolint:gosec // G201: table names come from hardcoded constants
+func UpdateCommentTextInTx(ctx context.Context, tx *sql.Tx, issueID, commentID, newText string) error {
+	table := "comments"
+	if IsActiveWispInTx(ctx, tx, issueID) {
+		table = "wisp_comments"
+	}
+
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE %s SET text = ?, updated_at = NOW() WHERE id = ? AND issue_id = ?
+	`, table), newText, commentID, issueID)
+	if err != nil {
+		return fmt.Errorf("update comment text in %s: %w", table, err)
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("comment %s not found in issue %s", commentID, issueID)
+	}
+	return nil
+}
+
 // AddCommentEventInTx adds a comment as an event to an issue within a transaction.
 // Routes to events or wisp_events based on wisp status.
 //
