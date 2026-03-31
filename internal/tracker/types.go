@@ -134,6 +134,7 @@ type PullStats struct {
 	Created     int
 	Updated     int
 	Skipped     int
+	Errors      int
 	Incremental bool
 	SyncedSince string
 }

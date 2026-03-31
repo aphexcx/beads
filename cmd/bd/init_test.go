@@ -428,8 +428,8 @@ func TestSetupClaudeSettings_InvalidJSON(t *testing.T) {
 		t.Error("Original file content should be preserved")
 	}
 
-	if strings.Contains(string(content), "bd onboard") {
-		t.Error("File should NOT contain bd onboard prompt after error")
+	if strings.Contains(string(content), "bd prime") {
+		t.Error("File should NOT contain bd prime prompt after error")
 	}
 }
 
@@ -476,8 +476,8 @@ func TestSetupClaudeSettings_ValidJSON(t *testing.T) {
 	contentStr := string(content)
 
 	// Should contain the new prompt
-	if !strings.Contains(contentStr, "bd onboard") {
-		t.Error("File should contain bd onboard prompt")
+	if !strings.Contains(contentStr, "bd prime") {
+		t.Error("File should contain bd prime prompt")
 	}
 
 	// Should preserve existing permissions
@@ -516,8 +516,8 @@ func TestSetupClaudeSettings_NoExistingFile(t *testing.T) {
 		t.Fatalf("Failed to read settings file: %v", err)
 	}
 
-	if !strings.Contains(string(content), "bd onboard") {
-		t.Error("File should contain bd onboard prompt")
+	if !strings.Contains(string(content), "bd prime") {
+		t.Error("File should contain bd prime prompt")
 	}
 }
 
@@ -1450,12 +1450,11 @@ func TestInit_WithBEADS_DIR_DoltBackend(t *testing.T) {
 		t.Fatalf("Init with BEADS_DIR and Dolt backend failed: %v", err)
 	}
 
-	// Verify Dolt database was created at BEADS_DIR
-	expectedDoltPath := filepath.Join(beadsDirPath, "dolt")
-	if info, err := os.Stat(expectedDoltPath); os.IsNotExist(err) {
-		t.Errorf("Dolt database was not created at BEADS_DIR path: %s", expectedDoltPath)
-	} else if !info.IsDir() {
-		t.Errorf("Expected Dolt path to be a directory: %s", expectedDoltPath)
+	// In embedded mode (default), the engine creates .beads/embeddeddolt/ —
+	// .beads/dolt/ should NOT be created (GH#2903).
+	unexpectedDoltPath := filepath.Join(beadsDirPath, "dolt")
+	if _, err := os.Stat(unexpectedDoltPath); err == nil {
+		t.Errorf("Empty .beads/dolt/ should not be created in embedded mode: %s", unexpectedDoltPath)
 	}
 
 	// Verify database was NOT created at CWD
