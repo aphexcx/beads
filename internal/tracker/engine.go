@@ -38,6 +38,14 @@ type PullHooks struct {
 	// Called on the raw TrackerIssue before conversion to beads format.
 	// If nil, all issues are imported.
 	ShouldImport func(issue *TrackerIssue) bool
+
+	// SyncComments is called per-issue after import to sync comments from the external tracker.
+	// If nil, comment sync is skipped during pull.
+	SyncComments func(ctx context.Context, localIssueID string, externalIssueID string) error
+
+	// SyncAttachments is called per-issue after import to sync attachment metadata from the external tracker.
+	// If nil, attachment sync is skipped during pull.
+	SyncAttachments func(ctx context.Context, localIssueID string, externalIssueID string) error
 }
 
 // PushHooks contains optional callbacks that customize push (export) behavior.
@@ -65,6 +73,10 @@ type PushHooks struct {
 	// ResolveState maps a beads status to a tracker state ID using the cached state.
 	// Only called if BuildStateCache is set. Returns (stateID, ok).
 	ResolveState func(cache interface{}, status types.Status) (string, bool)
+
+	// SyncComments is called per-issue after push to sync local comments to the external tracker.
+	// If nil, comment sync is skipped during push.
+	SyncComments func(ctx context.Context, localIssueID string, externalIssueID string) error
 }
 
 // Engine orchestrates synchronization between beads and an external tracker.
@@ -410,6 +422,18 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		}
 
 		if existing != nil && pullIssueEqual(existing, conv.Issue, ref) {
+			// Issue unchanged, but still sync comments/attachments
+			// (they may have been added externally since last sync).
+			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
+				if err := e.PullHooks.SyncComments(ctx, existing.ID, extIssue.ID); err != nil {
+					e.warn("Comment sync failed for %s: %v", existing.ID, err)
+				}
+			}
+			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
+				if err := e.PullHooks.SyncAttachments(ctx, existing.ID, extIssue.ID); err != nil {
+					e.warn("Attachment sync failed for %s: %v", existing.ID, err)
+				}
+			}
 			stats.Skipped++
 			continue
 		}
@@ -462,6 +486,22 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				continue
 			}
 			stats.Created++
+		}
+
+		// Sync comments/attachments after import (new or updated).
+		localID := conv.Issue.ID
+		if existing != nil {
+			localID = existing.ID
+		}
+		if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
+			if err := e.PullHooks.SyncComments(ctx, localID, extIssue.ID); err != nil {
+				e.warn("Comment sync failed for %s: %v", localID, err)
+			}
+		}
+		if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
+			if err := e.PullHooks.SyncAttachments(ctx, localID, extIssue.ID); err != nil {
+				e.warn("Attachment sync failed for %s: %v", localID, err)
+			}
 		}
 
 		pendingDeps = append(pendingDeps, conv.Dependencies...)
@@ -767,6 +807,13 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				// but also flag the error so the user knows the link is broken
 			}
 			stats.Created++
+
+			// Sync comments after create (push direction).
+			if e.PushHooks != nil && e.PushHooks.SyncComments != nil && created != nil && created.ID != "" {
+				if err := e.PushHooks.SyncComments(ctx, issue.ID, created.ID); err != nil {
+					e.warn("Comment push failed for %s: %v", issue.ID, err)
+				}
+			}
 		} else if !opts.CreateOnly || forceIDs[issue.ID] {
 			// Update existing external issue
 			extID := e.Tracker.ExtractIdentifier(extRef)
@@ -798,6 +845,13 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				continue
 			}
 			stats.Updated++
+
+			// Sync comments after update (push direction).
+			if e.PushHooks != nil && e.PushHooks.SyncComments != nil {
+				if err := e.PushHooks.SyncComments(ctx, issue.ID, extID); err != nil {
+					e.warn("Comment push failed for %s: %v", issue.ID, err)
+				}
+			}
 		} else {
 			stats.Skipped++
 		}
@@ -1033,6 +1087,11 @@ func (e *Engine) shouldPushIssue(issue *types.Issue, opts SyncOptions) bool {
 	}
 
 	if opts.State == "open" && issue.Status == types.StatusClosed {
+		return false
+	}
+
+	// Skip issues not updated since the --since cutoff.
+	if !opts.Since.IsZero() && !issue.UpdatedAt.After(opts.Since) {
 		return false
 	}
 

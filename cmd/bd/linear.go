@@ -7,11 +7,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/linear"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -95,6 +97,11 @@ Type Filtering (--push only):
   --exclude-type wisp       Exclude issues of these types
   --include-ephemeral       Include ephemeral issues (wisps, etc.); default is to exclude
   --parent TICKET           Only push this ticket and its descendants
+  --since 15d               Only push issues updated in the last 15 days
+  --since 2026-03-27        Only push issues updated after this date
+
+  Persistent exclude types (merged with --exclude-type):
+    bd config set linear.exclude_types "molecule,event"
 
 Conflict Resolution:
   By default, newer timestamp wins. Override with:
@@ -151,6 +158,7 @@ func init() {
 	linearSyncCmd.Flags().StringSlice("exclude-type", nil, "Exclude issues of these types (can be repeated)")
 	linearSyncCmd.Flags().Bool("include-ephemeral", false, "Include ephemeral issues (wisps, etc.) when pushing to Linear")
 	linearSyncCmd.Flags().String("parent", "", "Limit push to this beads ticket and its descendants")
+	linearSyncCmd.Flags().String("since", "", "Only push issues updated after this date (e.g. 2026-03-27, 15d for 15 days ago)")
 	linearSyncCmd.Flags().StringSlice("team", nil, "Team ID(s) to sync (overrides configured team_id/team_ids)")
 	registerSelectiveSyncFlags(linearSyncCmd)
 
@@ -171,6 +179,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	typeFilters, _ := cmd.Flags().GetStringSlice("type")
 	excludeTypes, _ := cmd.Flags().GetStringSlice("exclude-type")
 	includeEphemeral, _ := cmd.Flags().GetBool("include-ephemeral")
+	sinceStr, _ := cmd.Flags().GetString("since")
 	cliTeams, _ := cmd.Flags().GetStringSlice("team")
 
 	if !dryRun {
@@ -217,7 +226,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	engine.OnWarning = func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
 
 	// Set up Linear-specific pull hooks
-	engine.PullHooks = buildLinearPullHooks(ctx)
+	engine.PullHooks = buildLinearPullHooks(ctx, lt)
 
 	// Build sync options from CLI flags
 	opts := tracker.SyncOptions{
@@ -232,11 +241,30 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	for _, t := range typeFilters {
 		opts.TypeFilter = append(opts.TypeFilter, types.IssueType(strings.ToLower(t)))
 	}
+	// Merge CLI --exclude-type with config linear.exclude_types
+	configExclude, _ := store.GetConfig(ctx, "linear.exclude_types")
+	if configExclude != "" {
+		for _, t := range strings.Split(configExclude, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				opts.ExcludeTypes = append(opts.ExcludeTypes, types.IssueType(strings.ToLower(t)))
+			}
+		}
+	}
 	for _, t := range excludeTypes {
 		opts.ExcludeTypes = append(opts.ExcludeTypes, types.IssueType(strings.ToLower(t)))
 	}
 	if !includeEphemeral {
 		opts.ExcludeEphemeral = true
+	}
+
+	// Parse --since flag
+	if sinceStr != "" {
+		sinceTime, err := parseSinceFlag(sinceStr)
+		if err != nil {
+			FatalError("invalid --since value %q: %v", sinceStr, err)
+		}
+		opts.Since = sinceTime
 	}
 
 	if err := applySelectiveSyncFlags(cmd, &opts, push); err != nil {
@@ -294,11 +322,14 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 }
 
 // buildLinearPullHooks creates PullHooks for Linear-specific pull behavior.
-func buildLinearPullHooks(ctx context.Context) *tracker.PullHooks {
+func buildLinearPullHooks(ctx context.Context, lt *linear.Tracker) *tracker.PullHooks {
 	idMode := getLinearIDMode(ctx)
 	hashLength := getLinearHashLength(ctx)
 
 	hooks := &tracker.PullHooks{}
+
+	hooks.SyncComments = buildCommentPullHook(ctx, lt)
+	hooks.SyncAttachments = buildAttachmentPullHook(ctx, lt)
 
 	if idMode == "hash" {
 		// Pre-load existing IDs for collision avoidance
@@ -394,7 +425,135 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 			}
 			return false
 		},
+		SyncComments: buildCommentPushHook(ctx, lt),
 	}
+}
+
+// buildCommentPullHook creates a hook that pulls comments from Linear and imports them locally.
+// Uses the tracker's CommentSyncer interface for fetching. The hook unwraps the
+// HookFiringStore decorator to reach the concrete CommentRefStore implementation.
+func buildCommentPullHook(_ context.Context, lt *linear.Tracker) func(context.Context, string, string) error {
+	return func(ctx context.Context, localIssueID, externalIssueID string) error {
+		refStore, ok := storage.UnwrapStore(store).(storage.CommentRefStore)
+		if !ok {
+			return nil
+		}
+
+		comments, err := lt.FetchComments(ctx, externalIssueID, time.Time{})
+		if err != nil {
+			return fmt.Errorf("fetch comments: %w", err)
+		}
+
+		for _, c := range comments {
+			extRef := "linear:comment:" + c.ID
+			existing, err := refStore.GetCommentByExternalRef(ctx, localIssueID, extRef)
+			if err != nil {
+				continue
+			}
+			if existing != nil {
+				continue
+			}
+			if _, err := refStore.ImportCommentWithRef(ctx, localIssueID, c.Author, c.Body, extRef, c.CreatedAt); err != nil {
+				debug.Logf("comment import failed for %s: %v", localIssueID, err)
+			}
+		}
+		return nil
+	}
+}
+
+// buildAttachmentPullHook creates a hook that pulls attachment metadata from Linear.
+// Pull-only: beads does not push attachments to Linear.
+func buildAttachmentPullHook(_ context.Context, lt *linear.Tracker) func(context.Context, string, string) error {
+	return func(ctx context.Context, localIssueID, externalIssueID string) error {
+		attStore, ok := storage.UnwrapStore(store).(storage.AttachmentStore)
+		if !ok {
+			return nil
+		}
+
+		attachments, err := lt.FetchAttachments(ctx, externalIssueID)
+		if err != nil {
+			return fmt.Errorf("fetch attachments: %w", err)
+		}
+
+		for _, a := range attachments {
+			extRef := "linear:attachment:" + a.ID
+			existing, err := attStore.GetAttachmentByExternalRef(ctx, localIssueID, extRef)
+			if err != nil {
+				continue
+			}
+			if existing != nil {
+				continue
+			}
+			att := &types.Attachment{
+				IssueID:     localIssueID,
+				ExternalRef: extRef,
+				Filename:    a.Filename,
+				URL:         a.URL,
+				MimeType:    a.MimeType,
+				SizeBytes:   a.SizeBytes,
+				Source:      "linear",
+				Creator:     a.Creator,
+				CreatedAt:   a.CreatedAt,
+			}
+			if _, err := attStore.CreateAttachment(ctx, att); err != nil {
+				debug.Logf("attachment import failed for %s: %v", localIssueID, err)
+			}
+		}
+		return nil
+	}
+}
+
+// buildCommentPushHook creates a hook that pushes local comments to Linear.
+// Only comments without an existing linear:comment:* external_ref are pushed
+// (already-synced comments are skipped). Newly created Linear comment IDs are
+// recorded on the local comment so subsequent syncs don't duplicate.
+func buildCommentPushHook(_ context.Context, lt *linear.Tracker) func(context.Context, string, string) error {
+	return func(ctx context.Context, localIssueID, externalIssueID string) error {
+		refStore, ok := storage.UnwrapStore(store).(storage.CommentRefStore)
+		if !ok {
+			return nil
+		}
+
+		localComments, err := store.GetIssueComments(ctx, localIssueID)
+		if err != nil {
+			return fmt.Errorf("list local comments: %w", err)
+		}
+
+		for _, c := range localComments {
+			if strings.HasPrefix(c.ExternalRef, "linear:comment:") {
+				continue
+			}
+			remoteID, err := lt.CreateComment(ctx, externalIssueID, c.Text)
+			if err != nil {
+				debug.Logf("push comment to %s failed: %v", externalIssueID, err)
+				continue
+			}
+			extRef := "linear:comment:" + remoteID
+			if err := refStore.UpdateCommentExternalRef(ctx, localIssueID, c.ID, extRef); err != nil {
+				debug.Logf("record external_ref on %s failed: %v", c.ID, err)
+			}
+		}
+		return nil
+	}
+}
+
+// parseSinceFlag parses a --since value as either a duration shorthand
+// (e.g. "15d") or an absolute date (e.g. "2026-03-27"). Returns the cutoff
+// time; UpdatedAt strictly after this cutoff passes the filter.
+func parseSinceFlag(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err == nil && days > 0 {
+			return time.Now().UTC().AddDate(0, 0, -days), nil
+		}
+	}
+	for _, layout := range []string{"2006-01-02", "2006-01-02T15:04:05Z", time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("expected date (2006-01-02) or duration (15d)")
 }
 
 func runLinearStatus(cmd *cobra.Command, args []string) {
