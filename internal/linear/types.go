@@ -174,6 +174,11 @@ type TeamResponse struct {
 	Team TeamStates `json:"team"`
 }
 
+// ProjectTeam is a minimal team reference returned inside a Project's teams connection.
+type ProjectTeam struct {
+	ID string `json:"id"`
+}
+
 // Project represents a project in Linear.
 type Project struct {
 	ID          string  `json:"id"`
@@ -186,6 +191,9 @@ type Project struct {
 	CreatedAt   string  `json:"createdAt"`
 	UpdatedAt   string  `json:"updatedAt"`
 	CompletedAt string  `json:"completedAt,omitempty"`
+	// Teams captures the nested GraphQL teams { nodes { id } } connection.
+	// Present when fetched via FetchProjects (which requests teams); may be nil from other queries.
+	Teams []ProjectTeam `json:"-"`
 }
 
 // ProjectsResponse represents the response from projects query.
@@ -213,6 +221,59 @@ type ProjectUpdateResponse struct {
 		Success bool    `json:"success"`
 		Project Project `json:"project"`
 	} `json:"projectUpdate"`
+}
+
+// Comment represents a comment from the Linear API.
+type Comment struct {
+	ID        string `json:"id"`
+	Body      string `json:"body"`
+	CreatedAt string `json:"createdAt"`
+	UpdatedAt string `json:"updatedAt"`
+	User      *User  `json:"user"`
+}
+
+// CommentsResponse represents the response from issue comments query.
+type CommentsResponse struct {
+	Issue struct {
+		Comments struct {
+			Nodes    []Comment `json:"nodes"`
+			PageInfo struct {
+				HasNextPage bool   `json:"hasNextPage"`
+				EndCursor   string `json:"endCursor"`
+			} `json:"pageInfo"`
+		} `json:"comments"`
+	} `json:"issue"`
+}
+
+// CommentCreateResponse represents the response from commentCreate mutation.
+type CommentCreateResponse struct {
+	CommentCreate struct {
+		Success bool    `json:"success"`
+		Comment Comment `json:"comment"`
+	} `json:"commentCreate"`
+}
+
+// Attachment represents an attachment from the Linear API.
+type Attachment struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Subtitle  string `json:"subtitle"`
+	URL       string `json:"url"`
+	Creator   *User  `json:"creator,omitempty"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// AttachmentsResponse represents the response from issue attachments query.
+type AttachmentsResponse struct {
+	Issue struct {
+		Attachments struct {
+			Nodes    []Attachment `json:"nodes"`
+			PageInfo struct {
+				HasNextPage bool   `json:"hasNextPage"`
+				EndCursor   string `json:"endCursor"`
+			} `json:"pageInfo"`
+		} `json:"attachments"`
+	} `json:"issue"`
 }
 
 // SyncStats tracks statistics for a Linear sync operation.

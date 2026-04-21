@@ -210,7 +210,7 @@ func (t *Tracker) MappingConfig() *MappingConfig {
 }
 
 func (t *Tracker) IsExternalRef(ref string) bool {
-	return IsLinearExternalRef(ref)
+	return IsLinearExternalRef(ref) // Recognizes both /issue/ and /project/ URLs
 }
 
 func (t *Tracker) ExtractIdentifier(ref string) string {
@@ -385,6 +385,198 @@ func linearToTrackerIssue(li *Issue) tracker.TrackerIssue {
 	}
 
 	return ti
+}
+
+// FetchComments retrieves comments for an issue from Linear.
+// Implements tracker.CommentSyncer.
+func (t *Tracker) FetchComments(ctx context.Context, externalIssueID string, since time.Time) ([]tracker.TrackerComment, error) {
+	client := t.clientForExternalID(ctx, externalIssueID)
+	if client == nil {
+		return nil, fmt.Errorf("no Linear client available")
+	}
+	comments, err := client.FetchIssueComments(ctx, externalIssueID, since)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]tracker.TrackerComment, 0, len(comments))
+	for _, c := range comments {
+		tc := tracker.TrackerComment{
+			ID:   c.ID,
+			Body: c.Body,
+		}
+		if c.User != nil {
+			tc.Author = c.User.Name
+		}
+		if ts, err := time.Parse(time.RFC3339, c.CreatedAt); err == nil {
+			tc.CreatedAt = ts
+		}
+		if ts, err := time.Parse(time.RFC3339, c.UpdatedAt); err == nil {
+			tc.UpdatedAt = ts
+		}
+		result = append(result, tc)
+	}
+	return result, nil
+}
+
+// CreateComment creates a new comment on an issue in Linear.
+// Implements tracker.CommentSyncer.
+func (t *Tracker) CreateComment(ctx context.Context, externalIssueID, body string) (string, error) {
+	client := t.clientForExternalID(ctx, externalIssueID)
+	if client == nil {
+		return "", fmt.Errorf("no Linear client available")
+	}
+	comment, err := client.CreateIssueComment(ctx, externalIssueID, body)
+	if err != nil {
+		return "", err
+	}
+	return comment.ID, nil
+}
+
+// FetchAttachments retrieves attachment metadata for an issue from Linear.
+// Implements tracker.AttachmentFetcher.
+func (t *Tracker) FetchAttachments(ctx context.Context, externalIssueID string) ([]tracker.TrackerAttachment, error) {
+	client := t.clientForExternalID(ctx, externalIssueID)
+	if client == nil {
+		return nil, fmt.Errorf("no Linear client available")
+	}
+	attachments, err := client.FetchIssueAttachments(ctx, externalIssueID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]tracker.TrackerAttachment, 0, len(attachments))
+	for _, a := range attachments {
+		ta := tracker.TrackerAttachment{
+			ID:       a.ID,
+			Filename: a.Title,
+			URL:      a.URL,
+			// Note: MimeType is not populated because Linear's attachment
+			// API does not expose metadata in the GraphQL schema.
+		}
+		if a.Creator != nil {
+			ta.Creator = a.Creator.Name
+		}
+		if ts, err := time.Parse(time.RFC3339, a.CreatedAt); err == nil {
+			ta.CreatedAt = ts
+		}
+		result = append(result, ta)
+	}
+	return result, nil
+}
+
+// CreateProject creates a new Linear project from a beads epic.
+// Implements tracker.ProjectSyncer.
+func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string, string, error) {
+	client := t.primaryClient()
+	if client == nil {
+		return "", "", fmt.Errorf("no Linear client available")
+	}
+
+	state := MapEpicToProjectState(epic.Status)
+	project, err := client.CreateProject(ctx, epic.Title, epic.Description, state)
+	if err != nil {
+		return "", "", err
+	}
+
+	return project.URL, project.ID, nil
+}
+
+// UpdateProject updates an existing Linear project from a beads epic.
+// Implements tracker.ProjectSyncer.
+func (t *Tracker) UpdateProject(ctx context.Context, projectID string, epic *types.Issue) error {
+	client := t.primaryClient()
+	if client == nil {
+		return fmt.Errorf("no Linear client available")
+	}
+
+	updates := map[string]interface{}{
+		"name":        epic.Title,
+		"description": epic.Description,
+		"state":       MapEpicToProjectState(epic.Status),
+	}
+
+	_, err := client.UpdateProject(ctx, projectID, updates)
+	return err
+}
+
+// FetchProjects retrieves Linear projects and converts them to TrackerProjects.
+// Implements tracker.ProjectSyncer.
+func (t *Tracker) FetchProjects(ctx context.Context, state string) ([]tracker.TrackerProject, error) {
+	var allProjects []tracker.TrackerProject
+
+	for _, teamID := range t.teamIDs {
+		client := t.clients[teamID]
+		if client == nil {
+			continue
+		}
+
+		projects, err := client.FetchProjects(ctx, state)
+		if err != nil {
+			return nil, fmt.Errorf("fetching projects from team %s: %w", teamID, err)
+		}
+
+		for _, p := range projects {
+			tp := tracker.TrackerProject{
+				ID:          p.ID,
+				Name:        p.Name,
+				Description: p.Description,
+				URL:         p.URL,
+				State:       p.State,
+			}
+			if updatedAt, err := time.Parse(time.RFC3339, p.UpdatedAt); err == nil {
+				tp.UpdatedAt = updatedAt
+			}
+			allProjects = append(allProjects, tp)
+		}
+	}
+
+	return allProjects, nil
+}
+
+// AssignIssueToProject assigns a Linear issue to a project.
+// Implements tracker.ProjectSyncer.
+func (t *Tracker) AssignIssueToProject(ctx context.Context, issueExternalID, projectID string) error {
+	client := t.clientForExternalID(ctx, issueExternalID)
+	if client == nil {
+		return fmt.Errorf("no Linear client available for issue %s", issueExternalID)
+	}
+
+	_, err := client.UpdateIssue(ctx, issueExternalID, map[string]interface{}{
+		"projectId": projectID,
+	})
+	return err
+}
+
+// SetIssueParent sets the parent issue for sub-issue nesting in Linear.
+// Implements tracker.ProjectSyncer.
+func (t *Tracker) SetIssueParent(ctx context.Context, issueExternalID, parentExternalID string) error {
+	client := t.clientForExternalID(ctx, issueExternalID)
+	if client == nil {
+		return fmt.Errorf("no Linear client available for issue %s", issueExternalID)
+	}
+
+	_, err := client.UpdateIssue(ctx, issueExternalID, map[string]interface{}{
+		"parentId": parentExternalID,
+	})
+	return err
+}
+
+// IsProjectRef checks if an external_ref is a Linear project URL.
+// Implements tracker.ProjectSyncer.
+func (t *Tracker) IsProjectRef(ref string) bool {
+	return IsLinearProjectRef(ref)
+}
+
+// ExtractProjectID extracts the project ID from a Linear project URL or returns the ID directly.
+// Implements tracker.ProjectSyncer.
+func (t *Tracker) ExtractProjectID(ref string) string {
+	// If it's a URL, we need to look up the project by slug to get the ID.
+	// For simplicity, return the slug — callers needing the UUID should use FetchProject.
+	if IsLinearProjectRef(ref) {
+		return ExtractLinearProjectSlug(ref)
+	}
+	return ref
 }
 
 // BuildStateCacheFromTracker builds a StateCache using the tracker's primary client.
