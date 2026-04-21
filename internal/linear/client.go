@@ -17,12 +17,13 @@ import (
 )
 
 // projectsQuery is the GraphQL query for fetching projects.
+// Note: Linear's ProjectFilter does not support a "team" field, so we fetch
+// all projects and include teams in the response for client-side filtering.
 const projectsQuery = `
-	query Projects($filter: ProjectFilter!, $first: Int!, $after: String) {
+	query Projects($first: Int!, $after: String) {
 		projects(
 			first: $first
 			after: $after
-			filter: $filter
 		) {
 			nodes {
 				id
@@ -35,6 +36,11 @@ const projectsQuery = `
 				createdAt
 				updatedAt
 				completedAt
+				teams {
+					nodes {
+						id
+					}
+				}
 			}
 			pageInfo {
 				hasNextPage
@@ -690,6 +696,196 @@ func (sc *StateCache) FindStateForBeadsStatus(status types.Status) string {
 	return ""
 }
 
+// FetchIssueComments retrieves comments for a specific issue from Linear.
+// If since is non-zero, only comments created after that time are returned.
+func (c *Client) FetchIssueComments(ctx context.Context, issueID string, since time.Time) ([]Comment, error) {
+	var allComments []Comment
+	var cursor string
+
+	query := `
+		query IssueComments($issueId: String!, $first: Int!, $after: String) {
+			issue(id: $issueId) {
+				comments(first: $first, after: $after) {
+					nodes {
+						id
+						body
+						createdAt
+						updatedAt
+						user {
+							id
+							name
+							email
+							displayName
+						}
+					}
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+				}
+			}
+		}
+	`
+
+	for {
+		variables := map[string]interface{}{
+			"issueId": issueID,
+			"first":   MaxPageSize,
+		}
+		if cursor != "" {
+			variables["after"] = cursor
+		}
+
+		req := &GraphQLRequest{
+			Query:     query,
+			Variables: variables,
+		}
+
+		data, err := c.Execute(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch comments for issue %s: %w", issueID, err)
+		}
+
+		var resp CommentsResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return nil, fmt.Errorf("failed to parse comments response: %w", err)
+		}
+
+		for _, comment := range resp.Issue.Comments.Nodes {
+			if !since.IsZero() {
+				createdAt, err := time.Parse(time.RFC3339, comment.CreatedAt)
+				if err == nil && !createdAt.After(since) {
+					continue
+				}
+			}
+			allComments = append(allComments, comment)
+		}
+
+		if !resp.Issue.Comments.PageInfo.HasNextPage {
+			break
+		}
+		cursor = resp.Issue.Comments.PageInfo.EndCursor
+	}
+
+	return allComments, nil
+}
+
+// CreateIssueComment creates a new comment on an issue in Linear.
+// Returns the created comment.
+func (c *Client) CreateIssueComment(ctx context.Context, issueID, body string) (*Comment, error) {
+	query := `
+		mutation CreateComment($input: CommentCreateInput!) {
+			commentCreate(input: $input) {
+				success
+				comment {
+					id
+					body
+					createdAt
+					updatedAt
+					user {
+						id
+						name
+						email
+						displayName
+					}
+				}
+			}
+		}
+	`
+
+	req := &GraphQLRequest{
+		Query: query,
+		Variables: map[string]interface{}{
+			"input": map[string]interface{}{
+				"issueId": issueID,
+				"body":    body,
+			},
+		},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create comment: %w", err)
+	}
+
+	var resp CommentCreateResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse create comment response: %w", err)
+	}
+
+	if !resp.CommentCreate.Success {
+		return nil, fmt.Errorf("comment creation reported as unsuccessful")
+	}
+
+	return &resp.CommentCreate.Comment, nil
+}
+
+// FetchIssueAttachments retrieves attachment metadata for a specific issue from Linear.
+func (c *Client) FetchIssueAttachments(ctx context.Context, issueID string) ([]Attachment, error) {
+	var allAttachments []Attachment
+	var cursor string
+
+	query := `
+		query IssueAttachments($issueId: String!, $first: Int!, $after: String) {
+			issue(id: $issueId) {
+				attachments(first: $first, after: $after) {
+					nodes {
+						id
+						title
+						subtitle
+						url
+						creator {
+							id
+							name
+							email
+							displayName
+						}
+						createdAt
+					}
+					pageInfo {
+						hasNextPage
+						endCursor
+					}
+				}
+			}
+		}
+	`
+
+	for {
+		variables := map[string]interface{}{
+			"issueId": issueID,
+			"first":   MaxPageSize,
+		}
+		if cursor != "" {
+			variables["after"] = cursor
+		}
+
+		req := &GraphQLRequest{
+			Query:     query,
+			Variables: variables,
+		}
+
+		data, err := c.Execute(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch attachments for issue %s: %w", issueID, err)
+		}
+
+		var resp AttachmentsResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return nil, fmt.Errorf("failed to parse attachments response: %w", err)
+		}
+
+		allAttachments = append(allAttachments, resp.Issue.Attachments.Nodes...)
+
+		if !resp.Issue.Attachments.PageInfo.HasNextPage {
+			break
+		}
+		cursor = resp.Issue.Attachments.PageInfo.EndCursor
+	}
+
+	return allAttachments, nil
+}
+
 // ExtractLinearIdentifier extracts the Linear issue identifier (e.g., "TEAM-123") from a Linear URL.
 func ExtractLinearIdentifier(url string) string {
 	// Linear URLs look like: https://linear.app/team/issue/TEAM-123/title
@@ -703,9 +899,10 @@ func ExtractLinearIdentifier(url string) string {
 	return ""
 }
 
-// CanonicalizeLinearExternalRef returns a stable Linear issue URL without the slug.
+// CanonicalizeLinearExternalRef returns a stable Linear issue or project URL without the slug.
 // Example: https://linear.app/team/issue/TEAM-123/title -> https://linear.app/team/issue/TEAM-123
-// Returns ok=false if the URL isn't a recognizable Linear issue URL.
+// Example: https://linear.app/team/project/slug-id/title -> https://linear.app/team/project/slug-id
+// Returns ok=false if the URL isn't a recognizable Linear URL.
 func CanonicalizeLinearExternalRef(externalRef string) (canonical string, ok bool) {
 	if externalRef == "" || !IsLinearExternalRef(externalRef) {
 		return "", false
@@ -718,7 +915,7 @@ func CanonicalizeLinearExternalRef(externalRef string) (canonical string, ok boo
 
 	segments := strings.Split(parsed.Path, "/")
 	for i, segment := range segments {
-		if segment == "issue" && i+1 < len(segments) && segments[i+1] != "" {
+		if (segment == "issue" || segment == "project") && i+1 < len(segments) && segments[i+1] != "" {
 			path := "/" + strings.Join(segments[1:i+2], "/")
 			return fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, path), true
 		}
@@ -727,9 +924,29 @@ func CanonicalizeLinearExternalRef(externalRef string) (canonical string, ok boo
 	return "", false
 }
 
-// IsLinearExternalRef checks if an external_ref URL is a Linear issue URL.
+// IsLinearExternalRef checks if an external_ref URL is a Linear issue or project URL.
 func IsLinearExternalRef(externalRef string) bool {
-	return strings.Contains(externalRef, "linear.app/") && strings.Contains(externalRef, "/issue/")
+	if !strings.Contains(externalRef, "linear.app/") {
+		return false
+	}
+	return strings.Contains(externalRef, "/issue/") || strings.Contains(externalRef, "/project/")
+}
+
+// IsLinearProjectRef checks if an external_ref URL is a Linear project URL.
+func IsLinearProjectRef(externalRef string) bool {
+	return strings.Contains(externalRef, "linear.app/") && strings.Contains(externalRef, "/project/")
+}
+
+// ExtractLinearProjectSlug extracts the project slug ID from a Linear project URL.
+// Linear project URLs look like: https://linear.app/team/project/slug-id/title
+func ExtractLinearProjectSlug(url string) string {
+	parts := strings.Split(url, "/")
+	for i, part := range parts {
+		if part == "project" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 // FetchTeams retrieves all teams accessible with the current API key.
@@ -766,28 +983,41 @@ func (c *Client) FetchTeams(ctx context.Context) ([]Team, error) {
 
 // FetchProjects retrieves projects from Linear with optional filtering by state.
 // state can be: "planned", "started", "paused", "completed", "canceled", or "all"/"".
+// Projects are fetched without a team filter (Linear's ProjectFilter doesn't support it)
+// and then filtered client-side to only include projects belonging to the configured team.
 func (c *Client) FetchProjects(ctx context.Context, state string) ([]Project, error) {
+	// Local type to unmarshal the nested teams connection from the GraphQL response.
+	type projectWithTeams struct {
+		ID          string  `json:"id"`
+		Name        string  `json:"name"`
+		Description string  `json:"description"`
+		SlugId      string  `json:"slugId"`
+		URL         string  `json:"url"`
+		State       string  `json:"state"`
+		Progress    float64 `json:"progress"`
+		CreatedAt   string  `json:"createdAt"`
+		UpdatedAt   string  `json:"updatedAt"`
+		CompletedAt string  `json:"completedAt,omitempty"`
+		Teams       struct {
+			Nodes []ProjectTeam `json:"nodes"`
+		} `json:"teams"`
+	}
+	type projectsWithTeamsResp struct {
+		Projects struct {
+			Nodes    []projectWithTeams `json:"nodes"`
+			PageInfo struct {
+				HasNextPage bool   `json:"hasNextPage"`
+				EndCursor   string `json:"endCursor"`
+			} `json:"pageInfo"`
+		} `json:"projects"`
+	}
+
 	var allProjects []Project
 	var cursor string
 
-	filter := map[string]interface{}{
-		"team": map[string]interface{}{
-			"id": map[string]interface{}{
-				"eq": c.TeamID,
-			},
-		},
-	}
-
-	if state != "all" && state != "" {
-		filter["state"] = map[string]interface{}{
-			"eq": state,
-		}
-	}
-
 	for {
 		variables := map[string]interface{}{
-			"filter": filter,
-			"first":  MaxPageSize,
+			"first": MaxPageSize,
 		}
 		if cursor != "" {
 			variables["after"] = cursor
@@ -803,17 +1033,50 @@ func (c *Client) FetchProjects(ctx context.Context, state string) ([]Project, er
 			return nil, fmt.Errorf("failed to fetch projects: %w", err)
 		}
 
-		var projectsResp ProjectsResponse
-		if err := json.Unmarshal(data, &projectsResp); err != nil {
+		var resp projectsWithTeamsResp
+		if err := json.Unmarshal(data, &resp); err != nil {
 			return nil, fmt.Errorf("failed to parse projects response: %w", err)
 		}
 
-		allProjects = append(allProjects, projectsResp.Projects.Nodes...)
+		for _, p := range resp.Projects.Nodes {
+			// Client-side team filter: only include projects that belong to our team
+			if c.TeamID != "" {
+				belongsToTeam := false
+				for _, t := range p.Teams.Nodes {
+					if t.ID == c.TeamID {
+						belongsToTeam = true
+						break
+					}
+				}
+				if !belongsToTeam {
+					continue
+				}
+			}
 
-		if !projectsResp.Projects.PageInfo.HasNextPage {
+			// Client-side state filter
+			if state != "all" && state != "" && p.State != state {
+				continue
+			}
+
+			allProjects = append(allProjects, Project{
+				ID:          p.ID,
+				Name:        p.Name,
+				Description: p.Description,
+				SlugId:      p.SlugId,
+				URL:         p.URL,
+				State:       p.State,
+				Progress:    p.Progress,
+				CreatedAt:   p.CreatedAt,
+				UpdatedAt:   p.UpdatedAt,
+				CompletedAt: p.CompletedAt,
+				Teams:       p.Teams.Nodes,
+			})
+		}
+
+		if !resp.Projects.PageInfo.HasNextPage {
 			break
 		}
-		cursor = projectsResp.Projects.PageInfo.EndCursor
+		cursor = resp.Projects.PageInfo.EndCursor
 	}
 
 	return allProjects, nil
@@ -872,6 +1135,51 @@ func (c *Client) CreateProject(ctx context.Context, name, description, state str
 	}
 
 	return &createResp.ProjectCreate.Project, nil
+}
+
+// FetchProject retrieves a single project by ID from Linear.
+func (c *Client) FetchProject(ctx context.Context, projectID string) (*Project, error) {
+	query := `
+		query Project($id: String!) {
+			project(id: $id) {
+				id
+				name
+				description
+				slugId
+				url
+				state
+				progress
+				createdAt
+				updatedAt
+				completedAt
+			}
+		}
+	`
+
+	req := &GraphQLRequest{
+		Query: query,
+		Variables: map[string]interface{}{
+			"id": projectID,
+		},
+	}
+
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch project: %w", err)
+	}
+
+	var resp struct {
+		Project Project `json:"project"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse project response: %w", err)
+	}
+
+	if resp.Project.ID == "" {
+		return nil, nil
+	}
+
+	return &resp.Project, nil
 }
 
 // UpdateProject updates an existing project in Linear.
