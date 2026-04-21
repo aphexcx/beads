@@ -91,6 +91,8 @@ type SyncOptions struct {
 	// or external refs (e.g. "EXT-456"). When non-empty, push filters local issues
 	// by ID and pull uses FetchIssue() for targeted retrieval instead of bulk fetch.
 	IssueIDs []string
+	// Since limits push to issues updated after this time. Zero value means no restriction.
+	Since time.Time
 }
 
 // SyncResult is the complete result of a sync operation.
