@@ -411,6 +411,51 @@ func TestIssueToBeads(t *testing.T) {
 	}
 }
 
+// TestIssueToBeadsSetsCancelCloseReason verifies that pulling a Linear
+// issue in a canceled-type state stamps a close_reason on the beads copy
+// so the subsequent push doesn't route it as Done. Issues pulled in
+// Done/other states get no auto close_reason so user-written reasons
+// survive on unrelated beads (buildPullIssueUpdates enforces that).
+func TestIssueToBeadsSetsCancelCloseReason(t *testing.T) {
+	config := DefaultMappingConfig()
+
+	base := func(state *State) *Issue {
+		return &Issue{
+			ID: "u-1", Identifier: "T-1", Title: "t", URL: "https://linear.app/t/issue/T-1",
+			State:     state,
+			CreatedAt: "2026-04-01T00:00:00Z", UpdatedAt: "2026-04-01T00:00:00Z",
+		}
+	}
+
+	closeReasonOf := func(conv *IssueConversion) string {
+		issue, ok := conv.Issue.(*types.Issue)
+		if !ok {
+			t.Fatalf("conv.Issue is not *types.Issue: %T", conv.Issue)
+		}
+		return issue.CloseReason
+	}
+
+	got := closeReasonOf(IssueToBeads(base(&State{Type: "canceled", Name: "Canceled"}), config))
+	if got == "" || !strings.Contains(got, "canceled") {
+		t.Errorf("canceled state should signal cancel intent, got %q", got)
+	}
+
+	got = closeReasonOf(IssueToBeads(base(&State{Type: "canceled", Name: "Duplicate"}), config))
+	if got == "" {
+		t.Errorf("duplicate (canceled-type) should set CloseReason, got empty")
+	}
+
+	got = closeReasonOf(IssueToBeads(base(&State{Type: "completed", Name: "Done"}), config))
+	if got != "" {
+		t.Errorf("completed state should leave CloseReason empty, got %q", got)
+	}
+
+	got = closeReasonOf(IssueToBeads(base(&State{Type: "started", Name: "In Progress"}), config))
+	if got != "" {
+		t.Errorf("non-closed state should leave CloseReason empty, got %q", got)
+	}
+}
+
 func TestIssueToBeadsWithParent(t *testing.T) {
 	config := DefaultMappingConfig()
 
