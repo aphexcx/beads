@@ -395,9 +395,11 @@ func ClassifyCloseReason(reason string) CloseIntent {
 	if s == "" {
 		return CloseIntentCompleted
 	}
+	// Both US ("canceled") and British ("cancelled") spellings are accepted.
+	// nolint:misspell // intentionally accepting both spellings
 	for _, prefix := range []string{
 		"stale:", "stale ", "stale,",
-		"canceled", "canceled",
+		"canceled", "cancelled",
 		"duplicate",
 		"superseded",
 		"obsolete",
@@ -511,7 +513,21 @@ func PushFieldsEqual(local *types.Issue, remote *Issue, config *MappingConfig) b
 	if PriorityToLinear(local.Priority, config) != remote.Priority {
 		return false
 	}
-	return StateToBeadsStatus(remote.State, config) == local.Status
+	if StateToBeadsStatus(remote.State, config) != local.Status {
+		return false
+	}
+	// For closed beads, "equal beads status" isn't enough — Linear has
+	// two terminal states (completed → Done, canceled → Canceled) that
+	// both map to beads closed. If local's close_reason would route to a
+	// different Linear type than the current remote state, we must push.
+	if local.Status == types.StatusClosed && remote.State != nil {
+		localIsCanceled := ClassifyCloseReason(local.CloseReason) == CloseIntentCanceled
+		remoteIsCanceled := strings.EqualFold(strings.TrimSpace(remote.State.Type), "canceled")
+		if localIsCanceled != remoteIsCanceled {
+			return false
+		}
+	}
+	return true
 }
 
 // PushFieldsEqualToBeads is a fallback comparator for cases where Linear's raw
