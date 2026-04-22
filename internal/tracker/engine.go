@@ -532,6 +532,15 @@ func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
 		!equalNormalizedStrings(local.Labels, remote.Labels) {
 		return false
 	}
+	// For closed beads also compare close_reason — the tracker's field
+	// mapper populates remote.CloseReason to reflect Linear's terminal
+	// state intent (Canceled → marker, Done → empty). Treating them as
+	// equal when close_reason drifts lets a bead remain marked
+	// cancel-intent locally after Linear flipped Canceled→Done, which
+	// then re-clobbers on the next push.
+	if local.Status == types.StatusClosed && local.CloseReason != remote.CloseReason {
+		return false
+	}
 	localRef := ""
 	if local.ExternalRef != nil {
 		localRef = strings.TrimSpace(*local.ExternalRef)
@@ -547,6 +556,19 @@ func buildPullIssueUpdates(existing *types.Issue, remote *types.Issue, ref strin
 		"status":      string(remote.Status),
 		"issue_type":  string(remote.IssueType),
 		"assignee":    remote.Assignee,
+	}
+	// Sync close_reason on any closed pull so Linear's terminal-state
+	// intent (Done vs Canceled) survives round-trip. Without this, a
+	// bead that was reaper-auto-closed locally and then manually moved
+	// to Done in Linear would keep its "stale:" close_reason, and the
+	// next push would route it back to Canceled via close_reason-based
+	// state resolution. The tracker's field mapper is responsible for
+	// setting remote.CloseReason: non-empty for Canceled/Duplicate-type
+	// states, empty for Done. Overwriting free-form user close_reasons
+	// on closed beads is intentional — the same clobber model is
+	// already used for title/description/priority/status/assignee.
+	if remote.Status == types.StatusClosed {
+		updates["close_reason"] = remote.CloseReason
 	}
 	trimmedRef := strings.TrimSpace(ref)
 	if trimmedRef == "" {

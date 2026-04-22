@@ -625,6 +625,18 @@ func IssueToBeads(li *Issue, config *MappingConfig) *IssueConversion {
 	// Map state using configurable mapping
 	issue.Status = StateToBeadsStatus(li.State, config)
 
+	// Record cancel-intent in close_reason so future pushes route the bead
+	// to the same terminal Linear state (Canceled, not Done). beads only
+	// has a single closed status — without this hint, a bead that pulled
+	// from Linear's Canceled state would push back as Done on the next
+	// sync because ResolveStateIDForIssue defaults to Completed when
+	// close_reason is absent or looks done-ish.
+	if issue.Status == types.StatusClosed && li.State != nil {
+		if strings.EqualFold(strings.TrimSpace(li.State.Type), "canceled") {
+			issue.CloseReason = "canceled: pulled from Linear state " + li.State.Name
+		}
+	}
+
 	if li.CompletedAt != "" {
 		completedAt, err := time.Parse(time.RFC3339, li.CompletedAt)
 		if err == nil {
