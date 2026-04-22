@@ -158,7 +158,7 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 
 	priority := PriorityToLinear(issue.Priority, t.config)
 
-	stateID, err := t.findStateID(ctx, client, issue.Status)
+	stateID, err := t.findStateIDForIssue(ctx, client, issue)
 	if err != nil {
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
 	}
@@ -183,7 +183,9 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	updates := mapper.IssueToTracker(issue)
 
 	// Resolve and include state so status changes are pushed to Linear.
-	stateID, err := t.findStateID(ctx, client, issue.Status)
+	// Uses the issue-aware resolver so close_reason distinguishes
+	// Done vs. Canceled for closed beads.
+	stateID, err := t.findStateIDForIssue(ctx, client, issue)
 	if err != nil {
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
 	}
@@ -243,14 +245,30 @@ func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 			return fmt.Errorf("fetching workflow states for team %s: %w", teamID, err)
 		}
 		for _, status := range []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked, types.StatusClosed} {
-			if _, err := ResolveStateIDForBeadsStatus(cache, status, t.config); err != nil {
+			var resolveErr error
+			if status == types.StatusClosed {
+				// Closed uses close_reason-aware routing at push time, not
+				// state_map. Validate both terminal paths (completed + canceled)
+				// resolve to a state — a team missing a Done-type or
+				// Canceled-type state should still be flagged here.
+				synthDone := &types.Issue{Status: types.StatusClosed, CloseReason: ""}
+				synthCancel := &types.Issue{Status: types.StatusClosed, CloseReason: "stale:"}
+				if _, err := ResolveStateIDForIssue(cache, synthDone, t.config); err != nil {
+					resolveErr = err
+				} else if _, err := ResolveStateIDForIssue(cache, synthCancel, t.config); err != nil {
+					resolveErr = err
+				}
+			} else {
+				_, resolveErr = ResolveStateIDForBeadsStatus(cache, status, t.config)
+			}
+			if resolveErr != nil {
 				// Only fail for statuses the config explicitly tries to map or when
 				// mappings are entirely absent. Missing blocked mappings are allowed
 				// until a blocked issue is actually pushed.
-				if status == types.StatusBlocked && strings.Contains(err.Error(), "has no configured Linear state") {
+				if status == types.StatusBlocked && strings.Contains(resolveErr.Error(), "has no configured Linear state") {
 					continue
 				}
-				return err
+				return resolveErr
 			}
 		}
 	}
@@ -258,13 +276,27 @@ func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 }
 
 // findStateID looks up the Linear workflow state ID for a beads status
-// using the given per-team client.
+// using the given per-team client. Kept for status-only callers that have
+// no issue context (e.g. pre-flight mapping validation).
 func (t *Tracker) findStateID(ctx context.Context, client *Client, status types.Status) (string, error) {
 	cache, err := BuildStateCache(ctx, client)
 	if err != nil {
 		return "", err
 	}
 	return ResolveStateIDForBeadsStatus(cache, status, t.config)
+}
+
+// findStateIDForIssue picks a Linear state ID for the given issue,
+// honoring close_reason when the bead is closed so Done vs. Canceled is
+// chosen correctly (GH#bd-1ob follow-up: was routing every closed bead
+// to whichever terminal state the state_map happened to name-match, which
+// in practice was always Canceled).
+func (t *Tracker) findStateIDForIssue(ctx context.Context, client *Client, issue *types.Issue) (string, error) {
+	cache, err := BuildStateCache(ctx, client)
+	if err != nil {
+		return "", err
+	}
+	return ResolveStateIDForIssue(cache, issue, t.config)
 }
 
 // primaryClient returns the client for the first configured team.

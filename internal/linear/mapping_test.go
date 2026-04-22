@@ -704,3 +704,105 @@ func TestPushFieldsEqualToBeads(t *testing.T) {
 		t.Fatal("expected beads-form fallback comparison to ignore local-only fields")
 	}
 }
+
+func TestClassifyCloseReason(t *testing.T) {
+	tests := []struct {
+		reason string
+		want   CloseIntent
+	}{
+		{"", CloseIntentCompleted},
+		{"Closed", CloseIntentCompleted},
+		{"Work completed and merged via PRs #115 and #124", CloseIntentCompleted},
+		{"Deleted /app/admin/ directory", CloseIntentCompleted},
+		{"stale:auto-closed by reaper", CloseIntentCanceled},
+		{"STALE: no activity for 30 days", CloseIntentCanceled},
+		{"canceled - not shipping this quarter", CloseIntentCanceled},
+		{"Cancelled (British spelling)", CloseIntentCanceled},
+		{"duplicate of hw-abc", CloseIntentCanceled},
+		{"superseded by hw-def", CloseIntentCanceled},
+		{"obsolete", CloseIntentCanceled},
+		{"wontfix: by design", CloseIntentCanceled},
+		{"won't fix — external dep", CloseIntentCanceled},
+		{"abandoned after spike", CloseIntentCanceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reason, func(t *testing.T) {
+			got := ClassifyCloseReason(tt.reason)
+			if got != tt.want {
+				t.Errorf("ClassifyCloseReason(%q) = %v, want %v", tt.reason, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveStateIDForIssueUsesCloseReason verifies that closed beads with
+// done-ish close_reason land on a completed-type Linear state, while
+// cancellation-ish reasons land on a canceled-type state. Critically,
+// configuring state_map with both canceled and done → closed (the natural
+// config for a team with both terminal states) no longer triggers the
+// ambiguity error on push — close_reason is the disambiguator now.
+func TestResolveStateIDForIssueUsesCloseReason(t *testing.T) {
+	cache := &StateCache{
+		States: []State{
+			{ID: "done-id", Name: "Done", Type: "completed"},
+			{ID: "canceled-id", Name: "Canceled", Type: "canceled"},
+			{ID: "duplicate-id", Name: "Duplicate", Type: "canceled"},
+		},
+	}
+	config := DefaultMappingConfig()
+	// Matches the user-facing config we recommend: both terminal types map
+	// to the single beads closed status.
+	config.ExplicitStateMap["done"] = "closed"
+	config.ExplicitStateMap["canceled"] = "closed"
+
+	tests := []struct {
+		name    string
+		issue   *types.Issue
+		wantID  string
+		wantErr bool
+	}{
+		{
+			name:   "completed via empty close_reason",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: ""},
+			wantID: "done-id",
+		},
+		{
+			name:   "completed via done-ish close_reason",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "merged in PR #42"},
+			wantID: "done-id",
+		},
+		{
+			name:   "canceled via reaper stale prefix",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "stale:auto-closed by reaper"},
+			wantID: "canceled-id",
+		},
+		{
+			name:   "canceled via duplicate (prefers first canceled-type state by name)",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "duplicate of hw-abc"},
+			wantID: "canceled-id", // "canceled" name match beats "duplicate"
+		},
+		{
+			name:    "open status delegates to state_map",
+			issue:   &types.Issue{Status: types.StatusOpen, CloseReason: ""},
+			wantErr: true, // open isn't mapped in this cache, state_map path errors
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveStateIDForIssue(cache, tt.issue, config)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got state %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.wantID {
+				t.Errorf("ResolveStateIDForIssue() = %q, want %q", got, tt.wantID)
+			}
+		})
+	}
+}

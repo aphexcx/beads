@@ -373,6 +373,95 @@ func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config
 	return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q", status)
 }
 
+// CloseIntent describes whether a closed bead represents completion (Done)
+// or cancellation (abandoned, superseded, duplicate) for purposes of routing
+// to the right terminal Linear state.
+type CloseIntent int
+
+const (
+	CloseIntentCompleted CloseIntent = iota
+	CloseIntentCanceled
+)
+
+// ClassifyCloseReason inspects a bead's close_reason free-form string and
+// returns whether the bead was canceled (abandoned) or completed (done).
+// Heuristics match the close_reason strings actually produced in Gas Town
+// (e.g. reaper's "stale:auto-closed by reaper") plus the common vocabulary
+// ("duplicate", "superseded", "obsolete", "wontfix", "abandoned") used by
+// humans when closing without shipping. Empty / generic / done-sounding
+// reasons default to Completed — the safer default for manual bd close.
+func ClassifyCloseReason(reason string) CloseIntent {
+	s := strings.ToLower(strings.TrimSpace(reason))
+	if s == "" {
+		return CloseIntentCompleted
+	}
+	for _, prefix := range []string{
+		"stale:", "stale ", "stale,",
+		"canceled", "canceled",
+		"duplicate",
+		"superseded",
+		"obsolete",
+		"wontfix", "won't fix", "wont-fix",
+		"abandoned",
+	} {
+		if strings.HasPrefix(s, prefix) {
+			return CloseIntentCanceled
+		}
+	}
+	return CloseIntentCompleted
+}
+
+// ResolveStateIDForIssue picks the correct Linear workflow state ID for
+// pushing `issue`. Non-closed statuses delegate to
+// ResolveStateIDForBeadsStatus (the existing explicit-state_map path).
+// Closed beads bypass state_map and use close_reason semantics to pick
+// a state of the correct Linear type:
+//   - cancellation intent → a "canceled"-type state (prefer name "Canceled")
+//   - completion intent   → a "completed"-type state (prefer name "Done")
+//
+// This lets a single beads status=closed correctly round-trip to either
+// Linear terminal state without the ambiguity of having both
+// state_map.canceled=closed and state_map.done=closed configured.
+func ResolveStateIDForIssue(cache *StateCache, issue *types.Issue, config *MappingConfig) (string, error) {
+	if issue == nil {
+		return "", fmt.Errorf("cannot resolve state: nil issue")
+	}
+	if issue.Status != types.StatusClosed {
+		return ResolveStateIDForBeadsStatus(cache, issue.Status, config)
+	}
+	if cache == nil || len(cache.States) == 0 {
+		return "", fmt.Errorf("no workflow states found")
+	}
+
+	desiredType := "completed"
+	preferredName := "done"
+	if ClassifyCloseReason(issue.CloseReason) == CloseIntentCanceled {
+		desiredType = "canceled"
+		preferredName = "canceled"
+	}
+
+	var candidates []State
+	for _, s := range cache.States {
+		if strings.EqualFold(strings.TrimSpace(s.Type), desiredType) {
+			candidates = append(candidates, s)
+		}
+	}
+	if len(candidates) == 0 {
+		// No Linear state of the desired type configured on the team.
+		// Fall back to the state_map path so the user still gets a
+		// deterministic error message if closed is unmapped entirely.
+		return ResolveStateIDForBeadsStatus(cache, types.StatusClosed, config)
+	}
+	for _, s := range candidates {
+		if strings.EqualFold(strings.TrimSpace(s.Name), preferredName) {
+			return s.ID, nil
+		}
+	}
+	// Preferred name absent (unusual team config). Use the first candidate
+	// of the correct type — better than erroring on an otherwise valid push.
+	return candidates[0].ID, nil
+}
+
 // ParseBeadsStatus converts a status string to types.Status.
 func ParseBeadsStatus(s string) types.Status {
 	switch strings.ToLower(s) {
