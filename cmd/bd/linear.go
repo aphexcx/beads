@@ -302,11 +302,15 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 		fmt.Println("\n✓ Dry run complete (no changes made)")
 	} else {
 		if result.Stats.Pulled > 0 {
-			fmt.Printf("✓ Pulled %d issues (%d created, %d updated)\n",
-				result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+			fmt.Printf("✓ Pulled %d issues from Linear (%d created, %d updated locally)\n",
+				result.Stats.Pulled, result.PullStats.Created, result.PullStats.Updated)
 		}
 		if result.Stats.Pushed > 0 {
-			fmt.Printf("✓ Pushed %d issues\n", result.Stats.Pushed)
+			fmt.Printf("✓ Pushed %d issues to Linear (%d created, %d updated)\n",
+				result.Stats.Pushed, result.PushStats.Created, result.PushStats.Updated)
+		}
+		if result.Stats.Skipped > 0 {
+			fmt.Printf("  Skipped %d (no changes needed)\n", result.Stats.Skipped)
 		}
 		if result.Stats.Conflicts > 0 {
 			fmt.Printf("→ Resolved %d conflicts\n", result.Stats.Conflicts)
