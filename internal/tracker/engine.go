@@ -541,6 +541,14 @@ func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
 	if local.Status == types.StatusClosed && local.CloseReason != remote.CloseReason {
 		return false
 	}
+	// Reopen case: Linear moved a closed issue back to open/in_progress.
+	// If local still carries a close_reason from the prior closure, a
+	// future re-close would re-fire that stale reason and route the push
+	// to the wrong terminal state. Force an update so close_reason gets
+	// cleared.
+	if remote.Status != types.StatusClosed && strings.TrimSpace(local.CloseReason) != "" {
+		return false
+	}
 	localRef := ""
 	if local.ExternalRef != nil {
 		localRef = strings.TrimSpace(*local.ExternalRef)
@@ -569,6 +577,10 @@ func buildPullIssueUpdates(existing *types.Issue, remote *types.Issue, ref strin
 	// already used for title/description/priority/status/assignee.
 	if remote.Status == types.StatusClosed {
 		updates["close_reason"] = remote.CloseReason
+	} else {
+		// Reopen: clear any stale close_reason so it can't mis-route a
+		// future push back to Canceled via close_reason resolution.
+		updates["close_reason"] = ""
 	}
 	trimmedRef := strings.TrimSpace(ref)
 	if trimmedRef == "" {
