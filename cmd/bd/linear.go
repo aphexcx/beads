@@ -152,6 +152,7 @@ func init() {
 	linearSyncCmd.Flags().Bool("prefer-local", false, "Prefer local version on conflicts")
 	linearSyncCmd.Flags().Bool("prefer-linear", false, "Prefer Linear version on conflicts")
 	linearSyncCmd.Flags().Bool("create-only", false, "Only create new issues, don't update existing")
+	linearSyncCmd.Flags().Bool("create-closed", false, "Push closed local beads with no external ref as new Linear issues (for historical backfill; skipped by default)")
 	linearSyncCmd.Flags().Bool("update-refs", true, "Update external_ref after creating Linear issues")
 	linearSyncCmd.Flags().String("state", "all", "Issue state to sync: open, closed, all")
 	linearSyncCmd.Flags().StringSlice("type", nil, "Only sync issues of these types (can be repeated)")
@@ -175,6 +176,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	preferLocal, _ := cmd.Flags().GetBool("prefer-local")
 	preferLinear, _ := cmd.Flags().GetBool("prefer-linear")
 	createOnly, _ := cmd.Flags().GetBool("create-only")
+	createClosed, _ := cmd.Flags().GetBool("create-closed")
 	state, _ := cmd.Flags().GetString("state")
 	typeFilters, _ := cmd.Flags().GetStringSlice("type")
 	excludeTypes, _ := cmd.Flags().GetStringSlice("exclude-type")
@@ -230,11 +232,12 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 
 	// Build sync options from CLI flags
 	opts := tracker.SyncOptions{
-		Pull:       pull,
-		Push:       push,
-		DryRun:     dryRun,
-		CreateOnly: createOnly,
-		State:      state,
+		Pull:         pull,
+		Push:         push,
+		DryRun:       dryRun,
+		CreateOnly:   createOnly,
+		CreateClosed: createClosed,
+		State:        state,
 	}
 
 	// Convert type filters

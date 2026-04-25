@@ -74,6 +74,12 @@ type SyncOptions struct {
 	DryRun bool
 	// CreateOnly only creates new issues, doesn't update existing.
 	CreateOnly bool
+	// CreateClosed allows pushing closed local beads with no external ref as
+	// new external issues (tombstone creates). Default is false — closed
+	// beads without an external ref are skipped so ongoing syncs don't
+	// retroactively register completed local-only work. Set true for one-off
+	// historical backfills.
+	CreateClosed bool
 	// State filters issues: "open", "closed", or "all".
 	State string
 	// ConflictResolution specifies how to handle bidirectional conflicts.

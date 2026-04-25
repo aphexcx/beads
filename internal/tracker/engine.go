@@ -803,6 +803,16 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		extRef := derefStr(issue.ExternalRef)
 		willCreate := extRef == "" || !e.Tracker.IsExternalRef(extRef)
 
+		// Skip tombstone creates: a bead that's already closed locally with no
+		// external ref was done without ever flowing through the external
+		// tracker. Creating a new terminal-state ticket for it just adds noise
+		// in Linear/Jira/GitHub. Opt back in with --create-closed for one-off
+		// historical backfills.
+		if willCreate && issue.Status == types.StatusClosed && !opts.CreateClosed {
+			stats.Skipped++
+			continue
+		}
+
 		if opts.DryRun {
 			if willCreate {
 				e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
