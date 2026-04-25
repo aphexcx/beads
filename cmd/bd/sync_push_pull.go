@@ -202,11 +202,15 @@ func outputSyncResult(result *tracker.SyncResult, dryRun bool) {
 		fmt.Println("Dry run mode - no changes will be made")
 	}
 	if result.Stats.Pulled > 0 {
-		fmt.Printf("✓ Pulled %d issues (%d created, %d updated)\n",
-			result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+		fmt.Printf("✓ Pulled %d issues (%d created, %d updated locally)\n",
+			result.Stats.Pulled, result.PullStats.Created, result.PullStats.Updated)
 	}
 	if result.Stats.Pushed > 0 {
-		fmt.Printf("✓ Pushed %d issues\n", result.Stats.Pushed)
+		fmt.Printf("✓ Pushed %d issues (%d created, %d updated)\n",
+			result.Stats.Pushed, result.PushStats.Created, result.PushStats.Updated)
+	}
+	if result.Stats.Skipped > 0 {
+		fmt.Printf("  Skipped %d (no changes needed)\n", result.Stats.Skipped)
 	}
 	if dryRun {
 		fmt.Println("\nRun without --dry-run to apply changes")
