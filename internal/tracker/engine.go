@@ -46,6 +46,15 @@ type PullHooks struct {
 	// SyncAttachments is called per-issue after import to sync attachment metadata from the external tracker.
 	// If nil, attachment sync is skipped during pull.
 	SyncAttachments func(ctx context.Context, localIssueID string, externalIssueID string) error
+
+	// ContentEqual overrides the generic pullIssueEqual check when the
+	// tracker needs custom comparison logic (e.g. Linear builds its
+	// description by merging local.description with acceptance/notes fields,
+	// so a byte-exact compare between local.Description and remote.Description
+	// always fails even when the content is semantically identical).
+	// Returns true if local and the converted-remote are equal and the pull
+	// should skip. If nil, pullIssueEqual is used.
+	ContentEqual func(local, remote *types.Issue) bool
 }
 
 // PushHooks contains optional callbacks that customize push (export) behavior.
@@ -428,7 +437,15 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 		}
 
-		if existing != nil && pullIssueEqual(existing, conv.Issue, ref) {
+		pullEqual := false
+		if existing != nil {
+			if e.PullHooks != nil && e.PullHooks.ContentEqual != nil {
+				pullEqual = e.PullHooks.ContentEqual(existing, conv.Issue) && referencesMatch(existing, ref)
+			} else {
+				pullEqual = pullIssueEqual(existing, conv.Issue, ref)
+			}
+		}
+		if pullEqual {
 			// Issue unchanged, but still sync comments/attachments
 			// (they may have been added externally since last sync).
 			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
@@ -524,6 +541,20 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		attribute.Int("sync.skipped", stats.Skipped),
 	)
 	return stats, nil
+}
+
+// referencesMatch reports whether the local external_ref matches the provided
+// ref string (after trimming). Used by the pull-equal fast-path to require
+// both content equality AND ref alignment before skipping an update.
+func referencesMatch(local *types.Issue, ref string) bool {
+	if local == nil {
+		return false
+	}
+	localRef := ""
+	if local.ExternalRef != nil {
+		localRef = strings.TrimSpace(*local.ExternalRef)
+	}
+	return localRef == strings.TrimSpace(ref)
 }
 
 func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {

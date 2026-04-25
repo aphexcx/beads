@@ -29,12 +29,17 @@ var (
 	// Table cell inner padding: collapse consecutive spaces within cells.
 	reTableCellPad    = regexp.MustCompile(`\|[ \t]{2,}`)
 	reTableCellPadEnd = regexp.MustCompile(`[ \t]{2,}\|`)
+	// Linear auto-links bare URLs in descriptions on round-trip:
+	// `https://x` → `[https://x](<https://x>)`. Strip back to the bare URL
+	// for drift comparison.
+	reMarkdownAutoLink = regexp.MustCompile(`\[(https?://[^\]]+)\]\(<[^>]*>\)`)
 )
 
 // NormalizeLinearMarkdown returns a form of s that collapses rendering-
 // equivalent markdown differences Linear's editor and our local authoring
 // produce. Used only for drift detection — does not mutate stored content.
 func NormalizeLinearMarkdown(s string) string {
+	s = reMarkdownAutoLink.ReplaceAllString(s, "$1")
 	s = reMarkdownEscape.ReplaceAllString(s, "$1")
 	s = reMarkdownBullet.ReplaceAllString(s, "$1* ")
 	s = reMarkdownTableSep.ReplaceAllString(s, "| --- ")

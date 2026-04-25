@@ -341,6 +341,36 @@ func buildLinearPullHooks(ctx context.Context, lt *linear.Tracker) *tracker.Pull
 	hooks.SyncComments = buildCommentPullHook(ctx, lt)
 	hooks.SyncAttachments = buildAttachmentPullHook(ctx, lt)
 
+	// ContentEqual: Linear builds its description by merging local's
+	// description with acceptance_criteria/design/notes. A byte compare
+	// between local.Description and remote.Description always fails when
+	// local has any of those fields populated. Compare the rebuilt local
+	// form (with markdown noise normalized) against the normalized remote.
+	hooks.ContentEqual = func(local, remote *types.Issue) bool {
+		if local == nil || remote == nil {
+			return false
+		}
+		if local.Title != remote.Title ||
+			local.Priority != remote.Priority ||
+			local.Status != remote.Status ||
+			local.IssueType != remote.IssueType {
+			return false
+		}
+		localDesc := linear.NormalizeLinearMarkdown(linear.BuildLinearDescription(local))
+		remoteDesc := linear.NormalizeLinearMarkdown(remote.Description)
+		if localDesc != remoteDesc {
+			return false
+		}
+		// Closed-beads close_reason logic mirrors pullIssueEqual:
+		if local.Status == types.StatusClosed && local.CloseReason != remote.CloseReason {
+			return false
+		}
+		if remote.Status != types.StatusClosed && strings.TrimSpace(local.CloseReason) != "" {
+			return false
+		}
+		return true
+	}
+
 	if idMode == "hash" {
 		// Pre-load existing IDs for collision avoidance
 		existingIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
