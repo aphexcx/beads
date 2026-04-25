@@ -60,6 +60,13 @@ type PushHooks struct {
 	// Returns true if content is identical (skip update). If nil, uses timestamp comparison.
 	ContentEqual func(local *types.Issue, remote *TrackerIssue) bool
 
+	// DescribeDiff returns human-readable field-level differences between local
+	// and remote for dry-run verbose output. Each entry is a short description
+	// like "title: \"old\" → \"new\"". Return empty slice if no differences.
+	// Optional — if nil, dry-run output just reports that an update would happen
+	// without enumerating fields.
+	DescribeDiff func(local *types.Issue, remote *TrackerIssue) []string
+
 	// ShouldPush filters issues during push. Return false to skip.
 	// Called in addition to type/state/ephemeral filters. Use for prefix filtering, etc.
 	// If nil, all issues (matching other filters) are pushed.
@@ -813,17 +820,6 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			continue
 		}
 
-		if opts.DryRun {
-			if willCreate {
-				e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
-				stats.Created++
-			} else {
-				e.msg("[dry-run] Would update in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
-				stats.Updated++
-			}
-			continue
-		}
-
 		// FormatDescription hook: apply to a copy so we don't mutate local data.
 		pushIssue := issue
 		if e.PushHooks != nil && e.PushHooks.FormatDescription != nil {
@@ -833,6 +829,11 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 
 		if willCreate {
+			if opts.DryRun {
+				e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
+				stats.Created++
+				continue
+			}
 			// Create in external tracker
 			created, err := e.Tracker.CreateIssue(ctx, pushIssue)
 			if err != nil {
@@ -867,9 +868,11 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			}
 
 			// Check if update is needed
+			var fetchedExt *TrackerIssue
 			if !forceIDs[issue.ID] {
 				extIssue, err := e.Tracker.FetchIssue(ctx, extID)
 				if err == nil && extIssue != nil {
+					fetchedExt = extIssue
 					// ContentEqual hook: content-hash dedup to skip unnecessary API calls
 					if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
 						if e.PushHooks.ContentEqual(issue, extIssue) {
@@ -881,6 +884,17 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 						continue
 					}
 				}
+			}
+
+			if opts.DryRun {
+				e.msg("[dry-run] Would update in %s: %s — %s", e.Tracker.DisplayName(), issue.ID, ui.SanitizeForTerminal(issue.Title))
+				if opts.VerboseDiff && e.PushHooks != nil && e.PushHooks.DescribeDiff != nil && fetchedExt != nil {
+					for _, d := range e.PushHooks.DescribeDiff(issue, fetchedExt) {
+						e.msg("    · %s", d)
+					}
+				}
+				stats.Updated++
+				continue
 			}
 
 			if _, err := e.Tracker.UpdateIssue(ctx, extID, pushIssue); err != nil {

@@ -153,6 +153,7 @@ func init() {
 	linearSyncCmd.Flags().Bool("prefer-linear", false, "Prefer Linear version on conflicts")
 	linearSyncCmd.Flags().Bool("create-only", false, "Only create new issues, don't update existing")
 	linearSyncCmd.Flags().Bool("create-closed", false, "Push closed local beads with no external ref as new Linear issues (for historical backfill; skipped by default)")
+	linearSyncCmd.Flags().Bool("verbose-diff", false, "In --dry-run, show per-field differences for each would-be update")
 	linearSyncCmd.Flags().Bool("update-refs", true, "Update external_ref after creating Linear issues")
 	linearSyncCmd.Flags().String("state", "all", "Issue state to sync: open, closed, all")
 	linearSyncCmd.Flags().StringSlice("type", nil, "Only sync issues of these types (can be repeated)")
@@ -177,6 +178,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	preferLinear, _ := cmd.Flags().GetBool("prefer-linear")
 	createOnly, _ := cmd.Flags().GetBool("create-only")
 	createClosed, _ := cmd.Flags().GetBool("create-closed")
+	verboseDiff, _ := cmd.Flags().GetBool("verbose-diff")
 	state, _ := cmd.Flags().GetString("state")
 	typeFilters, _ := cmd.Flags().GetStringSlice("type")
 	excludeTypes, _ := cmd.Flags().GetStringSlice("exclude-type")
@@ -237,6 +239,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 		DryRun:       dryRun,
 		CreateOnly:   createOnly,
 		CreateClosed: createClosed,
+		VerboseDiff:  verboseDiff,
 		State:        state,
 	}
 
@@ -397,6 +400,13 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 				return false
 			}
 			return linear.PushFieldsEqualToBeads(local, remoteConv.Issue)
+		},
+		DescribeDiff: func(local *types.Issue, remote *tracker.TrackerIssue) []string {
+			remoteIssue, ok := remote.Raw.(*linear.Issue)
+			if !ok || remoteIssue == nil {
+				return nil
+			}
+			return linear.PushFieldsDiff(local, remoteIssue, config)
 		},
 		BuildStateCache: func(ctx context.Context) (interface{}, error) {
 			return linear.BuildStateCacheFromTracker(ctx, lt)

@@ -80,6 +80,10 @@ type SyncOptions struct {
 	// retroactively register completed local-only work. Set true for one-off
 	// historical backfills.
 	CreateClosed bool
+	// VerboseDiff prints field-level differences for each would-be update in
+	// dry-run output. Requires the tracker's PushHooks.DescribeDiff hook to
+	// be set; otherwise is a no-op.
+	VerboseDiff bool
 	// State filters issues: "open", "closed", or "all".
 	State string
 	// ConflictResolution specifies how to handle bidirectional conflicts.

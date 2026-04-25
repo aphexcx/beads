@@ -530,6 +530,48 @@ func PushFieldsEqual(local *types.Issue, remote *Issue, config *MappingConfig) b
 	return true
 }
 
+// PushFieldsDiff returns a human-readable list of field differences between a
+// local bead and the remote Linear issue. Used for dry-run verbose output so
+// users can see exactly what a push would change, rather than just "Would
+// update". Returns an empty slice when fields are equivalent.
+func PushFieldsDiff(local *types.Issue, remote *Issue, config *MappingConfig) []string {
+	if local == nil || remote == nil {
+		return nil
+	}
+	var diffs []string
+	if local.Title != remote.Title {
+		diffs = append(diffs, fmt.Sprintf("title: %q → %q", remote.Title, local.Title))
+	}
+	localDesc := BuildLinearDescription(local)
+	if localDesc != remote.Description {
+		diffs = append(diffs, fmt.Sprintf("description: %d → %d chars", len(remote.Description), len(localDesc)))
+	}
+	localPrio := PriorityToLinear(local.Priority, config)
+	if localPrio != remote.Priority {
+		diffs = append(diffs, fmt.Sprintf("priority: %d → %d", remote.Priority, localPrio))
+	}
+	remoteStatus := StateToBeadsStatus(remote.State, config)
+	if remoteStatus != local.Status {
+		remoteName := ""
+		if remote.State != nil {
+			remoteName = remote.State.Name
+		}
+		diffs = append(diffs, fmt.Sprintf("status: %s (%q) → %s", remoteStatus, remoteName, local.Status))
+	}
+	if local.Status == types.StatusClosed && remote.State != nil {
+		localIsCanceled := ClassifyCloseReason(local.CloseReason) == CloseIntentCanceled
+		remoteIsCanceled := strings.EqualFold(strings.TrimSpace(remote.State.Type), "canceled")
+		if localIsCanceled != remoteIsCanceled {
+			targetType := "completed"
+			if localIsCanceled {
+				targetType = "canceled"
+			}
+			diffs = append(diffs, fmt.Sprintf("close intent: %s → %s (from close_reason=%q)", remote.State.Type, targetType, local.CloseReason))
+		}
+	}
+	return diffs
+}
+
 // PushFieldsEqualToBeads is a fallback comparator for cases where Linear's raw
 // payload is unavailable and only the normalized beads form remains.
 func PushFieldsEqualToBeads(local, remote *types.Issue) bool {
