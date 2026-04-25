@@ -2,12 +2,48 @@ package linear
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// Noise-normalization regexes for markdown that Linear round-trips differently
+// than we send it. Stripping these lets the sync engine skip re-pushing content
+// that only differs in rendering-equivalent markdown syntax.
+var (
+	// Backslash escapes before punctuation Linear's editor emits verbatim
+	// (e.g. `1\. WiFi`, `\~880`). Strip escape to match human-authored form.
+	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~` + "`" + `])`)
+	// Bullet marker at line start: normalize `- ` / `+ ` to `* ` (Linear's form).
+	reMarkdownBullet = regexp.MustCompile(`(?m)^(\s*)[-+] `)
+	// GFM table separator: collapse any run of dashes within a cell to `---`
+	// so widths don't churn on every sync.
+	reMarkdownTableSep = regexp.MustCompile(`\|\s*:?-{2,}:?\s*`)
+	// Trailing whitespace on each line.
+	reTrailingSpace = regexp.MustCompile(`(?m)[ \t]+$`)
+	// Runs of newlines (Linear inserts blank lines around headings/lists).
+	reNewlineRun = regexp.MustCompile(`\n{2,}`)
+	// Table cell inner padding: collapse consecutive spaces within cells.
+	reTableCellPad    = regexp.MustCompile(`\|[ \t]{2,}`)
+	reTableCellPadEnd = regexp.MustCompile(`[ \t]{2,}\|`)
+)
+
+// NormalizeLinearMarkdown returns a form of s that collapses rendering-
+// equivalent markdown differences Linear's editor and our local authoring
+// produce. Used only for drift detection — does not mutate stored content.
+func NormalizeLinearMarkdown(s string) string {
+	s = reMarkdownEscape.ReplaceAllString(s, "$1")
+	s = reMarkdownBullet.ReplaceAllString(s, "$1* ")
+	s = reMarkdownTableSep.ReplaceAllString(s, "| --- ")
+	s = reTableCellPad.ReplaceAllString(s, "| ")
+	s = reTableCellPadEnd.ReplaceAllString(s, " |")
+	s = reTrailingSpace.ReplaceAllString(s, "")
+	s = reNewlineRun.ReplaceAllString(s, "\n")
+	return strings.TrimSpace(s)
+}
 
 // IDGenerationOptions configures Linear hash ID generation.
 type IDGenerationOptions struct {
@@ -507,7 +543,7 @@ func PushFieldsEqual(local *types.Issue, remote *Issue, config *MappingConfig) b
 	if local.Title != remote.Title {
 		return false
 	}
-	if BuildLinearDescription(local) != remote.Description {
+	if NormalizeLinearMarkdown(BuildLinearDescription(local)) != NormalizeLinearMarkdown(remote.Description) {
 		return false
 	}
 	if PriorityToLinear(local.Priority, config) != remote.Priority {
@@ -543,8 +579,8 @@ func PushFieldsDiff(local *types.Issue, remote *Issue, config *MappingConfig) []
 		diffs = append(diffs, fmt.Sprintf("title: %q → %q", remote.Title, local.Title))
 	}
 	localDesc := BuildLinearDescription(local)
-	if localDesc != remote.Description {
-		diffs = append(diffs, fmt.Sprintf("description: %d → %d chars", len(remote.Description), len(localDesc)))
+	if NormalizeLinearMarkdown(localDesc) != NormalizeLinearMarkdown(remote.Description) {
+		diffs = append(diffs, describeTextDiff("description", remote.Description, localDesc))
 	}
 	localPrio := PriorityToLinear(local.Priority, config)
 	if localPrio != remote.Priority {
@@ -572,6 +608,55 @@ func PushFieldsDiff(local *types.Issue, remote *Issue, config *MappingConfig) []
 	return diffs
 }
 
+// describeTextDiff returns a short, human-readable summary of how two strings
+// differ. Includes length delta and the first differing excerpt so users can
+// see *what* changed, not just "it's different". Used for dry-run verbose
+// descriptions of field drift.
+func describeTextDiff(label, before, after string) string {
+	if before == after {
+		return ""
+	}
+	// Find first differing byte position.
+	minLen := len(before)
+	if len(after) < minLen {
+		minLen = len(after)
+	}
+	firstDiff := minLen
+	for i := 0; i < minLen; i++ {
+		if before[i] != after[i] {
+			firstDiff = i
+			break
+		}
+	}
+
+	// Extract a ~30-char window of context on each side.
+	const window = 30
+	start := firstDiff - window
+	if start < 0 {
+		start = 0
+	}
+	beforeEnd := firstDiff + window
+	if beforeEnd > len(before) {
+		beforeEnd = len(before)
+	}
+	afterEnd := firstDiff + window
+	if afterEnd > len(after) {
+		afterEnd = len(after)
+	}
+	beforeWin := sanitizeForOneLine(before[start:beforeEnd])
+	afterWin := sanitizeForOneLine(after[start:afterEnd])
+
+	return fmt.Sprintf("%s: %d → %d chars, first diff at byte %d\n        remote: …%s…\n        local:  …%s…",
+		label, len(before), len(after), firstDiff, beforeWin, afterWin)
+}
+
+// sanitizeForOneLine collapses newlines/tabs so a multi-line excerpt prints
+// as a single readable line in terminal output.
+func sanitizeForOneLine(s string) string {
+	r := strings.NewReplacer("\n", "⏎", "\r", "⏎", "\t", "→")
+	return r.Replace(s)
+}
+
 // PushFieldsEqualToBeads is a fallback comparator for cases where Linear's raw
 // payload is unavailable and only the normalized beads form remains.
 func PushFieldsEqualToBeads(local, remote *types.Issue) bool {
@@ -581,7 +666,7 @@ func PushFieldsEqualToBeads(local, remote *types.Issue) bool {
 	if local.Title != remote.Title {
 		return false
 	}
-	if BuildLinearDescription(local) != remote.Description {
+	if NormalizeLinearMarkdown(BuildLinearDescription(local)) != NormalizeLinearMarkdown(remote.Description) {
 		return false
 	}
 	if local.Priority != remote.Priority {
