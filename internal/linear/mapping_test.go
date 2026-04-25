@@ -851,3 +851,152 @@ func TestResolveStateIDForIssueUsesCloseReason(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeLinearMarkdown(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "bullet markers normalized to *",
+			in:   "First line\n- item one\n- item two\n+ item three",
+			want: "First line\n* item one\n* item two\n* item three",
+		},
+		{
+			name: "punctuation escapes stripped",
+			in:   `Step 1\. WiFi config\nUses \~880 lines\.`,
+			want: `Step 1. WiFi config\nUses ~880 lines.`,
+		},
+		{
+			name: "auto-linked URL collapsed",
+			in:   "PR opened: [https://github.com/x/y/pull/1](<https://github.com/x/y/pull/1>) — done",
+			want: "PR opened: https://github.com/x/y/pull/1 — done",
+		},
+		{
+			name: "table separator widths normalized",
+			in:   "| File | Lines |\n|------|-------|\n| `a` | 100 |",
+			want: "| File | Lines |\n| --- | --- |\n| `a` | 100 |",
+		},
+		{
+			name: "multiple newlines collapsed to single",
+			in:   "## Heading\n\n\nFirst para\n\n\n\nSecond para",
+			want: "## Heading\nFirst para\nSecond para",
+		},
+		{
+			name: "trailing whitespace stripped per line",
+			in:   "Line one  \nLine two\t\nLine three",
+			want: "Line one\nLine two\nLine three",
+		},
+		{
+			name: "round-trip: local form vs Linear form normalize equally",
+			in:   "Section:\n- item a\n- item b\nuses \\~5 chars",
+			want: "Section:\n* item a\n* item b\nuses ~5 chars",
+		},
+		{
+			name: "leading and trailing whitespace trimmed",
+			in:   "\n\n  body\n\n",
+			want: "body",
+		},
+		{
+			name: "empty input",
+			in:   "",
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeLinearMarkdown(tt.in)
+			if got != tt.want {
+				t.Errorf("NormalizeLinearMarkdown() got:\n%q\nwant:\n%q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeLinearMarkdownIdempotent(t *testing.T) {
+	// Normalizing twice should equal normalizing once (steady state).
+	inputs := []string{
+		"- a\n- b",
+		"foo\\.bar",
+		"[https://x.com](<https://x.com>)",
+		"|---|---|\n|x|y|",
+		"a\n\n\nb",
+	}
+	for _, in := range inputs {
+		once := NormalizeLinearMarkdown(in)
+		twice := NormalizeLinearMarkdown(once)
+		if once != twice {
+			t.Errorf("NormalizeLinearMarkdown not idempotent for %q: %q vs %q", in, once, twice)
+		}
+	}
+}
+
+func TestPushFieldsEqualUsesNormalization(t *testing.T) {
+	config := DefaultMappingConfig()
+	local := &types.Issue{
+		Title:       "title",
+		Description: "Body:\n- item one\n- item two",
+		Status:      types.StatusOpen,
+		Priority:    2,
+	}
+	remote := &Issue{
+		Title:       "title",
+		Description: "Body:\n* item one\n* item two", // bullet normalized
+		Priority:    1,                               // 2 (medium) → linear 1 via priority map default? validate
+		State:       &State{Type: "backlog", Name: "Backlog"},
+	}
+	// Use config's default priority map for medium → 3 (linear medium)
+	// We don't care about exact priority equivalence here — set both to 0
+	local.Priority = 4
+	remote.Priority = PriorityToLinear(local.Priority, config)
+	if !PushFieldsEqual(local, remote, config) {
+		t.Errorf("PushFieldsEqual should treat bullet markdown variants as equal")
+	}
+}
+
+func TestPushFieldsDiffReportsFields(t *testing.T) {
+	config := DefaultMappingConfig()
+	local := &types.Issue{
+		Title:       "new title",
+		Description: "new body",
+		Status:      types.StatusInProgress,
+		Priority:    1,
+	}
+	remote := &Issue{
+		Title:       "old title",
+		Description: "old body",
+		Priority:    PriorityToLinear(2, config),
+		State:       &State{Type: "backlog", Name: "Backlog"},
+	}
+	diffs := PushFieldsDiff(local, remote, config)
+	if len(diffs) == 0 {
+		t.Fatal("expected non-empty diff, got empty")
+	}
+	joined := strings.Join(diffs, "\n")
+	for _, want := range []string{"title:", "description:", "priority:", "status:"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("diff should mention %q, got: %s", want, joined)
+		}
+	}
+}
+
+func TestPushFieldsDiffEmptyForEqualIssues(t *testing.T) {
+	config := DefaultMappingConfig()
+	local := &types.Issue{
+		Title:       "same",
+		Description: "same body\n- a\n- b",
+		Status:      types.StatusOpen,
+		Priority:    2,
+	}
+	remote := &Issue{
+		Title:       "same",
+		Description: "same body\n* a\n* b", // bullet diff is normalized away
+		Priority:    PriorityToLinear(local.Priority, config),
+		State:       &State{Type: "backlog", Name: "Backlog"},
+	}
+	diffs := PushFieldsDiff(local, remote, config)
+	if len(diffs) != 0 {
+		t.Errorf("expected empty diff for equal issues (modulo normalization), got: %v", diffs)
+	}
+}
