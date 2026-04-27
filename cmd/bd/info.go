@@ -210,6 +210,16 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.0.3",
+		Date:    "2026-04-24",
+		Changes: []string{
+			"FIX: go install @latest — new release tag removes the go.mod replace directives that made v1.0.1 and v1.0.2 uninstallable via go install",
+			"FIX: npm macOS installs — release archives are flat so npm postinstall finds the bd binary at the archive root",
+			"FIX: Windows install — make install removes stale extensionless bd before installing bd.exe so old binaries do not shadow the new executable",
+			"FIX: Windows test portability and embedded pre-commit export cwd handling",
+		},
+	},
+	{
 		Version: "1.0.2",
 		Date:    "2026-04-15",
 		Changes: []string{

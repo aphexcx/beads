@@ -107,6 +107,14 @@ func TestEmbeddedConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("config_set_and_get_linear_state_map_dotted_key", func(t *testing.T) {
+		bdConfig(t, bd, dir, "set", "linear.state_map.closed", "Done")
+		out := bdConfig(t, bd, dir, "get", "linear.state_map.closed")
+		if strings.TrimSpace(out) != "Done" {
+			t.Errorf("expected exact state_map value, got: %s", out)
+		}
+	})
+
 	// ===== List =====
 
 	t.Run("config_list", func(t *testing.T) {

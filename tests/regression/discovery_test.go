@@ -1,8 +1,10 @@
-//go:build regression
+//go:build regression && discovery
 
 // discovery_test.go contains tests discovered during manual regression testing
 // on 2026-02-22. These tests exercise the candidate binary ONLY (not differential)
 // since bd export was removed from main (BUG-1 in DISCOVERY.md).
+// They intentionally fail while known bugs are still open; run with
+// -tags=regression,discovery when doing bug-discovery work, not in CI gates.
 //
 // TestMain starts an isolated Dolt server on a dynamic port (via BEADS_DOLT_PORT).
 // Each test uses a unique prefix to avoid cross-contamination (BUG-6).
@@ -75,6 +77,33 @@ func containsID(ids []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func diffIDSets(got, want []string) string {
+	gotSet := make(map[string]bool, len(got))
+	wantSet := make(map[string]bool, len(want))
+	for _, id := range got {
+		gotSet[id] = true
+	}
+	for _, id := range want {
+		wantSet[id] = true
+	}
+
+	var missing, extra []string
+	for id := range wantSet {
+		if !gotSet[id] {
+			missing = append(missing, id)
+		}
+	}
+	for id := range gotSet {
+		if !wantSet[id] {
+			extra = append(extra, id)
+		}
+	}
+	if len(missing) == 0 && len(extra) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("missing from list --ready: %v\nextra in list --ready: %v", missing, extra)
 }
 
 // =============================================================================
@@ -219,9 +248,18 @@ func TestBug9_ListReadyIncludesBlocked(t *testing.T) {
 		t.Errorf("bd ready should include free %s", c)
 	}
 
-	// Ideally list --ready should match bd ready
-	if containsID(listReady, a) && !containsID(bdReady, a) {
-		t.Logf("KNOWN: list --ready includes blocked %s but bd ready does not", a)
+	if containsID(listReady, a) {
+		t.Errorf("list --ready should not include blocked %s", a)
+	}
+	if !containsID(listReady, b) {
+		t.Errorf("list --ready should include unblocked %s", b)
+	}
+	if !containsID(listReady, c) {
+		t.Errorf("list --ready should include free %s", c)
+	}
+
+	if diff := diffIDSets(listReady, bdReady); diff != "" {
+		t.Errorf("list --ready and bd ready should agree:\n%s", diff)
 	}
 }
 

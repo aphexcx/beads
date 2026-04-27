@@ -51,6 +51,18 @@ func GetReadyWorkInTx(
 		args = append(args, filter.Type)
 	} else {
 		excludeTypes := []string{"merge-request", "gate", "molecule", "message", "agent", "role", "rig"}
+		seen := make(map[string]bool, len(excludeTypes)+len(filter.ExcludeTypes))
+		for _, t := range excludeTypes {
+			seen[t] = true
+		}
+		for _, t := range filter.ExcludeTypes {
+			s := string(t)
+			if s == "" || seen[s] {
+				continue
+			}
+			seen[s] = true
+			excludeTypes = append(excludeTypes, s)
+		}
 		placeholders := make([]string, len(excludeTypes))
 		for i, t := range excludeTypes {
 			placeholders[i] = "?"
@@ -90,11 +102,36 @@ func GetReadyWorkInTx(
 			args = append(args, label)
 		}
 	}
-	// Parent filtering.
+	if len(filter.ExcludeLabels) > 0 {
+		placeholders := make([]string, len(filter.ExcludeLabels))
+		for i, label := range filter.ExcludeLabels {
+			placeholders[i] = "?"
+			args = append(args, label)
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (SELECT issue_id FROM labels WHERE label IN (%s))", strings.Join(placeholders, ", ")))
+	}
+	// Parent filtering: return all transitive descendants of parentID.
+	// GH#3396: previously was a one-hop subquery against dependencies, so
+	// grandchildren were silently dropped despite the help text and
+	// WorkFilter.ParentID godoc both promising "descendants (recursive)".
 	if filter.ParentID != nil {
 		parentID := *filter.ParentID
-		whereClauses = append(whereClauses, "(id IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child' AND depends_on_id = ?) OR (id LIKE CONCAT(?, '.%') AND id NOT IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child')))")
-		args = append(args, parentID, parentID)
+		descendantIDs, descErr := GetDescendantIDsInTx(ctx, tx, parentID, 0)
+		if descErr != nil {
+			return nil, fmt.Errorf("get parent descendants: %w", descErr)
+		}
+		parentClauses := []string{"(id LIKE CONCAT(?, '.%') AND id NOT IN (SELECT issue_id FROM dependencies WHERE type = 'parent-child'))"}
+		args = append(args, parentID)
+		for start := 0; start < len(descendantIDs); start += queryBatchSize {
+			end := start + queryBatchSize
+			if end > len(descendantIDs) {
+				end = len(descendantIDs)
+			}
+			placeholders, batchArgs := buildSQLInClause(descendantIDs[start:end])
+			parentClauses = append(parentClauses, fmt.Sprintf("id IN (%s)", placeholders))
+			args = append(args, batchArgs...)
+		}
+		whereClauses = append(whereClauses, "("+strings.Join(parentClauses, " OR ")+")")
 	}
 
 	// Molecule filtering: filter to direct children of the specified molecule.
@@ -200,7 +237,7 @@ func GetReadyWorkInTx(
 	}
 
 	// Batch-fetch full issues preserving order.
-	issues, err := GetIssuesByIDsInTx(ctx, tx, issueIDs)
+	issues, err := GetIssuesByIDsInTx(ctx, tx, issueIDs, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get ready work: fetch issues: %w", err)
 	}

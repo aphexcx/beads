@@ -2,10 +2,16 @@ package dolt
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/testutil"
 )
 
 func TestEncryptDecryptWithKey(t *testing.T) {
@@ -31,6 +37,92 @@ func TestEncryptDecryptWithKey(t *testing.T) {
 	}
 	if decrypted != password {
 		t.Errorf("decrypted = %q, want %q", decrypted, password)
+	}
+}
+
+func TestApplyS3ChecksumEnvToCmd(t *testing.T) {
+	t.Setenv(awsResponseChecksumValidationEnv, "when_supported")
+
+	cmd := exec.Command("dolt", "push") // #nosec G204 -- test command is not executed
+	(&remoteCredentials{username: "user", password: "pass"}).applyToCmd(cmd)
+	applyS3ChecksumEnvToCmd(cmd)
+
+	var gotChecksum, gotUser, gotPassword string
+	for _, e := range cmd.Env {
+		switch {
+		case strings.HasPrefix(e, awsResponseChecksumValidationEnv+"="):
+			gotChecksum = strings.TrimPrefix(e, awsResponseChecksumValidationEnv+"=")
+		case strings.HasPrefix(e, "DOLT_REMOTE_USER="):
+			gotUser = strings.TrimPrefix(e, "DOLT_REMOTE_USER=")
+		case strings.HasPrefix(e, "DOLT_REMOTE_PASSWORD="):
+			gotPassword = strings.TrimPrefix(e, "DOLT_REMOTE_PASSWORD=")
+		}
+	}
+
+	if gotChecksum != "when_required" {
+		t.Fatalf("%s = %q, want when_required", awsResponseChecksumValidationEnv, gotChecksum)
+	}
+	if gotUser != "user" || gotPassword != "pass" {
+		t.Fatalf("credential env = user:%q password:%q", gotUser, gotPassword)
+	}
+}
+
+func TestWithRemoteOperationEnvRestoresS3ChecksumEnv(t *testing.T) {
+	t.Setenv(awsResponseChecksumValidationEnv, "when_supported")
+
+	err := withRemoteOperationEnv(nil, true, func() error {
+		if got := os.Getenv(awsResponseChecksumValidationEnv); got != "when_required" {
+			t.Fatalf("%s during operation = %q, want when_required", awsResponseChecksumValidationEnv, got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRemoteOperationEnv returned error: %v", err)
+	}
+	if got := os.Getenv(awsResponseChecksumValidationEnv); got != "when_supported" {
+		t.Fatalf("%s after operation = %q, want restored when_supported", awsResponseChecksumValidationEnv, got)
+	}
+}
+
+func TestWithRemoteOperationEnvUnsetsS3ChecksumEnv(t *testing.T) {
+	t.Setenv(awsResponseChecksumValidationEnv, "")
+	if err := os.Unsetenv(awsResponseChecksumValidationEnv); err != nil {
+		t.Fatalf("unset %s: %v", awsResponseChecksumValidationEnv, err)
+	}
+
+	err := withRemoteOperationEnv(nil, true, func() error {
+		if got := os.Getenv(awsResponseChecksumValidationEnv); got != "when_required" {
+			t.Fatalf("%s during operation = %q, want when_required", awsResponseChecksumValidationEnv, got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withRemoteOperationEnv returned error: %v", err)
+	}
+	if _, ok := os.LookupEnv(awsResponseChecksumValidationEnv); ok {
+		t.Fatalf("%s should be unset after operation", awsResponseChecksumValidationEnv)
+	}
+}
+
+func TestIsS3RemoteURL(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "dolt aws", url: "aws://[table:bucket]/db", want: true},
+		{name: "s3", url: "s3://bucket/path", want: true},
+		{name: "gcs", url: "gs://bucket/path", want: false},
+		{name: "azure", url: "az://account.blob.core.windows.net/container", want: false},
+		{name: "empty", url: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isS3RemoteURL(tt.url); got != tt.want {
+				t.Fatalf("isS3RemoteURL(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -79,7 +171,9 @@ func TestCredentialKeyFileGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("key file should exist after initCredentialKey: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0600 {
+	if runtime.GOOS == "windows" {
+		t.Log("skipping POSIX mode-bit check on Windows")
+	} else if perm := info.Mode().Perm(); perm != 0600 {
 		t.Errorf("key file permissions = %o, want 0600", perm)
 	}
 
@@ -200,6 +294,105 @@ func TestInitCredentialKeyEmptyDbPath(t *testing.T) {
 	}
 }
 
+func TestEnsureCredentialKeyAlreadyInitialized(t *testing.T) {
+	tmpDir := t.TempDir()
+	key := []byte("0123456789abcdef0123456789abcdef")
+	store := &DoltStore{
+		dbPath:        filepath.Join(tmpDir, "dolt"),
+		beadsDir:      tmpDir,
+		credentialKey: append([]byte(nil), key...),
+	}
+
+	if err := store.ensureCredentialKey(t.Context()); err != nil {
+		t.Fatalf("ensureCredentialKey() error = %v", err)
+	}
+	if string(store.credentialKey) != string(key) {
+		t.Fatalf("credentialKey changed unexpectedly: got %q want %q", string(store.credentialKey), string(key))
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, credentialKeyFile)); !os.IsNotExist(err) {
+		t.Fatalf("expected no key file write when key already initialized, got err=%v", err)
+	}
+}
+
+func TestEnsureCredentialKeyInitializesWhenMissing(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := &DoltStore{
+		dbPath:   filepath.Join(tmpDir, "dolt"),
+		beadsDir: tmpDir,
+	}
+
+	if err := store.ensureCredentialKey(t.Context()); err != nil {
+		t.Fatalf("ensureCredentialKey() error = %v", err)
+	}
+	if len(store.credentialKey) != 32 {
+		t.Fatalf("credentialKey length = %d, want 32", len(store.credentialKey))
+	}
+	if _, err := os.Stat(filepath.Join(tmpDir, credentialKeyFile)); err != nil {
+		t.Fatalf("expected key file after lazy init: %v", err)
+	}
+}
+
+func TestAddFederationPeerReturnsCredentialKeyInitError(t *testing.T) {
+	parentFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parentFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("failed to create parent file: %v", err)
+	}
+
+	store := &DoltStore{
+		dbPath:   filepath.Join(parentFile, "dolt"),
+		beadsDir: filepath.Join(parentFile, ".beads"),
+	}
+
+	err := store.AddFederationPeer(t.Context(), &storage.FederationPeer{
+		Name:        "peerone",
+		RemoteURL:   "file:///tmp/nonexistent-peer",
+		Password:    "secret",
+		Sovereignty: "T2",
+	})
+	if err == nil {
+		t.Fatal("expected credential key initialization error")
+	}
+	if !strings.Contains(err.Error(), "failed to initialize credential key") {
+		t.Fatalf("expected credential key initialization error, got: %v", err)
+	}
+}
+
+func TestDecryptWithKeyShortCiphertext(t *testing.T) {
+	key := make([]byte, 32)
+	if _, err := decryptWithKey([]byte("short"), key); err == nil || err.Error() != "ciphertext too short" {
+		t.Fatalf("decryptWithKey(short) error = %v, want ciphertext too short", err)
+	}
+}
+
+func TestValidatePeerName(t *testing.T) {
+	tests := []struct {
+		name    string
+		peer    string
+		wantErr string
+	}{
+		{name: "valid", peer: "peer_one-2"},
+		{name: "empty", peer: "", wantErr: "peer name cannot be empty"},
+		{name: "must start with letter", peer: "1peer", wantErr: "peer name must start with a letter and contain only alphanumeric characters, hyphens, and underscores"},
+		{name: "invalid character", peer: "peer.one", wantErr: "peer name must start with a letter and contain only alphanumeric characters, hyphens, and underscores"},
+		{name: "too long", peer: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_extra", wantErr: "peer name too long (max 64 characters)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validatePeerName(tt.peer)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validatePeerName(%q) unexpected error: %v", tt.peer, err)
+				}
+				return
+			}
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("validatePeerName(%q) error = %v, want %q", tt.peer, err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestCredentialKeyMigrationFromDbPath(t *testing.T) {
 	// Simulate old layout: key file in .beads/dolt/ (dbPath)
 	beadsDir := t.TempDir()
@@ -298,6 +491,68 @@ func TestCredentialKeyCreatesBeadsDir(t *testing.T) {
 	}
 }
 
+func TestFederationPeerCredentialLifecycleLazyKeyInit(t *testing.T) {
+	skipIfNoServer(t)
+
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	beadsDir := filepath.Join(baseDir, ".beads")
+	dbName := fmt.Sprintf("test_federation_credentials_%d", testServerPort)
+
+	assertDatabaseNotExists(t, testServerPort, dbName)
+	t.Cleanup(func() { dropTestDatabase(t, testServerPort, dbName) })
+
+	store, err := New(ctx, &Config{
+		Path:            filepath.Join(beadsDir, "dolt"),
+		BeadsDir:        beadsDir,
+		ServerHost:      "127.0.0.1",
+		ServerPort:      testServerPort,
+		Database:        dbName,
+		MaxOpenConns:    1,
+		CreateIfMissing: true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer store.Close()
+
+	peer := &storage.FederationPeer{
+		Name:        "peerone",
+		RemoteURL:   "file:///tmp/nonexistent-peer",
+		Username:    "alice",
+		Password:    "s3cret",
+		Sovereignty: "T2",
+	}
+
+	if err := store.AddFederationPeer(ctx, peer); err != nil {
+		t.Fatalf("AddFederationPeer() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(beadsDir, credentialKeyFile)); err != nil {
+		t.Fatalf("expected credential key file after adding peer with password: %v", err)
+	}
+
+	store.credentialKey = nil
+	got, err := store.GetFederationPeer(ctx, peer.Name)
+	if err != nil {
+		t.Fatalf("GetFederationPeer() error = %v", err)
+	}
+	if got.Password != peer.Password {
+		t.Fatalf("GetFederationPeer().Password = %q, want %q", got.Password, peer.Password)
+	}
+
+	store.credentialKey = nil
+	peers, err := store.ListFederationPeers(ctx)
+	if err != nil {
+		t.Fatalf("ListFederationPeers() error = %v", err)
+	}
+	if len(peers) != 1 {
+		t.Fatalf("ListFederationPeers() length = %d, want 1", len(peers))
+	}
+	if peers[0].Password != peer.Password {
+		t.Fatalf("ListFederationPeers()[0].Password = %q, want %q", peers[0].Password, peer.Password)
+	}
+}
+
 // setupCredentialTestStore creates a DoltStore with a dolt-initialized CLI directory
 // and "origin" remote for credential routing tests. Requires dolt CLI.
 func setupCredentialTestStore(t *testing.T, remoteUser, remotePassword string, serverMode, setupRemote bool) *DoltStore {
@@ -340,9 +595,7 @@ func setupCredentialTestStoreWithURL(t *testing.T, remoteUser, remotePassword st
 // CLI subprocess routing for Push, ForcePush, and Pull when credentials are set.
 // The guard is shared across all three operations (same insertion pattern in store.go).
 func TestCredentialCLIRouting(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed, skipping credential routing test")
-	}
+	testutil.RequireDoltBinary(t)
 
 	tests := []struct {
 		name           string
@@ -406,9 +659,7 @@ func TestCredentialCLIRoutingNoRemote(t *testing.T) {
 }
 
 func TestCredentialCLIRoutingSharedServerUsesSharedDoltRoot(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed, skipping shared-server credential routing test")
-	}
+	testutil.RequireDoltBinary(t)
 
 	sharedRoot := t.TempDir()
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
@@ -447,10 +698,55 @@ func TestCredentialCLIRoutingSharedServerUsesSharedDoltRoot(t *testing.T) {
 	}
 }
 
-func TestCloudAuthCLIRoutingSharedServerUsesSharedDoltRoot(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed, skipping shared-server cloud-auth routing test")
+func TestMatchingLocalRemoteCLIRouting(t *testing.T) {
+	tests := []struct {
+		name    string
+		remotes []storage.RemoteInfo
+		cliURL  string
+		remote  string
+		want    bool
+	}{
+		{
+			name:    "matching remote and url",
+			remotes: []storage.RemoteInfo{{Name: "origin", URL: "https://doltremoteapi.dolthub.com/org/repo"}},
+			cliURL:  "https://doltremoteapi.dolthub.com/org/repo",
+			remote:  "origin",
+			want:    true,
+		},
+		{
+			name:    "different url",
+			remotes: []storage.RemoteInfo{{Name: "origin", URL: "https://server.example/repo"}},
+			cliURL:  "https://local.example/repo",
+			remote:  "origin",
+			want:    false,
+		},
+		{
+			name:    "different remote",
+			remotes: []storage.RemoteInfo{{Name: "backup", URL: "https://doltremoteapi.dolthub.com/org/repo"}},
+			cliURL:  "https://doltremoteapi.dolthub.com/org/repo",
+			remote:  "origin",
+			want:    false,
+		},
+		{
+			name:    "missing cli remote",
+			remotes: []storage.RemoteInfo{{Name: "origin", URL: "https://doltremoteapi.dolthub.com/org/repo"}},
+			remote:  "origin",
+			want:    false,
+		},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldUseCLIForMatchingLocalRemote(tt.remotes, tt.cliURL, tt.remote)
+			if got != tt.want {
+				t.Fatalf("shouldUseCLIForMatchingLocalRemote() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCloudAuthCLIRoutingSharedServerUsesSharedDoltRoot(t *testing.T) {
+	testutil.RequireDoltBinary(t)
 
 	sharedRoot := t.TempDir()
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
@@ -492,9 +788,7 @@ func TestCloudAuthCLIRoutingSharedServerUsesSharedDoltRoot(t *testing.T) {
 // that controls CLI subprocess routing for federation PushTo, PullFrom, and Fetch
 // when peer credentials are resolved from the federation_peers table.
 func TestFederationCredentialCLIRouting(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed, skipping credential routing test")
-	}
+	testutil.RequireDoltBinary(t)
 
 	tests := []struct {
 		name        string
@@ -528,9 +822,7 @@ func TestFederationCredentialCLIRouting(t *testing.T) {
 }
 
 func TestCloudAuthCLIRouting(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed")
-	}
+	testutil.RequireDoltBinary(t)
 
 	tests := []struct {
 		name      string
@@ -576,9 +868,7 @@ func TestCloudAuthCLIRouting(t *testing.T) {
 }
 
 func TestCloudAuthCLIRoutingStructural(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed")
-	}
+	testutil.RequireDoltBinary(t)
 
 	t.Run("embedded mode", func(t *testing.T) {
 		store := setupCredentialTestStoreWithURL(t, "", "", false, true, "origin", "az://account.blob.core.windows.net/container")
@@ -600,9 +890,7 @@ func TestCloudAuthCLIRoutingStructural(t *testing.T) {
 // DoltHub (primary) + Azure (backup) remotes. AZURE_STORAGE_ACCOUNT should
 // trigger CLI routing ONLY for the Azure remote, not the DoltHub remote.
 func TestPerRemoteCloudAuthHybrid(t *testing.T) {
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("dolt not installed")
-	}
+	testutil.RequireDoltBinary(t)
 
 	tmpDir := t.TempDir()
 	dbName := "testdb"

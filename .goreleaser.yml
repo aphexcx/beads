@@ -164,13 +164,12 @@ brews:
     repository:
       owner: gastownhall
       name: homebrew-beads
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
     # Disabled: macOS archives are built by a separate CI job (goreleaser-macos),
     # so goreleaser can't generate a complete formula. The update-homebrew-formula
     # job in release.yml generates the formula after all archives are uploaded.
     skip_upload: true
-    homepage: "https://github.com/steveyegge/beads"
+    homepage: "https://github.com/gastownhall/beads"
     description: "AI-supervised issue tracker for coding workflows"
     license: "MIT"
     install: |
@@ -223,12 +222,12 @@ release:
 
     **Quick Install (macOS/Linux/FreeBSD):**
     ```bash
-    curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+    curl -sSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
     ```
 
     **Windows (PowerShell):**
     ```powershell
-    irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+    irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
     ```
 
     **Manual Install:**

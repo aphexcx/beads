@@ -36,6 +36,7 @@ fields: description, issue_type (type), priority, acceptance_criteria.
 EXAMPLES:
   bd import                        # Import from .beads/issues.jsonl
   bd import backup.jsonl           # Import from a specific file
+  bd import -i backup.jsonl        # Legacy alias for a specific file
   bd import -                      # Read JSONL from stdin
   cat issues.jsonl | bd import -   # Pipe JSONL from another tool
   bd import --dry-run              # Show what would be imported
@@ -48,9 +49,11 @@ EXAMPLES:
 var (
 	importDryRun bool
 	importDedup  bool
+	importInput  string
 )
 
 func init() {
+	importCmd.Flags().StringVarP(&importInput, "input", "i", "", "Read JSONL from a specific file")
 	importCmd.Flags().BoolVar(&importDryRun, "dry-run", false, "Show what would be imported without importing")
 	importCmd.Flags().BoolVar(&importDedup, "dedup", false, "Skip lines whose title matches an existing open issue")
 	rootCmd.AddCommand(importCmd)
@@ -58,7 +61,11 @@ func init() {
 
 func runImport(cmd *cobra.Command, args []string) error {
 	ctx := rootCtx
-	fromStdin := len(args) > 0 && args[0] == "-"
+	if importInput != "" && len(args) > 0 {
+		return fmt.Errorf("use either --input or a positional file, not both")
+	}
+
+	fromStdin := importInput == "-" || (len(args) > 0 && args[0] == "-")
 
 	if fromStdin {
 		return runImportFromReader(ctx, os.Stdin, "stdin")
@@ -66,7 +73,9 @@ func runImport(cmd *cobra.Command, args []string) error {
 
 	// Determine source file
 	var jsonlPath string
-	if len(args) > 0 {
+	if importInput != "" {
+		jsonlPath = importInput
+	} else if len(args) > 0 {
 		jsonlPath = args[0]
 	} else {
 		beadsDir := beads.FindBeadsDir()

@@ -122,6 +122,32 @@ func SetYamlConfig(key, value string) error {
 		return err
 	}
 
+	return setYamlConfigAtPath(configPath, key, value)
+}
+
+// SetYamlConfigInDir sets a configuration value in the config.yaml located in
+// the provided beadsDir, bypassing CWD/worktree discovery. Use this when the
+// caller has already resolved the authoritative workspace and needs to avoid
+// local worktree stubs shadowing the real shared config location.
+func SetYamlConfigInDir(beadsDir, key, value string) error {
+	// Validate specific keys (GH#995)
+	if err := validateYamlConfigValue(key, value); err != nil {
+		return err
+	}
+
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	if _, err := os.Stat(configPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no config.yaml found in %s (run 'bd init' first)", beadsDir)
+		}
+		return fmt.Errorf("failed to stat config.yaml: %w", err)
+	}
+
+	return setYamlConfigAtPath(configPath, key, value)
+}
+
+func setYamlConfigAtPath(configPath, key, value string) error {
+
 	// Normalize key to canonical yaml format
 	normalizedKey := normalizeYamlKey(key)
 
@@ -189,6 +215,10 @@ func UnsetYamlConfig(key string) error {
 // This keeps YAML-only config behavior aligned with runtime resolution when
 // BEADS_DIR points to an external runtime directory.
 func findProjectConfigYaml() (string, error) {
+	return findProjectConfigYamlWithFinder(findProjectBeadsDir)
+}
+
+func findProjectConfigYamlWithFinder(findBeadsDir func() string) (string, error) {
 	// Respect BEADS_DIR first when set.
 	if beadsDir := os.Getenv("BEADS_DIR"); beadsDir != "" {
 		configPath := filepath.Join(beadsDir, "config.yaml")
@@ -198,20 +228,58 @@ func findProjectConfigYaml() (string, error) {
 		return "", fmt.Errorf("no config.yaml found in BEADS_DIR (%s) (run 'bd init' first)", beadsDir)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("failed to get working directory: %w", err)
+	if configPath := projectConfigPathFromLoadedState(); configPath != "" {
+		return configPath, nil
 	}
 
-	// Walk up parent directories to find .beads/config.yaml
-	for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
-		configPath := filepath.Join(dir, ".beads", "config.yaml")
-		if _, err := os.Stat(configPath); err == nil {
-			return configPath, nil
+	if findBeadsDir != nil {
+		if beadsDir := findBeadsDir(); beadsDir != "" {
+			configPath := filepath.Join(beadsDir, "config.yaml")
+			if _, err := os.Stat(configPath); err == nil {
+				return configPath, nil
+			}
 		}
 	}
 
 	return "", fmt.Errorf("no .beads/config.yaml found (run 'bd init' first)")
+}
+
+func projectConfigPathFromLoadedState() string {
+	configPath := ConfigFileUsed()
+	if configPath == "" {
+		return ""
+	}
+	if filepath.Base(configPath) != "config.yaml" {
+		return ""
+	}
+	if filepath.Base(filepath.Dir(configPath)) != ".beads" {
+		return ""
+	}
+	if _, err := os.Stat(configPath); err != nil {
+		return ""
+	}
+	return configPath
+}
+
+func findProjectBeadsDir() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+
+	for dir := cwd; dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		beadsDir := filepath.Join(dir, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			return beadsDir
+		}
+	}
+
+	configPath := worktreeFallbackConfigPath(cwd)
+	if configPath == "" {
+		return ""
+	}
+
+	return filepath.Dir(configPath)
 }
 
 // updateYamlKey updates a key in yaml content, handling commented-out keys.

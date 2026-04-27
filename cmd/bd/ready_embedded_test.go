@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -57,6 +58,28 @@ func TestEmbeddedReady(t *testing.T) {
 		}
 	})
 
+	t.Run("ready_json_truncation_hint", func(t *testing.T) {
+		for i := 0; i < 3; i++ {
+			bdCreate(t, bd, dir, fmt.Sprintf("Ready capped issue %d", i), "--type", "task")
+		}
+
+		cmd := exec.Command(bd, "ready", "--json", "--limit", "2")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("bd ready --json --limit 2 failed: %v\nstderr: %s\nstdout: %s", err, stderr.String(), out)
+		}
+		if !json.Valid(bytes.TrimSpace(out)) {
+			t.Fatalf("ready JSON stdout should remain parseable, got: %s", out)
+		}
+		if !strings.Contains(stderr.String(), "Use --limit 0 for all") {
+			t.Fatalf("expected truncation hint on stderr, got: %q", stderr.String())
+		}
+	})
+
 	// ===== With Blockers =====
 
 	t.Run("ready_excludes_blocked", func(t *testing.T) {
@@ -81,6 +104,27 @@ func TestEmbeddedReady(t *testing.T) {
 		// The blocked issue should not appear in ready output
 		if strings.Contains(string(out), "Blocked by blocker") {
 			t.Errorf("blocked issue should not appear in ready output: %s", out)
+		}
+	})
+
+	// ===== Exclude Label =====
+
+	t.Run("ready_exclude_label", func(t *testing.T) {
+		bdCreate(t, bd, dir, "Triage pending item", "--type", "task", "--label", "triage:pending")
+		bdCreate(t, bd, dir, "Normal ready item", "--type", "task")
+
+		cmd := exec.Command(bd, "ready", "--exclude-label", "triage:pending")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd ready --exclude-label failed: %v\n%s", err, out)
+		}
+		if strings.Contains(string(out), "Triage pending item") {
+			t.Errorf("triage:pending issue should not appear with --exclude-label: %s", out)
+		}
+		if !strings.Contains(string(out), "Normal ready item") {
+			t.Errorf("normal issue should still appear with --exclude-label: %s", out)
 		}
 	})
 }

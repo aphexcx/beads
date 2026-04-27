@@ -354,6 +354,230 @@ func TestGetReadyWork_TypeFilter(t *testing.T) {
 	}
 }
 
+// TestGetReadyWork_ExcludeTypeFilter verifies that filter.ExcludeTypes is
+// honored in addition to the hardcoded default exclusion list. Regression test
+// for GH#3397: the CLI flag --exclude-type was silently ignored because
+// GetReadyWorkInTx built the NOT IN clause from the hardcoded defaults only.
+func TestGetReadyWork_ExcludeTypeFilter(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	epic := &types.Issue{
+		ID:        "rw-ex-epic",
+		Title:     "An Epic",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeEpic,
+	}
+	task := &types.Issue{
+		ID:        "rw-ex-task",
+		Title:     "A Task",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	bug := &types.Issue{
+		ID:        "rw-ex-bug",
+		Title:     "A Bug",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeBug,
+	}
+
+	for _, iss := range []*types.Issue{epic, task, bug} {
+		if err := store.CreateIssue(ctx, iss, "tester"); err != nil {
+			t.Fatalf("failed to create issue: %v", err)
+		}
+	}
+
+	// Single-type exclusion.
+	work, err := store.GetReadyWork(ctx, types.WorkFilter{
+		ExcludeTypes: []types.IssueType{types.TypeEpic},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, w := range work {
+		if w.ID == epic.ID {
+			t.Error("epic should not appear when ExcludeTypes includes epic")
+		}
+	}
+
+	// Multi-type exclusion.
+	work, err = store.GetReadyWork(ctx, types.WorkFilter{
+		ExcludeTypes: []types.IssueType{types.TypeEpic, types.TypeTask},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	foundBug := false
+	for _, w := range work {
+		if w.ID == epic.ID {
+			t.Error("epic should not appear when ExcludeTypes includes epic")
+		}
+		if w.ID == task.ID {
+			t.Error("task should not appear when ExcludeTypes includes task")
+		}
+		if w.ID == bug.ID {
+			foundBug = true
+		}
+	}
+	if !foundBug {
+		t.Error("bug should still appear when ExcludeTypes excludes only epic and task")
+	}
+}
+
+// TestGetReadyWork_ParentFilterReturnsDescendants verifies that --parent
+// returns all transitive descendants, not just direct children. Regression
+// test for GH#3396: the SQL clause was a one-hop subquery, so grandchildren
+// of the given parent were silently dropped despite the help text and the
+// WorkFilter.ParentID godoc both promising "descendants (recursive)".
+func TestGetReadyWork_ParentFilterReturnsDescendants(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	epic := &types.Issue{
+		ID:        "rw-pd-epic",
+		Title:     "Epic",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeEpic,
+	}
+	phase := &types.Issue{
+		ID:        "rw-pd-phase",
+		Title:     "Phase",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeEpic,
+	}
+	leaf := &types.Issue{
+		ID:        "rw-pd-leaf",
+		Title:     "Leaf Task",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, iss := range []*types.Issue{epic, phase, leaf} {
+		if err := store.CreateIssue(ctx, iss, "tester"); err != nil {
+			t.Fatalf("failed to create issue %s: %v", iss.ID, err)
+		}
+	}
+
+	// epic <- phase <- leaf via parent-child deps.
+	for _, dep := range []*types.Dependency{
+		{IssueID: phase.ID, DependsOnID: epic.ID, Type: types.DepParentChild},
+		{IssueID: leaf.ID, DependsOnID: phase.ID, Type: types.DepParentChild},
+	} {
+		if err := store.AddDependency(ctx, dep, "tester"); err != nil {
+			t.Fatalf("failed to add dep %s->%s: %v", dep.IssueID, dep.DependsOnID, err)
+		}
+	}
+
+	// Direct parent filter still works (control).
+	parentPhase := phase.ID
+	workPhase, err := store.GetReadyWork(ctx, types.WorkFilter{ParentID: &parentPhase})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	foundLeaf := false
+	for _, w := range workPhase {
+		if w.ID == leaf.ID {
+			foundLeaf = true
+		}
+	}
+	if !foundLeaf {
+		t.Error("direct-parent filter should return the leaf task")
+	}
+
+	// Grandparent filter: leaf must appear (the bug under test).
+	parentEpic := epic.ID
+	workEpic, err := store.GetReadyWork(ctx, types.WorkFilter{ParentID: &parentEpic})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	foundLeaf = false
+	foundPhase := false
+	for _, w := range workEpic {
+		if w.ID == leaf.ID {
+			foundLeaf = true
+		}
+		if w.ID == phase.ID {
+			foundPhase = true
+		}
+	}
+	if !foundPhase {
+		t.Error("grandparent filter should include the direct child (phase)")
+	}
+	if !foundLeaf {
+		t.Error("grandparent filter should include transitive grandchildren (leaf) - regression for GH#3396")
+	}
+}
+
+func TestGetReadyWork_ParentFilterReturnsDeepDescendants(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	root := &types.Issue{
+		ID:        "rw-deep-root",
+		Title:     "Deep Root",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeEpic,
+	}
+	if err := store.CreateIssue(ctx, root, "tester"); err != nil {
+		t.Fatalf("failed to create root: %v", err)
+	}
+
+	parentID := root.ID
+	const depth = 105
+	for i := 1; i <= depth; i++ {
+		issue := &types.Issue{
+			ID:        fmt.Sprintf("rw-deep-%03d", i),
+			Title:     fmt.Sprintf("Deep child %03d", i),
+			Status:    types.StatusOpen,
+			Priority:  2,
+			IssueType: types.TypeTask,
+		}
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("failed to create issue %s: %v", issue.ID, err)
+		}
+		if err := store.AddDependency(ctx, &types.Dependency{
+			IssueID:     issue.ID,
+			DependsOnID: parentID,
+			Type:        types.DepParentChild,
+		}, "tester"); err != nil {
+			t.Fatalf("failed to add parent-child dep for %s: %v", issue.ID, err)
+		}
+		parentID = issue.ID
+	}
+
+	rootID := root.ID
+	work, err := store.GetReadyWork(ctx, types.WorkFilter{ParentID: &rootID})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	foundLeaf := false
+	for _, w := range work {
+		if w.ID == fmt.Sprintf("rw-deep-%03d", depth) {
+			foundLeaf = true
+			break
+		}
+	}
+	if !foundLeaf {
+		t.Fatalf("parent filter should include descendant beyond depth 100, got %d descendants", len(work))
+	}
+}
+
 // TestGetReadyWork_CustomStatusBlockerStillBlocks verifies that a blocker with
 // a custom status still prevents blocked issues from appearing in ready work.
 // Regression test for bd-1x0.

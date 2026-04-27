@@ -371,6 +371,63 @@ func TestListQueryCapabilitiesSuite(t *testing.T) {
 		}
 	})
 
+	t.Run("exclude label - single", func(t *testing.T) {
+		// issue1 has "critical" and "security"; issue3 has "docs"; issue2 has none.
+		// Excluding "critical" should return issue2 and issue3.
+		results, err := s.SearchIssues(ctx, "", types.IssueFilter{
+			ExcludeLabels: []string{"critical"},
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		ids := make(map[string]bool)
+		for _, r := range results {
+			ids[r.ID] = true
+		}
+		if ids[issue1.ID] {
+			t.Errorf("issue1 (has 'critical') should be excluded")
+		}
+		if !ids[issue2.ID] {
+			t.Errorf("issue2 (no labels) should be included")
+		}
+		if !ids[issue3.ID] {
+			t.Errorf("issue3 (has 'docs', not 'critical') should be included")
+		}
+	})
+
+	t.Run("exclude label - multiple", func(t *testing.T) {
+		// Excluding "critical" and "docs" leaves only issue2.
+		results, err := s.SearchIssues(ctx, "", types.IssueFilter{
+			ExcludeLabels: []string{"critical", "docs"},
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 issue after excluding critical+docs, got %d", len(results))
+		}
+		if len(results) > 0 && results[0].ID != issue2.ID {
+			t.Errorf("Expected issue2, got %s", results[0].ID)
+		}
+	})
+
+	t.Run("exclude label - combined with include", func(t *testing.T) {
+		// Include "security" AND exclude "docs": should return issue1 only.
+		results, err := s.SearchIssues(ctx, "", types.IssueFilter{
+			Labels:        []string{"security"},
+			ExcludeLabels: []string{"docs"},
+		})
+		if err != nil {
+			t.Fatalf("Search failed: %v", err)
+		}
+		if len(results) != 1 {
+			t.Errorf("Expected 1 issue, got %d", len(results))
+		}
+		if len(results) > 0 && results[0].ID != issue1.ID {
+			t.Errorf("Expected issue1, got %s", results[0].ID)
+		}
+	})
+
 	t.Run("priority range - min", func(t *testing.T) {
 		minPrio := 2
 		results, err := s.SearchIssues(ctx, "", types.IssueFilter{
@@ -1291,7 +1348,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test full hierarchy (should return all 6 issues)
 	t.Run("full_hierarchy", func(t *testing.T) {
-		issues, err := getHierarchicalChildren(ctx, store, "", parent.ID)
+		issues, err := getHierarchicalChildren(ctx, store, "", parent.ID, types.IssueFilter{})
 		if err != nil {
 			t.Fatalf("getHierarchicalChildren failed: %v", err)
 		}
@@ -1302,7 +1359,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test child subset (should return child1 + its 2 grandchildren = 3 total)
 	t.Run("child_subset", func(t *testing.T) {
-		issues, err := getHierarchicalChildren(ctx, store, "", child1.ID)
+		issues, err := getHierarchicalChildren(ctx, store, "", child1.ID, types.IssueFilter{})
 		if err != nil {
 			t.Fatalf("getHierarchicalChildren for child1 failed: %v", err)
 		}
@@ -1313,7 +1370,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test leaf node (should return only itself)
 	t.Run("leaf_node", func(t *testing.T) {
-		issues, err := getHierarchicalChildren(ctx, store, "", grandchild11.ID)
+		issues, err := getHierarchicalChildren(ctx, store, "", grandchild11.ID, types.IssueFilter{})
 		if err != nil {
 			t.Fatalf("getHierarchicalChildren for leaf failed: %v", err)
 		}
@@ -1324,7 +1381,7 @@ func TestHierarchicalChildren(t *testing.T) {
 
 	// Test error case - non-existent parent
 	t.Run("nonexistent_parent", func(t *testing.T) {
-		_, err := getHierarchicalChildren(ctx, store, "", "nonexistent-id")
+		_, err := getHierarchicalChildren(ctx, store, "", "nonexistent-id", types.IssueFilter{})
 		if err == nil || !strings.Contains(err.Error(), "not found") {
 			t.Error("Expected 'not found' error for nonexistent parent")
 		}
@@ -1572,5 +1629,21 @@ func TestListJSON_ParentField(t *testing.T) {
 				t.Errorf("Issue %s should have nil parent, got %q", issue.ID, *iwc.Parent)
 			}
 		}
+	}
+}
+
+func TestListCommandInit(t *testing.T) {
+	t.Parallel()
+	if listCmd == nil {
+		t.Fatal("listCmd should be initialized")
+	}
+
+	// Verify --exclude-label flag exists and defaults to empty slice
+	excludeLabelFlag := listCmd.Flags().Lookup("exclude-label")
+	if excludeLabelFlag == nil {
+		t.Fatal("--exclude-label flag should exist on bd list")
+	}
+	if excludeLabelFlag.DefValue != "[]" {
+		t.Errorf("--exclude-label default should be '[]', got %q", excludeLabelFlag.DefValue)
 	}
 }

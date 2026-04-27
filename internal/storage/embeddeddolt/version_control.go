@@ -59,8 +59,8 @@ func (s *EmbeddedDoltStore) CommitWithConfig(ctx context.Context, message string
 }
 
 func (s *EmbeddedDoltStore) AddRemote(ctx context.Context, name, url string) error {
-	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, "CALL DOLT_REMOTE('add', ?, ?)", name, url)
+	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
+		_, err := db.ExecContext(ctx, "CALL DOLT_REMOTE('add', ?, ?)", name, url)
 		return err
 	})
 }

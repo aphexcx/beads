@@ -93,7 +93,7 @@ func formatConfigValuesResult(issues []string) DoctorCheck {
 
 // findConfigPath locates config.yaml in standard locations.
 func findConfigPath(repoPath string) string {
-	configPath := filepath.Join(repoPath, ".beads", "config.yaml")
+	configPath := filepath.Join(ResolveBeadsDirForRepo(repoPath), "config.yaml")
 	if _, err := os.Stat(configPath); err == nil {
 		return configPath
 	}
@@ -322,7 +322,7 @@ func expandPath(path string) string {
 func checkMetadataConfigValues(repoPath string) []string {
 	var issues []string
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		issues = append(issues, fmt.Sprintf("metadata.json: failed to load: %v", err))
@@ -378,7 +378,7 @@ func checkMetadataConfigValues(repoPath string) []string {
 func checkDatabaseConfigValues(repoPath string) []string {
 	var issues []string
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		return issues // No .beads directory, nothing to check
 	}

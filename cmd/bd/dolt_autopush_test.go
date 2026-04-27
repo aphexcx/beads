@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,19 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 )
+
+type fakeAutoPushTarget struct {
+	commit string
+	push   func(context.Context) error
+}
+
+func (f *fakeAutoPushTarget) GetCurrentCommit(context.Context) (string, error) {
+	return f.commit, nil
+}
+
+func (f *fakeAutoPushTarget) Push(ctx context.Context) error {
+	return f.push(ctx)
+}
 
 func TestIsDoltAutoPushEnabled_ExplicitConfig(t *testing.T) {
 	// Cannot be parallel: modifies global env vars and config.
@@ -50,8 +64,8 @@ func TestIsDoltAutoPushEnabled_ExplicitConfig(t *testing.T) {
 	}
 }
 
-func TestIsDoltAutoPushEnabled_DefaultNoStore(t *testing.T) {
-	// When no explicit config and no store, should return false.
+func TestIsDoltAutoPushEnabled_DefaultOff(t *testing.T) {
+	// Default (no explicit config) must return false — auto-push is opt-in only.
 	os.Unsetenv("BD_DOLT_AUTO_PUSH")
 	t.Cleanup(func() { os.Unsetenv("BD_DOLT_AUTO_PUSH") })
 
@@ -61,10 +75,9 @@ func TestIsDoltAutoPushEnabled_DefaultNoStore(t *testing.T) {
 		t.Fatalf("config.Initialize: %v", err)
 	}
 
-	// store is nil → auto-detection returns false
 	got := isDoltAutoPushEnabled(context.Background())
 	if got != false {
-		t.Errorf("isDoltAutoPushEnabled() with nil store = %v, want false", got)
+		t.Errorf("isDoltAutoPushEnabled() default = %v, want false", got)
 	}
 }
 
@@ -105,8 +118,63 @@ func TestAutoPushTimeoutConstants(t *testing.T) {
 	if autoPushTimeout < 10*time.Second || autoPushTimeout > 120*time.Second {
 		t.Errorf("autoPushTimeout = %s, want 10s-120s range", autoPushTimeout)
 	}
-	if autoPushRemoteTimeout < 2*time.Second || autoPushRemoteTimeout > 30*time.Second {
-		t.Errorf("autoPushRemoteTimeout = %s, want 2s-30s range", autoPushRemoteTimeout)
+}
+
+func TestPushWithContextReturnsPushResult(t *testing.T) {
+	target := &fakeAutoPushTarget{
+		push: func(context.Context) error {
+			return nil
+		},
+	}
+
+	if err := pushWithContext(context.Background(), target); err != nil {
+		t.Fatalf("pushWithContext() = %v, want nil", err)
+	}
+}
+
+func TestPushWithContextReturnsPushError(t *testing.T) {
+	wantErr := errors.New("push failed")
+	target := &fakeAutoPushTarget{
+		push: func(context.Context) error {
+			return wantErr
+		},
+	}
+
+	err := pushWithContext(context.Background(), target)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("pushWithContext() = %v, want %v", err, wantErr)
+	}
+}
+
+func TestPushWithContextBoundsIgnoredContext(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	target := &fakeAutoPushTarget{
+		push: func(context.Context) error {
+			close(started)
+			<-release
+			return nil
+		},
+	}
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := pushWithContext(ctx, target)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("pushWithContext() = %v, want deadline exceeded", err)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("pushWithContext returned before Push started")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("pushWithContext took %s, want under 500ms", elapsed)
 	}
 }
 

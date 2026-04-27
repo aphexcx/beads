@@ -49,6 +49,10 @@ func TestMain(m *testing.M) {
 	// Start an isolated Dolt server so regression tests don't pollute
 	// the production database on port 3307.
 	if _, err := exec.LookPath("dolt"); err != nil {
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
+			fmt.Fprintln(os.Stderr, "FAIL: dolt missing under GITHUB_ACTIONS — CI workflow must install dolt")
+			os.Exit(1)
+		}
 		fmt.Fprintln(os.Stderr, "SKIP: dolt not found in PATH; regression tests require dolt")
 		os.Exit(0)
 	}
@@ -434,6 +438,7 @@ func (w *workspace) export(extraArgs ...string) string {
 
 var volatileFields = []string{
 	"created_at", "updated_at", "closed_at",
+	"started_at",
 	"compacted_at", "compacted_at_commit",
 	"last_activity", "closed_by_session",
 	"compaction_level", "original_size",
@@ -447,7 +452,9 @@ var showOnlyFields = []string{
 }
 
 var versionSpecificFields = []string{
-	"deleted_at", "deleted_by", "delete_reason", "original_type",
+	"_type", "deleted_at", "deleted_by", "delete_reason", "original_type",
+	"comment_count", "dependency_count", "dependent_count",
+	"epic_total_children", "epic_closed_children", "epic_closeable",
 }
 
 // normalizeJSONL parses JSONL, normalizes each issue, applies ID canonicalization,
@@ -517,6 +524,11 @@ func normalizeIssue(m map[string]any) {
 			if t, err := time.Parse(time.RFC3339, s); err == nil {
 				m[df] = t.Format("2006-01-02")
 			}
+		}
+	}
+	if _, hasDefer := m["defer_until"]; hasDefer {
+		if status, _ := m["status"].(string); status == "open" || status == "deferred" {
+			delete(m, "status")
 		}
 	}
 

@@ -12,6 +12,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  detect-ci-tier:
+    name: Detect CI tier
+    runs-on: ubuntu-latest
+    outputs:
+      full_embedded: ${{ steps.tier.outputs.full_embedded }}
+      reason: ${{ steps.tier.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Decide embedded Dolt coverage
+        id: tier
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/ci-embedded-tier.sh
+
   # Fast check: every `go build|test|run|generate|install` invocation in
   # tracked scripts/hooks/CI carries -tags=gms_pure_go. Prevents ICU-linkage
   # regressions from re-entering the build (see docs/ICU-POLICY.md).
@@ -21,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: ./scripts/check-build-tags.sh
+      - run: ./scripts/check-go-install-guidance.sh
 
   # Fast check to ensure all version files are in sync
   check-version-consistency:
@@ -101,10 +120,20 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Configure Git
+      - name: Install Dolt (Linux)
+        if: runner.os == 'Linux'
+        run: curl -fsSL https://github.com/dolthub/dolt/releases/latest/download/install.sh | sudo bash
+
+      - name: Install Dolt (macOS)
+        if: runner.os == 'macOS'
+        run: brew install dolt
+
+      - name: Configure Git and Dolt identity
         run: |
           git config --global user.name "CI Bot"
           git config --global user.email "ci@beads.test"
+          dolt config --global --add user.name "CI Bot"
+          dolt config --global --add user.email "ci@beads.test"
 
       - name: Install gotestsum
         if: matrix.coverage
@@ -147,10 +176,13 @@ jobs:
   # Embedded Dolt tests - test the in-process Dolt engine (no server required)
   #
   # Split into: build → storage tests + parallel cmd test shards.
-  # Adding new *_embedded_test.go files auto-distributes via hash sharding.
+  # cmd/bd embedded tests use a committed shard manifest; newly-added tests
+  # still auto-distribute via hash fallback until the manifest is updated.
 
   build-embedded:
     name: Build (Embedded Dolt)
+    needs: detect-ci-tier
+    if: needs.detect-ci-tier.outputs.full_embedded == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -181,7 +213,8 @@ jobs:
 
   test-embedded-storage:
     name: Test (Embedded Dolt Storage)
-    needs: build-embedded
+    needs: [detect-ci-tier, build-embedded]
+    if: needs.detect-ci-tier.outputs.full_embedded == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -208,7 +241,8 @@ jobs:
 
   test-embedded-cmd:
     name: Test (Embedded Dolt Cmd ${{ matrix.shard }}/${{ strategy.job-total }})
-    needs: build-embedded
+    needs: [detect-ci-tier, build-embedded]
+    if: needs.detect-ci-tier.outputs.full_embedded == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -303,7 +337,7 @@ jobs:
     name: Test Nix Flake
     runs-on: ubuntu-latest
     # Allow failure until nixpkgs updates Go to 1.25.6+
-    # (dolthub/driver requires go 1.25.6, nixpkgs-unstable has go 1.25.1)
+    # (dolthub/driver requires go 1.26.2, nixpkgs-unstable may lag behind)
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6

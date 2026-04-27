@@ -8,7 +8,7 @@ This document contains detailed operational instructions for AI agents working o
 
 ### Code Standards
 
-- **Go version**: 1.24+
+- **Go version**: see `go.mod` for the required version (currently 1.26+)
 - **Linting**: `golangci-lint run ./...` (baseline warnings documented in [docs/LINTING.md](docs/LINTING.md))
 - **Testing**: All new features need tests (`make test` for the normal local/CI path, `make test-icu-path` only when intentionally exercising the opt-in ICU regex path)
 - **Documentation**: Update relevant .md files
@@ -117,6 +117,14 @@ defer to the standard PR flow to keep changes reviewable.
 
 **Read [CONTRIBUTING.md](CONTRIBUTING.md)** — it contains promises we've made to contributors. Violating them damages trust and community.
 
+Run the read-only preflight before implementing related work, opening a PR, or
+merging/closing a PR:
+
+```bash
+scripts/pr-preflight.sh --search "<topic keywords>" --repo gastownhall/beads
+scripts/pr-preflight.sh <pr-number> --repo gastownhall/beads
+```
+
 **Before implementing any feature or fix, check for existing open PRs on the same topic:**
 
 ```bash
@@ -132,7 +140,8 @@ gh pr list --repo gastownhall/beads --state open --search "<topic keywords>" --j
 
 If you must rewrite (e.g., fundamentally different approach needed), explain why on the original PR and credit the contributor's design/tests in your commits.
 
-This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked.
+Do not rely on auto-discovery of CONTRIBUTING.md; the preflight is the agent
+gate for PR handling.
 
 ## Landing the Plane
 
@@ -142,7 +151,7 @@ This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked
 
 1. **File beads issues for any remaining work** that needs follow-up
 2. **Ensure all quality gates pass** (only if code changes were made):
-   - Run `make lint` or `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
+   - Run `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
    - Run `make test` (and `make test-icu-path` only if you intentionally need the ICU regex path)
    - File P0 issues if quality gates are broken
 3. **Update beads issues** - close finished work, update status
@@ -185,7 +194,7 @@ This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked
 bd create "Add integration tests for sync" -t task -p 2 --json
 
 # 2. Run quality gates (only if code changes were made)
-go test -short ./...
+make test
 golangci-lint run ./...
 
 # 3. Close finished issues
@@ -317,7 +326,7 @@ make test
 make test-icu-path
 
 # Coverage run
-go test -coverprofile=coverage.out ./...
+go test -tags gms_pure_go -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Verify installed binary
@@ -440,13 +449,12 @@ gh issue view 201
 
 - Check existing issues: `bd list`
 - Look at recent commits: `git log --oneline -20`
-- Read the docs: README.md, ADVANCED.md, EXTENDING.md
+- Read the docs: README.md, ADVANCED.md, docs/CONFIG.md
 - Create an issue if unsure: `bd create "Question: ..." -t task -p 2`
 
 ## Important Files
 
 - **README.md** - Main documentation (keep this updated!)
-- **EXTENDING.md** - Database extension guide
 - **ADVANCED.md** - Advanced features (rename, merge, compaction)
 - **CONTRIBUTING.md** - Contribution guidelines
 - **SECURITY.md** - Security policy

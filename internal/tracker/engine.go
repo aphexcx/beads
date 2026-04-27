@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -316,6 +317,8 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		localByExternalIdentifier[identifier] = localIssue
 	}
 
+	prelinkedHydrateIDs := make(map[string]bool)
+
 	// Fetch issues from external tracker
 	var extIssues []TrackerIssue
 	if len(opts.IssueIDs) > 0 {
@@ -360,10 +363,20 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		if provider, ok := e.Tracker.(PullStatsProvider); ok {
 			stats.Queried, stats.Candidates = provider.LastPullStats()
 		}
+		hydrated, hydratedLocalIDs, err := e.fetchPrelinkedIssues(ctx, extIssues, localIssues, lastSync)
+		if err != nil {
+			return nil, fmt.Errorf("hydrating pre-linked %s issues: %w", e.Tracker.DisplayName(), err)
+		}
+		extIssues = append(extIssues, hydrated...)
+		stats.Candidates += len(hydrated)
+		for id := range hydratedLocalIDs {
+			prelinkedHydrateIDs[id] = true
+		}
 	}
 
 	mapper := e.Tracker.FieldMapper()
 	var pendingDeps []DependencyInfo
+	var dryRunIssues []*types.Issue
 
 	for _, extIssue := range extIssues {
 		// ShouldImport hook: filter before conversion
@@ -409,6 +422,27 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 		}
 
+		if existing != nil {
+			// Conflict-aware pull: skip updating issues that were locally
+			// modified since last sync. Conflict detection (Phase 2) will
+			// handle these per the configured resolution strategy.
+			// Without this guard, pull silently overwrites local changes
+			// before conflict detection can compare timestamps.
+			if lastSync != nil && existing.UpdatedAt.After(*lastSync) && !allowOverwriteIDs[existing.ID] && !prelinkedHydrateIDs[existing.ID] {
+				stats.Skipped++
+				continue
+			}
+		}
+
+		pendingDeps = appendFilteredDependencies(pendingDeps, conv.Dependencies, opts.DependencyTypes, opts.DependencySources)
+		if opts.DryRun {
+			dryRunIssue := *conv.Issue
+			if strings.TrimSpace(ref) != "" {
+				dryRunIssue.ExternalRef = strPtr(ref)
+			}
+			dryRunIssues = append(dryRunIssues, &dryRunIssue)
+		}
+
 		if existing != nil && pullIssueEqual(existing, conv.Issue, ref) {
 			stats.Skipped++
 			continue
@@ -426,16 +460,6 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		}
 
 		if existing != nil {
-			// Conflict-aware pull: skip updating issues that were locally
-			// modified since last sync. Conflict detection (Phase 2) will
-			// handle these per the configured resolution strategy.
-			// Without this guard, pull silently overwrites local changes
-			// before conflict detection can compare timestamps.
-			if lastSync != nil && existing.UpdatedAt.After(*lastSync) && !allowOverwriteIDs[existing.ID] {
-				stats.Skipped++
-				continue
-			}
-
 			updates := buildPullIssueUpdates(existing, conv.Issue, ref)
 			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
 				updates["metadata"] = raw
@@ -463,12 +487,15 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 			stats.Created++
 		}
-
-		pendingDeps = append(pendingDeps, conv.Dependencies...)
 	}
 
 	// Create dependencies after all issues are imported
-	depErrors := e.createDependencies(ctx, pendingDeps)
+	depErrors := 0
+	if opts.DryRun {
+		depErrors = e.previewDependencies(ctx, pendingDeps, dryRunIssues)
+	} else {
+		depErrors = e.createDependencies(ctx, pendingDeps)
+	}
 	stats.Skipped += depErrors
 
 	span.SetAttributes(
@@ -527,6 +554,130 @@ func marshalTrackerMetadata(metadata interface{}) (json.RawMessage, bool) {
 		return nil, false
 	}
 	return json.RawMessage(raw), true
+}
+
+func appendFilteredDependencies(dst []DependencyInfo, deps []DependencyInfo, allowedTypes []types.DependencyType, allowedSources []DependencySource) []DependencyInfo {
+	if len(deps) == 0 {
+		return dst
+	}
+	if len(allowedTypes) == 0 && len(allowedSources) == 0 {
+		return append(dst, deps...)
+	}
+	allowed := make(map[string]struct{}, len(allowedTypes))
+	for _, depType := range allowedTypes {
+		allowed[string(depType)] = struct{}{}
+	}
+	allowedSourceSet := make(map[DependencySource]struct{}, len(allowedSources))
+	for _, source := range allowedSources {
+		allowedSourceSet[source] = struct{}{}
+	}
+	for _, dep := range deps {
+		if len(allowed) > 0 {
+			if _, ok := allowed[dep.Type]; !ok {
+				continue
+			}
+		}
+		if len(allowedSourceSet) > 0 {
+			if _, ok := allowedSourceSet[dep.Source]; !ok {
+				continue
+			}
+		}
+		dst = append(dst, dep)
+	}
+	return dst
+}
+
+func (e *Engine) fetchPrelinkedIssues(ctx context.Context, fetched []TrackerIssue, localIssues []*types.Issue, lastSync *time.Time) ([]TrackerIssue, map[string]bool, error) {
+	hydratedLocalIDs := make(map[string]bool)
+	if lastSync == nil {
+		return nil, hydratedLocalIDs, nil
+	}
+
+	seen := make(map[string]struct{}, len(fetched))
+	for _, issue := range fetched {
+		for _, id := range []string{
+			strings.TrimSpace(issue.Identifier),
+			strings.TrimSpace(e.Tracker.ExtractIdentifier(e.Tracker.BuildExternalRef(&issue))),
+		} {
+			if id != "" {
+				seen[id] = struct{}{}
+				seen[strings.ToLower(id)] = struct{}{}
+			}
+		}
+	}
+
+	var hydrated []TrackerIssue
+	for _, local := range localIssues {
+		if local == nil || local.ExternalRef == nil {
+			continue
+		}
+		ref := strings.TrimSpace(*local.ExternalRef)
+		if ref == "" || !e.Tracker.IsExternalRef(ref) {
+			continue
+		}
+		changedAfterLastSync, err := e.externalRefChangedAfter(ctx, local, ref, *lastSync)
+		if err != nil {
+			return hydrated, hydratedLocalIDs, fmt.Errorf("checking pre-linked local issue %s: %w", local.ID, err)
+		}
+		if !changedAfterLastSync {
+			continue
+		}
+		identifier := strings.TrimSpace(e.Tracker.ExtractIdentifier(ref))
+		if identifier == "" {
+			continue
+		}
+		if _, ok := seen[identifier]; ok {
+			continue
+		}
+		if _, ok := seen[strings.ToLower(identifier)]; ok {
+			continue
+		}
+
+		extIssue, err := e.Tracker.FetchIssue(ctx, identifier)
+		if err != nil {
+			return hydrated, hydratedLocalIDs, err
+		}
+		if extIssue == nil {
+			continue
+		}
+		hydrated = append(hydrated, *extIssue)
+		hydratedLocalIDs[local.ID] = true
+		seen[identifier] = struct{}{}
+		seen[strings.ToLower(identifier)] = struct{}{}
+	}
+	return hydrated, hydratedLocalIDs, nil
+}
+
+type dbProvider interface {
+	DB() *sql.DB
+}
+
+func (e *Engine) externalRefChangedAfter(ctx context.Context, local *types.Issue, currentRef string, lastSync time.Time) (bool, error) {
+	if local == nil {
+		return false, nil
+	}
+	provider, ok := e.Store.(dbProvider)
+	if !ok || provider.DB() == nil {
+		return local.CreatedAt.After(lastSync) || local.UpdatedAt.After(lastSync), nil
+	}
+
+	var previousRef sql.NullString
+	err := provider.DB().QueryRowContext(ctx, `
+		SELECT external_ref
+		FROM (
+			SELECT id, external_ref, commit_date FROM dolt_history_issues
+		) h
+		WHERE h.id = ? AND h.commit_date <= ?
+		ORDER BY h.commit_date DESC
+		LIMIT 1
+	`, local.ID, lastSync.UTC()).Scan(&previousRef)
+	if err == sql.ErrNoRows {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !previousRef.Valid || strings.TrimSpace(previousRef.String) != strings.TrimSpace(currentRef), nil
 }
 
 func syncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
@@ -952,15 +1103,21 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 		return 0
 	}
 
+	resolveIssue, err := e.dependencyIssueResolver(ctx, nil)
+	if err != nil {
+		e.warn("Failed to build dependency resolver: %v", err)
+		return len(deps)
+	}
+
 	errCount := 0
 	for _, dep := range deps {
-		fromIssue, err := e.Store.GetIssueByExternalRef(ctx, dep.FromExternalID)
+		fromIssue, err := resolveIssue(ctx, dep.FromExternalID)
 		if err != nil {
 			e.warn("Failed to resolve dependency source %s: %v", dep.FromExternalID, err)
 			errCount++
 			continue
 		}
-		toIssue, err := e.Store.GetIssueByExternalRef(ctx, dep.ToExternalID)
+		toIssue, err := resolveIssue(ctx, dep.ToExternalID)
 		if err != nil {
 			e.warn("Failed to resolve dependency target %s: %v", dep.ToExternalID, err)
 			errCount++
@@ -982,6 +1139,134 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 		}
 	}
 	return errCount
+}
+
+func (e *Engine) previewDependencies(ctx context.Context, deps []DependencyInfo, dryRunIssues []*types.Issue) int {
+	if len(deps) == 0 {
+		return 0
+	}
+
+	resolveIssue, err := e.dependencyIssueResolver(ctx, dryRunIssues)
+	if err != nil {
+		e.warn("Failed to build dependency resolver: %v", err)
+		return len(deps)
+	}
+
+	wouldCreate := 0
+	pending := make(map[string]struct{}, len(deps))
+	for _, dep := range deps {
+		fromIssue, err := resolveIssue(ctx, dep.FromExternalID)
+		if err != nil {
+			e.warn("Failed to resolve dependency source %s: %v", dep.FromExternalID, err)
+			continue
+		}
+		toIssue, err := resolveIssue(ctx, dep.ToExternalID)
+		if err != nil {
+			e.warn("Failed to resolve dependency target %s: %v", dep.ToExternalID, err)
+			continue
+		}
+		if fromIssue == nil || toIssue == nil {
+			continue
+		}
+		if dependencyExists(ctx, e.Store, fromIssue.ID, toIssue.ID, types.DependencyType(dep.Type)) {
+			continue
+		}
+		key := pendingDependencyPreviewKey(fromIssue.ID, toIssue.ID, dep.Type)
+		if _, ok := pending[key]; ok {
+			continue
+		}
+		pending[key] = struct{}{}
+		fromDisplay := firstNonEmpty(fromIssue.ID, dep.FromExternalID)
+		toDisplay := firstNonEmpty(toIssue.ID, dep.ToExternalID)
+		e.msg("[dry-run] Would create dependency: %s -> %s (%s)", fromDisplay, toDisplay, dep.Type)
+		wouldCreate++
+	}
+	if wouldCreate > 0 {
+		e.msg("[dry-run] Would create %d dependencies", wouldCreate)
+	}
+	return 0
+}
+
+func pendingDependencyPreviewKey(fromID, toID, depType string) string {
+	return strings.Join([]string{
+		strings.TrimSpace(fromID),
+		strings.TrimSpace(toID),
+		strings.TrimSpace(depType),
+	}, "\x00")
+}
+
+func (e *Engine) dependencyIssueResolver(ctx context.Context, extraIssues []*types.Issue) (func(context.Context, string) (*types.Issue, error), error) {
+	issues, searchErr := e.Store.SearchIssues(ctx, "", types.IssueFilter{})
+	if searchErr != nil {
+		return nil, searchErr
+	}
+	issues = append(issues, extraIssues...)
+
+	byExternal := make(map[string]*types.Issue, len(issues)*2)
+	for _, candidate := range issues {
+		if candidate == nil || candidate.ExternalRef == nil {
+			continue
+		}
+		ref := strings.TrimSpace(*candidate.ExternalRef)
+		if ref == "" || !e.Tracker.IsExternalRef(ref) {
+			continue
+		}
+		if _, exists := byExternal[ref]; !exists {
+			byExternal[ref] = candidate
+		}
+		identifier := strings.TrimSpace(e.Tracker.ExtractIdentifier(ref))
+		if identifier != "" {
+			if _, exists := byExternal[identifier]; !exists {
+				byExternal[identifier] = candidate
+			}
+			lowerIdentifier := strings.ToLower(identifier)
+			if _, exists := byExternal[lowerIdentifier]; !exists {
+				byExternal[lowerIdentifier] = candidate
+			}
+		}
+	}
+
+	return func(ctx context.Context, externalID string) (*types.Issue, error) {
+		externalID = strings.TrimSpace(externalID)
+		if externalID == "" {
+			return nil, nil
+		}
+		if issue := byExternal[externalID]; issue != nil {
+			return issue, nil
+		}
+		if issue := byExternal[strings.ToLower(externalID)]; issue != nil {
+			return issue, nil
+		}
+		if strings.Contains(externalID, "://") {
+			return e.Store.GetIssueByExternalRef(ctx, externalID)
+		}
+		return nil, nil
+	}, nil
+}
+
+func dependencyExists(ctx context.Context, store storage.Storage, issueID, dependsOnID string, depType types.DependencyType) bool {
+	if strings.TrimSpace(issueID) == "" || strings.TrimSpace(dependsOnID) == "" {
+		return false
+	}
+	records, err := store.GetDependenciesWithMetadata(ctx, issueID)
+	if err != nil {
+		return false
+	}
+	for _, record := range records {
+		if record.ID == dependsOnID && record.DependencyType == depType {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // buildDescendantSet returns the set of issue IDs consisting of the given parent

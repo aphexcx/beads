@@ -321,6 +321,30 @@ func TestEmbeddedInit(t *testing.T) {
 		}
 	})
 
+	t.Run("plain_git_origin_not_registered_as_dolt_remote", func(t *testing.T) {
+		bareDir := filepath.Join(t.TempDir(), "plain.git")
+		runGitForBootstrapTest(t, "", "init", "--bare", bareDir)
+
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+		runGitForBootstrapTest(t, dir, "remote", "add", "origin", bareDir)
+
+		runBDInit(t, bd, dir, "--prefix", "pg", "--skip-hooks", "--skip-agents")
+
+		out := bdDolt(t, bd, dir, "remote", "list")
+		if strings.Contains(out, "origin") {
+			t.Fatalf("plain git origin should not be registered as a Dolt remote; remote list:\n%s", out)
+		}
+
+		configYAML, err := os.ReadFile(filepath.Join(dir, ".beads", "config.yaml"))
+		if err != nil {
+			t.Fatalf("read config.yaml: %v", err)
+		}
+		if strings.Contains(string(configYAML), "sync.remote:") || strings.Contains(string(configYAML), "sync-remote:") {
+			t.Fatalf("plain git origin should not be persisted as sync.remote; config.yaml:\n%s", configYAML)
+		}
+	})
+
 	t.Run("database", func(t *testing.T) {
 		_, beadsDir, _ := bdInit(t, bd, "--database", "custom_db")
 		cfg, err := configfile.Load(beadsDir)
@@ -418,6 +442,36 @@ func TestEmbeddedInit(t *testing.T) {
 		}
 		if !strings.Contains(string(content), ".beads") {
 			t.Error("--setup-exclude should add .beads to .git/info/exclude")
+		}
+	})
+
+	t.Run("auto_commit_bypasses_hooks", func(t *testing.T) {
+		dir := t.TempDir()
+		initGitRepoAt(t, dir)
+		preCommitPath := filepath.Join(dir, ".git", "hooks", "pre-commit")
+		preCommit := "#!/bin/sh\necho hook-fired >> .hook-ran\nexit 1\n"
+		if err := os.WriteFile(preCommitPath, []byte(preCommit), 0755); err != nil {
+			t.Fatal(err)
+		}
+		unsetHooksPath := exec.Command("git", "config", "--unset", "core.hooksPath")
+		unsetHooksPath.Dir = dir
+		if out, err := unsetHooksPath.CombinedOutput(); err != nil {
+			t.Fatalf("git config --unset core.hooksPath failed: %v\n%s", err, out)
+		}
+
+		runBDInit(t, bd, dir, "--prefix", "hook")
+
+		if _, err := os.Stat(filepath.Join(dir, ".hook-ran")); err == nil {
+			t.Fatal("expected init auto-commit to bypass git hooks")
+		}
+		logCmd := exec.Command("git", "log", "--oneline", "-n", "1")
+		logCmd.Dir = dir
+		logOut, err := logCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git log failed: %v\n%s", err, logOut)
+		}
+		if !strings.Contains(string(logOut), "bd init: initialize beads issue tracking") {
+			t.Fatalf("expected init commit to succeed, got log: %s", logOut)
 		}
 	})
 
@@ -723,9 +777,10 @@ func TestEmbeddedInitConcurrent(t *testing.T) {
 	env := bdEnv(dir)
 
 	type result struct {
-		idx int
-		out string
-		err error
+		idx      int
+		out      string
+		err      error
+		timedOut bool
 	}
 	results := make([]result, N)
 	var wg sync.WaitGroup
@@ -733,17 +788,24 @@ func TestEmbeddedInitConcurrent(t *testing.T) {
 	for i := 0; i < N; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			cmd := exec.Command(bd, "init", "--prefix", "conc", "--force", "--quiet")
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, bd, "init", "--prefix", "conc", "--force", "--quiet", "--skip-agents")
 			cmd.Dir = dir
 			cmd.Env = env
 			out, err := cmd.CombinedOutput()
-			results[idx] = result{idx: idx, out: string(out), err: err}
+			results[idx] = result{idx: idx, out: string(out), err: err, timedOut: ctx.Err() == context.DeadlineExceeded}
 		}(i)
 	}
 	wg.Wait()
 
 	successes, lockErrors := 0, 0
 	for _, r := range results {
+		if r.timedOut {
+			t.Errorf("process %d timed out after 45s running concurrent bd init: %v\n%s", r.idx, r.err, r.out)
+			continue
+		}
 		if strings.Contains(r.out, "panic") {
 			t.Errorf("process %d panicked:\n%s", r.idx, r.out)
 		}

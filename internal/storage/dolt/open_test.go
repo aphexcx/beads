@@ -106,8 +106,46 @@ func TestResolveAutoStart(t *testing.T) {
 	}
 }
 
+// TestApplyCLIAutoStart_RespectsExternalMode verifies that an external-mode
+// repo (metadata.json with explicit dolt_server_port) suppresses the CLI
+// auto-start path, preventing the shadow-database fallback when the
+// configured external server is transiently unreachable.
+//
+// Regression for the case where ApplyCLIAutoStart hardcoded ServerModeOwned
+// and bypassed resolveAutoStart's external-mode check, so any bd command in
+// an external-mode repo could spawn a fallback embedded server when the
+// configured server didn't respond (e.g. during a service cutover).
+func TestApplyCLIAutoStart_RespectsExternalMode(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_AUTO_START", "")
+	t.Setenv("BEADS_TEST_MODE", "")
+
+	beadsDir := t.TempDir()
+	// metadata.json with explicit dolt_server_port → ServerModeExternal.
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltServerPort = 3399
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("save metadata.json: %v", err)
+	}
+
+	if got := doltserver.ResolveServerMode(beadsDir); got != doltserver.ServerModeExternal {
+		t.Fatalf("ResolveServerMode = %v, want External (preflight)", got)
+	}
+
+	// No config.yaml dolt.auto-start set — relies entirely on External-
+	// mode suppression. Pre-fix this would return AutoStart=true (default).
+	storeCfg := &Config{}
+	ApplyCLIAutoStart(beadsDir, storeCfg)
+	if storeCfg.AutoStart {
+		t.Errorf("ApplyCLIAutoStart set AutoStart=true in external-mode repo; want false (shadow database protection)")
+	}
+}
+
 func TestCLIDirUsesSharedDoltRootInSharedServerMode(t *testing.T) {
 	sharedRoot := t.TempDir()
+	t.Setenv(EnvDoltCLIDir, "")
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
 	t.Setenv("BEADS_SHARED_SERVER_DIR", sharedRoot)
 
@@ -125,6 +163,7 @@ func TestCLIDirUsesSharedDoltRootInSharedServerMode(t *testing.T) {
 }
 
 func TestCLIDirUsesDbPathOutsideSharedServerMode(t *testing.T) {
+	t.Setenv(EnvDoltCLIDir, "")
 	t.Setenv("BEADS_DOLT_SHARED_SERVER", "0")
 
 	dbPath := filepath.Join(t.TempDir(), ".beads", "dolt")
@@ -138,6 +177,58 @@ func TestCLIDirUsesDbPathOutsideSharedServerMode(t *testing.T) {
 	want := filepath.Join(dbPath, "local_db")
 	if got := store.CLIDir(); got != want {
 		t.Fatalf("CLIDir() = %q, want %q", got, want)
+	}
+}
+
+func TestCLIDirUsesExplicitEnvOverride(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "0")
+	cliDir := filepath.Join(t.TempDir(), "server-db")
+	t.Setenv(EnvDoltCLIDir, cliDir)
+
+	store := &DoltStore{
+		serverMode:  true,
+		serverOwner: doltserver.ServerModeExternal,
+		dbPath:      filepath.Join(t.TempDir(), ".beads", "dolt"),
+		database:    "local_db",
+	}
+
+	if got := store.CLIDir(); got != cliDir {
+		t.Fatalf("CLIDir() = %q, want %q", got, cliDir)
+	}
+}
+
+func TestCLIDirEmptyForGenericExternalServerModeWithoutEnv(t *testing.T) {
+	t.Setenv(EnvDoltCLIDir, "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "0")
+
+	store := &DoltStore{
+		serverMode:  true,
+		serverOwner: doltserver.ServerModeExternal,
+		dbPath:      filepath.Join(t.TempDir(), ".beads", "dolt"),
+		database:    "local_db",
+	}
+
+	if got := store.CLIDir(); got != "" {
+		t.Fatalf("CLIDir() = %q, want empty string", got)
+	}
+}
+
+func TestDoltCLIRequiresExplicitDirInGenericExternalServerMode(t *testing.T) {
+	t.Setenv(EnvDoltCLIDir, "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "0")
+
+	store := &DoltStore{
+		serverMode:  true,
+		serverOwner: doltserver.ServerModeExternal,
+		branch:      "main",
+	}
+
+	err := store.doltCLIPull(t.Context(), "origin", nil)
+	if err == nil {
+		t.Fatal("doltCLIPull() error = nil, want explicit CLI dir error")
+	}
+	if !strings.Contains(err.Error(), EnvDoltCLIDir) {
+		t.Fatalf("doltCLIPull() error = %q, want mention of %s", err.Error(), EnvDoltCLIDir)
 	}
 }
 

@@ -5,7 +5,6 @@ package tracker
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -19,9 +18,7 @@ import (
 // newTestStore creates a dolt store on the shared database with branch isolation.
 func newTestStore(t *testing.T) *dolt.DoltStore {
 	t.Helper()
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("Dolt not installed, skipping test")
-	}
+	testutil.RequireDoltBinary(t)
 	if testServerPort == 0 || testSharedDB == "" {
 		t.Skip("shared test Dolt database not initialized, skipping test")
 	}
@@ -61,10 +58,12 @@ type mockTracker struct {
 	created         []*types.Issue
 	updated         map[string]*types.Issue
 	fetchErr        error
+	fetchIssueErr   error
 	createErr       error
 	createFailAfter int // fail after this many successful creates (0 = fail immediately)
 	updateErr       error
 	fieldMapper     FieldMapper
+	fetchIssues     func(context.Context, FetchOptions) ([]TrackerIssue, error)
 }
 
 type mockExternalRefTracker struct {
@@ -159,14 +158,20 @@ func (m *mockBatchTracker) BatchPushDryRun(_ context.Context, issues []*types.Is
 	return &BatchPushResult{}, nil
 }
 
-func (m *mockTracker) FetchIssues(_ context.Context, _ FetchOptions) ([]TrackerIssue, error) {
+func (m *mockTracker) FetchIssues(ctx context.Context, opts FetchOptions) ([]TrackerIssue, error) {
 	if m.fetchErr != nil {
 		return nil, m.fetchErr
+	}
+	if m.fetchIssues != nil {
+		return m.fetchIssues(ctx, opts)
 	}
 	return m.issues, nil
 }
 
 func (m *mockTracker) FetchIssue(_ context.Context, identifier string) (*TrackerIssue, error) {
+	if m.fetchIssueErr != nil {
+		return nil, m.fetchIssueErr
+	}
 	if m.fetchErr != nil {
 		return nil, m.fetchErr
 	}
@@ -603,6 +608,84 @@ func TestEnginePullOnly(t *testing.T) {
 	}
 	if len(issues) != 2 {
 		t.Errorf("stored %d issues, want 2", len(issues))
+	}
+}
+
+func TestEnginePullUsesPrelinkedExternalRefIdentifier(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	localRef := "https://linear.app/team/issue/TEAM-123/fix-login"
+	local := &types.Issue{
+		ID:          "bd-linear-prelink",
+		Title:       "Fix login",
+		Description: "Local draft",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: strPtr(localRef),
+	}
+	if err := store.CreateIssue(ctx, local, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+
+	base := newMockTracker("linear")
+	base.issues = []TrackerIssue{{
+		ID:          "linear-internal-123",
+		Identifier:  "TEAM-123",
+		URL:         "https://linear.app/team/issue/TEAM-123/renamed-login-fix",
+		Title:       "Fix login",
+		Description: "Linear copy",
+		Priority:    2,
+		UpdatedAt:   time.Now(),
+	}}
+	lt := &mockExternalRefTracker{
+		mockTracker: base,
+		buildRef: func(issue *TrackerIssue) string {
+			return "https://linear.app/team/issue/" + issue.Identifier
+		},
+		extract: func(ref string) string {
+			parts := strings.Split(ref, "/issue/")
+			if len(parts) != 2 {
+				return ""
+			}
+			return strings.Split(parts[1], "/")[0]
+		},
+		isRef: func(ref string) bool {
+			return strings.Contains(ref, "linear.app/") && strings.Contains(ref, "/issue/")
+		},
+	}
+
+	engine := NewEngine(lt, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Sync() not successful: %s", result.Error)
+	}
+	if result.PullStats.Created != 0 || result.PullStats.Updated != 1 {
+		t.Fatalf("PullStats = %+v, want Created=0 Updated=1", result.PullStats)
+	}
+
+	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{ExternalRefContains: "TEAM-123"})
+	if err != nil {
+		t.Fatalf("SearchIssues() error: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("issues linked to TEAM-123 = %d, want 1", len(issues))
+	}
+	got, err := store.GetIssue(ctx, local.ID)
+	if err != nil {
+		t.Fatalf("GetIssue() error: %v", err)
+	}
+	wantRef := "https://linear.app/team/issue/TEAM-123"
+	if got.ExternalRef == nil || *got.ExternalRef != wantRef {
+		t.Fatalf("external_ref = %#v, want %q", got.ExternalRef, wantRef)
+	}
+	if got.Description != "Linear copy" {
+		t.Fatalf("description = %q, want Linear copy", got.Description)
 	}
 }
 
@@ -2037,6 +2120,736 @@ func TestEngineCreateDependencies(t *testing.T) {
 	}
 	if len(depRecords) == 0 {
 		t.Fatal("expected at least one dependency record, got none")
+	}
+}
+
+func TestEngineCreateDependenciesResolvesExternalIdentifiers(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issue1 := &types.Issue{
+		ID:        "bd-linear-blocked",
+		Title:     "Blocked issue",
+		Status:    types.StatusOpen,
+		IssueType: types.TypeTask,
+		Priority:  2,
+	}
+	issue2 := &types.Issue{
+		ID:        "bd-linear-blocker",
+		Title:     "Blocker issue",
+		Status:    types.StatusOpen,
+		IssueType: types.TypeTask,
+		Priority:  2,
+	}
+	for _, issue := range []*types.Issue{issue1, issue2} {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+	}
+	if err := store.UpdateIssue(ctx, issue1.ID, map[string]interface{}{"external_ref": "https://linear.app/team/issue/TEAM-101/blocked-issue"}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue issue1 external_ref: %v", err)
+	}
+	if err := store.UpdateIssue(ctx, issue2.ID, map[string]interface{}{"external_ref": "https://linear.app/team/issue/TEAM-100/blocker-issue"}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue issue2 external_ref: %v", err)
+	}
+
+	engine := NewEngine(&mockExternalRefTracker{
+		mockTracker: newMockTracker("linear"),
+		isRef: func(ref string) bool {
+			return strings.Contains(ref, "linear.app")
+		},
+		extract: func(ref string) string {
+			parts := strings.Split(ref, "/")
+			for _, part := range parts {
+				if strings.HasPrefix(part, "TEAM-") {
+					return part
+				}
+			}
+			return ref
+		},
+	}, store, "test-actor")
+
+	deps := []DependencyInfo{
+		{FromExternalID: "TEAM-101", ToExternalID: "TEAM-100", Type: string(types.DepBlocks)},
+	}
+	errCount := engine.createDependencies(ctx, deps)
+	if errCount != 0 {
+		t.Errorf("createDependencies returned errCount=%d, want 0; warnings=%v", errCount, engine.warnings)
+	}
+
+	depRecords, err := store.GetDependencyRecords(ctx, issue1.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords error: %v", err)
+	}
+	if len(depRecords) != 1 {
+		t.Fatalf("expected 1 dependency record, got %d", len(depRecords))
+	}
+	if depRecords[0].DependsOnID != issue2.ID || depRecords[0].Type != types.DepBlocks {
+		t.Errorf("dependency = %s -> %s (%s), want %s -> %s (%s)",
+			depRecords[0].IssueID, depRecords[0].DependsOnID, depRecords[0].Type,
+			issue1.ID, issue2.ID, types.DepBlocks)
+	}
+}
+
+func TestEngineCreateDependenciesResolvesBareIdentifierFromExternalRef(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issues := []*types.Issue{
+		{ID: "bd-linear-child", Title: "Child", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-linear-parent", Title: "Parent", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+	}
+	for _, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+	}
+	if err := store.UpdateIssue(ctx, "bd-linear-child", map[string]interface{}{"external_ref": "https://linear.app/team/issue/TEAM-101/child-title"}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue child external_ref: %v", err)
+	}
+	if err := store.UpdateIssue(ctx, "bd-linear-parent", map[string]interface{}{"external_ref": "https://linear.app/team/issue/TEAM-100/parent-title"}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue parent external_ref: %v", err)
+	}
+
+	base := newMockTracker("linear")
+	lt := &mockExternalRefTracker{
+		mockTracker: base,
+		extract: func(ref string) string {
+			parts := strings.Split(ref, "/issue/")
+			if len(parts) != 2 {
+				return ref
+			}
+			return strings.Split(parts[1], "/")[0]
+		},
+		isRef: func(ref string) bool {
+			return strings.Contains(ref, "linear.app/") && strings.Contains(ref, "/issue/")
+		},
+	}
+	engine := NewEngine(lt, store, "test-actor")
+
+	errCount := engine.createDependencies(ctx, []DependencyInfo{
+		{FromExternalID: "TEAM-101", ToExternalID: "TEAM-100", Type: string(types.DepParentChild)},
+	})
+	if errCount != 0 {
+		t.Fatalf("createDependencies returned errCount=%d, warnings=%v", errCount, engine.warnings)
+	}
+
+	depRecords, err := store.GetDependencyRecords(ctx, "bd-linear-child")
+	if err != nil {
+		t.Fatalf("GetDependencyRecords error: %v", err)
+	}
+	if len(depRecords) != 1 {
+		t.Fatalf("expected 1 dependency record, got %d", len(depRecords))
+	}
+	if depRecords[0].DependsOnID != "bd-linear-parent" || depRecords[0].Type != types.DepParentChild {
+		t.Fatalf("dependency = %s -> %s (%s), want bd-linear-child -> bd-linear-parent (%s)",
+			depRecords[0].IssueID, depRecords[0].DependsOnID, depRecords[0].Type, types.DepParentChild)
+	}
+}
+
+func TestEnginePullCreatesDependenciesForUnchangedIssues(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issue1 := &types.Issue{ID: "bd-unchanged-1", Title: "Blocked issue", Description: "already pulled", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2}
+	issue2 := &types.Issue{ID: "bd-unchanged-2", Title: "Blocker issue", Description: "already pulled", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2}
+	for _, issue := range []*types.Issue{issue1, issue2} {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+		ref := fmt.Sprintf("https://test.test/EXT-%s", strings.TrimPrefix(issue.ID, "bd-unchanged-"))
+		if err := store.UpdateIssue(ctx, issue.ID, map[string]interface{}{"external_ref": ref}, "test-actor"); err != nil {
+			t.Fatalf("UpdateIssue external_ref: %v", err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{Identifier: "EXT-1", Title: issue1.Title, Description: issue1.Description},
+		{Identifier: "EXT-2", Title: issue2.Title, Description: issue2.Description},
+	}
+	tracker.fieldMapper = &mockMapper{issueToBeads: func(ti *TrackerIssue) *IssueConversion {
+		conv := (&mockMapper{}).IssueToBeads(ti)
+		if ti.Identifier == "EXT-1" {
+			conv.Dependencies = []DependencyInfo{
+				{FromExternalID: "EXT-1", ToExternalID: "EXT-2", Type: string(types.DepBlocks)},
+			}
+		}
+		return conv
+	}}
+
+	engine := NewEngine(tracker, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync error: %v", err)
+	}
+	if result.PullStats.Updated != 0 || result.PullStats.Created != 0 {
+		t.Fatalf("PullStats = %+v, want only skipped unchanged issues", result.PullStats)
+	}
+
+	depRecords, err := store.GetDependencyRecords(ctx, issue1.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords error: %v", err)
+	}
+	if len(depRecords) != 1 || depRecords[0].DependsOnID != issue2.ID {
+		t.Fatalf("dependency records = %+v, want %s -> %s", depRecords, issue1.ID, issue2.ID)
+	}
+}
+
+func TestEnginePullDoesNotCreateDependenciesForLocallyModifiedSkippedIssue(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	lastSync := time.Now().UTC().Add(-1 * time.Hour)
+	if err := store.SetLocalMetadata(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetLocalMetadata error: %v", err)
+	}
+	child := &types.Issue{
+		ID:          "bd-local-child",
+		Title:       "Local child",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: strPtr("https://test.test/EXT-1"),
+		CreatedAt:   lastSync.Add(-2 * time.Hour),
+		UpdatedAt:   lastSync.Add(30 * time.Minute),
+	}
+	parent := &types.Issue{
+		ID:          "bd-local-parent",
+		Title:       "Parent",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: strPtr("https://test.test/EXT-2"),
+		CreatedAt:   lastSync.Add(-2 * time.Hour),
+		UpdatedAt:   lastSync.Add(-30 * time.Minute),
+	}
+	for _, issue := range []*types.Issue{child, parent} {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{Identifier: "EXT-1", Title: "Remote child", UpdatedAt: lastSync.Add(10 * time.Minute)},
+		{Identifier: "EXT-2", Title: "Parent", UpdatedAt: lastSync.Add(10 * time.Minute)},
+	}
+	tracker.fieldMapper = &mockMapper{issueToBeads: func(ti *TrackerIssue) *IssueConversion {
+		conv := (&mockMapper{}).IssueToBeads(ti)
+		if ti.Identifier == "EXT-1" {
+			conv.Dependencies = []DependencyInfo{
+				{FromExternalID: "EXT-1", ToExternalID: "EXT-2", Type: string(types.DepBlocks)},
+			}
+		}
+		return conv
+	}}
+
+	engine := NewEngine(tracker, store, "test-actor")
+	if _, err := engine.Sync(ctx, SyncOptions{Pull: true}); err != nil {
+		t.Fatalf("Sync error: %v", err)
+	}
+
+	depRecords, err := store.GetDependencyRecords(ctx, child.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords error: %v", err)
+	}
+	if len(depRecords) != 0 {
+		t.Fatalf("dependency records = %+v, want none for locally modified skipped issue", depRecords)
+	}
+}
+
+func TestEnginePullDryRunPreviewsDependencies(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issue1 := &types.Issue{ID: "bd-dry-child", Title: "Child", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2}
+	issue2 := &types.Issue{ID: "bd-dry-blocker", Title: "Blocker", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2}
+	for _, issue := range []*types.Issue{issue1, issue2} {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+		ref := "https://test.test/EXT-2"
+		if issue.ID == "bd-dry-child" {
+			ref = "https://test.test/EXT-1"
+		}
+		if err := store.UpdateIssue(ctx, issue.ID, map[string]interface{}{"external_ref": ref}, "test-actor"); err != nil {
+			t.Fatalf("UpdateIssue external_ref: %v", err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{Identifier: "EXT-1", Title: issue1.Title},
+		{Identifier: "EXT-2", Title: issue2.Title},
+	}
+	tracker.fieldMapper = &mockMapper{issueToBeads: func(ti *TrackerIssue) *IssueConversion {
+		conv := (&mockMapper{}).IssueToBeads(ti)
+		if ti.Identifier == "EXT-1" {
+			conv.Dependencies = []DependencyInfo{
+				{FromExternalID: "EXT-1", ToExternalID: "EXT-2", Type: string(types.DepBlocks)},
+			}
+		}
+		return conv
+	}}
+
+	var messages []string
+	engine := NewEngine(tracker, store, "test-actor")
+	engine.OnMessage = func(msg string) { messages = append(messages, msg) }
+	if _, err := engine.Sync(ctx, SyncOptions{Pull: true, DryRun: true}); err != nil {
+		t.Fatalf("Sync error: %v", err)
+	}
+
+	depRecords, err := store.GetDependencyRecords(ctx, issue1.ID)
+	if err != nil {
+		t.Fatalf("GetDependencyRecords error: %v", err)
+	}
+	if len(depRecords) != 0 {
+		t.Fatalf("dependency records = %+v, want none in dry-run", depRecords)
+	}
+	found := false
+	for _, msg := range messages {
+		if strings.Contains(msg, "Would create 1 dependencies") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("dry-run messages = %v, want dependency summary", messages)
+	}
+}
+
+func TestEnginePullFiltersDependencyTypes(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issues := []*types.Issue{
+		{ID: "bd-filter-child", Title: "Child", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-filter-parent", Title: "Parent", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-filter-blocker", Title: "Blocker", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+	}
+	for i, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+		ref := fmt.Sprintf("https://test.test/EXT-%d", i+1)
+		if err := store.UpdateIssue(ctx, issue.ID, map[string]interface{}{"external_ref": ref}, "test-actor"); err != nil {
+			t.Fatalf("UpdateIssue external_ref: %v", err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{Identifier: "EXT-1", Title: "Child"},
+		{Identifier: "EXT-2", Title: "Parent"},
+		{Identifier: "EXT-3", Title: "Blocker"},
+	}
+	tracker.fieldMapper = &mockMapper{issueToBeads: func(ti *TrackerIssue) *IssueConversion {
+		conv := (&mockMapper{}).IssueToBeads(ti)
+		if ti.Identifier == "EXT-1" {
+			conv.Dependencies = []DependencyInfo{
+				{FromExternalID: "EXT-1", ToExternalID: "EXT-2", Type: string(types.DepParentChild)},
+				{FromExternalID: "EXT-1", ToExternalID: "EXT-3", Type: string(types.DepBlocks)},
+			}
+		}
+		return conv
+	}}
+
+	engine := NewEngine(tracker, store, "test-actor")
+	if _, err := engine.Sync(ctx, SyncOptions{
+		Pull:            true,
+		DependencyTypes: []types.DependencyType{types.DepParentChild},
+	}); err != nil {
+		t.Fatalf("Sync error: %v", err)
+	}
+
+	depRecords, err := store.GetDependencyRecords(ctx, "bd-filter-child")
+	if err != nil {
+		t.Fatalf("GetDependencyRecords error: %v", err)
+	}
+	if len(depRecords) != 1 {
+		t.Fatalf("expected 1 dependency record, got %d: %+v", len(depRecords), depRecords)
+	}
+	if depRecords[0].DependsOnID != "bd-filter-parent" || depRecords[0].Type != types.DepParentChild {
+		t.Fatalf("dependency = %s -> %s (%s), want bd-filter-child -> bd-filter-parent (%s)",
+			depRecords[0].IssueID, depRecords[0].DependsOnID, depRecords[0].Type, types.DepParentChild)
+	}
+}
+
+func TestEnginePullFiltersLinearRelationsBySource(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issues := []*types.Issue{
+		{ID: "bd-source-child", Title: "Child", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-source-parent", Title: "Parent", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-source-related-parent", Title: "Related parent", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+	}
+	for i, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+		ref := fmt.Sprintf("https://test.test/EXT-SRC-%d", i+1)
+		if err := store.UpdateIssue(ctx, issue.ID, map[string]interface{}{"external_ref": ref}, "test-actor"); err != nil {
+			t.Fatalf("UpdateIssue external_ref: %v", err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{Identifier: "EXT-SRC-1", Title: "Child"},
+		{Identifier: "EXT-SRC-2", Title: "Parent"},
+		{Identifier: "EXT-SRC-3", Title: "Related parent"},
+	}
+	tracker.fieldMapper = &mockMapper{issueToBeads: func(ti *TrackerIssue) *IssueConversion {
+		conv := (&mockMapper{}).IssueToBeads(ti)
+		if ti.Identifier == "EXT-SRC-1" {
+			conv.Dependencies = []DependencyInfo{
+				{
+					FromExternalID: "EXT-SRC-1",
+					ToExternalID:   "EXT-SRC-2",
+					Type:           string(types.DepParentChild),
+					Source:         DependencySourceParent,
+				},
+				{
+					FromExternalID: "EXT-SRC-1",
+					ToExternalID:   "EXT-SRC-3",
+					Type:           string(types.DepParentChild),
+					Source:         DependencySourceRelation,
+				},
+			}
+		}
+		return conv
+	}}
+
+	engine := NewEngine(tracker, store, "test-actor")
+	if _, err := engine.Sync(ctx, SyncOptions{
+		Pull:              true,
+		DependencySources: []DependencySource{DependencySourceParent},
+	}); err != nil {
+		t.Fatalf("Sync error: %v", err)
+	}
+
+	depRecords, err := store.GetDependencyRecords(ctx, "bd-source-child")
+	if err != nil {
+		t.Fatalf("GetDependencyRecords error: %v", err)
+	}
+	if len(depRecords) != 1 {
+		t.Fatalf("expected 1 dependency record, got %d: %+v", len(depRecords), depRecords)
+	}
+	if depRecords[0].DependsOnID != "bd-source-parent" || depRecords[0].Type != types.DepParentChild {
+		t.Fatalf("dependency = %s -> %s (%s), want bd-source-child -> bd-source-parent (%s)",
+			depRecords[0].IssueID, depRecords[0].DependsOnID, depRecords[0].Type, types.DepParentChild)
+	}
+}
+
+func TestEnginePreviewDependenciesDedupesPendingRelations(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issues := []*types.Issue{
+		{ID: "bd-preview-source", Title: "Source", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-preview-target", Title: "Target", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+	}
+	for i, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue error: %v", err)
+		}
+		ref := fmt.Sprintf("https://test.test/EXT-PREVIEW-%d", i+1)
+		if err := store.UpdateIssue(ctx, issue.ID, map[string]interface{}{"external_ref": ref}, "test-actor"); err != nil {
+			t.Fatalf("UpdateIssue external_ref: %v", err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	var messages []string
+	engine := NewEngine(tracker, store, "test-actor")
+	engine.OnMessage = func(msg string) { messages = append(messages, msg) }
+
+	errCount := engine.previewDependencies(ctx, []DependencyInfo{
+		{
+			FromExternalID: "EXT-PREVIEW-1",
+			ToExternalID:   "EXT-PREVIEW-2",
+			Type:           string(types.DepRelated),
+			Source:         DependencySourceRelation,
+		},
+		{
+			FromExternalID: "EXT-PREVIEW-1",
+			ToExternalID:   "EXT-PREVIEW-2",
+			Type:           string(types.DepRelated),
+			Source:         DependencySourceParent,
+		},
+	}, nil)
+	if errCount != 0 {
+		t.Fatalf("previewDependencies errCount = %d, want 0", errCount)
+	}
+
+	dependencyLines := 0
+	summaryFound := false
+	for _, msg := range messages {
+		if strings.Contains(msg, "Would create dependency:") {
+			dependencyLines++
+		}
+		if strings.Contains(msg, "Would create 1 dependencies") {
+			summaryFound = true
+		}
+	}
+	if dependencyLines != 1 || !summaryFound {
+		t.Fatalf("dry-run messages = %v, want one dependency preview and a one-dependency summary", messages)
+	}
+}
+
+func TestEnginePullHydratesNewPrelinkedExternalRefAfterLastSync(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	lastSync := time.Now().UTC().Add(-2 * time.Hour)
+	if err := store.SetLocalMetadata(ctx, "linear.last_sync", lastSync.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetLocalMetadata error: %v", err)
+	}
+	localRef := "https://linear.app/team/issue/TEAM-123/stub"
+	local := &types.Issue{
+		ID:          "bd-prelinked-after-sync",
+		Title:       "Local stub",
+		Description: "stub",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: strPtr(localRef),
+		CreatedAt:   lastSync.Add(30 * time.Minute),
+		UpdatedAt:   lastSync.Add(30 * time.Minute),
+	}
+	if err := store.CreateIssue(ctx, local, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue error: %v", err)
+	}
+
+	base := newMockTracker("linear")
+	base.issues = []TrackerIssue{{
+		ID:          "linear-internal-123",
+		Identifier:  "TEAM-123",
+		URL:         "https://linear.app/team/issue/TEAM-123/remote-title",
+		Title:       "Remote title",
+		Description: "Remote description",
+		Priority:    1,
+		UpdatedAt:   lastSync.Add(-30 * time.Minute),
+	}}
+	base.fetchIssues = func(_ context.Context, opts FetchOptions) ([]TrackerIssue, error) {
+		if opts.Since == nil {
+			return base.issues, nil
+		}
+		return nil, nil
+	}
+	lt := &mockExternalRefTracker{
+		mockTracker: base,
+		buildRef: func(issue *TrackerIssue) string {
+			return "https://linear.app/team/issue/" + issue.Identifier
+		},
+		extract: func(ref string) string {
+			parts := strings.Split(ref, "/issue/")
+			if len(parts) != 2 {
+				return ""
+			}
+			return strings.Split(parts[1], "/")[0]
+		},
+		isRef: func(ref string) bool {
+			return strings.Contains(ref, "linear.app/") && strings.Contains(ref, "/issue/")
+		},
+	}
+
+	engine := NewEngine(lt, store, "test-actor")
+	engine.PushHooks = &PushHooks{ContentEqual: func(local *types.Issue, remote *TrackerIssue) bool {
+		return local.Title == remote.Title && local.Description == remote.Description
+	}}
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true, Push: true})
+	if err != nil {
+		t.Fatalf("Sync error: %v", err)
+	}
+	if result.PullStats.Updated != 1 {
+		t.Fatalf("PullStats = %+v, want one hydrated update", result.PullStats)
+	}
+	if len(base.updated) != 0 {
+		t.Fatalf("pushed updates = %+v, want none after hydration", base.updated)
+	}
+	got, err := store.GetIssue(ctx, local.ID)
+	if err != nil {
+		t.Fatalf("GetIssue error: %v", err)
+	}
+	if got.Title != "Remote title" || got.Description != "Remote description" {
+		t.Fatalf("hydrated issue = %q/%q, want remote content", got.Title, got.Description)
+	}
+	if got.ExternalRef == nil || *got.ExternalRef != "https://linear.app/team/issue/TEAM-123" {
+		t.Fatalf("external_ref = %#v, want canonical prelinked ref", got.ExternalRef)
+	}
+}
+
+func TestEnginePullHydratesOlderIssueWhenExternalRefAddedAfterLastSync(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	local := &types.Issue{
+		ID:          "bd-prelinked-existing",
+		Title:       "Local stub",
+		Description: "stub",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		CreatedAt:   time.Now().UTC().Add(-4 * time.Hour),
+		UpdatedAt:   time.Now().UTC().Add(-4 * time.Hour),
+	}
+	if err := store.CreateIssue(ctx, local, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue error: %v", err)
+	}
+
+	lastSync := time.Now().UTC()
+	if err := store.SetLocalMetadata(ctx, "linear.last_sync", lastSync.Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("SetLocalMetadata error: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	localRef := "https://linear.app/team/issue/TEAM-456/stub"
+	if err := store.UpdateIssue(ctx, local.ID, map[string]interface{}{"external_ref": localRef}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue external_ref error: %v", err)
+	}
+
+	base := newMockTracker("linear")
+	base.issues = []TrackerIssue{{
+		ID:          "linear-internal-456",
+		Identifier:  "TEAM-456",
+		URL:         "https://linear.app/team/issue/TEAM-456/remote-title",
+		Title:       "Remote title",
+		Description: "Remote description",
+		Priority:    1,
+		UpdatedAt:   lastSync.Add(-30 * time.Minute),
+	}}
+	base.fetchIssues = func(_ context.Context, opts FetchOptions) ([]TrackerIssue, error) {
+		if opts.Since == nil {
+			return base.issues, nil
+		}
+		return nil, nil
+	}
+	lt := &mockExternalRefTracker{
+		mockTracker: base,
+		buildRef: func(issue *TrackerIssue) string {
+			return "https://linear.app/team/issue/" + issue.Identifier
+		},
+		extract: func(ref string) string {
+			parts := strings.Split(ref, "/issue/")
+			if len(parts) != 2 {
+				return ""
+			}
+			return strings.Split(parts[1], "/")[0]
+		},
+		isRef: func(ref string) bool {
+			return strings.Contains(ref, "linear.app/") && strings.Contains(ref, "/issue/")
+		},
+	}
+
+	engine := NewEngine(lt, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync error: %v", err)
+	}
+	if result.PullStats.Updated != 1 {
+		t.Fatalf("PullStats = %+v, want one hydrated update", result.PullStats)
+	}
+	got, err := store.GetIssue(ctx, local.ID)
+	if err != nil {
+		t.Fatalf("GetIssue error: %v", err)
+	}
+	if got.Title != "Remote title" || got.Description != "Remote description" {
+		t.Fatalf("hydrated issue = %q/%q, want remote content", got.Title, got.Description)
+	}
+	if got.ExternalRef == nil || *got.ExternalRef != "https://linear.app/team/issue/TEAM-456" {
+		t.Fatalf("external_ref = %#v, want canonical prelinked ref", got.ExternalRef)
+	}
+}
+
+func TestEngineSyncPrelinkedHydrationFailureStopsPushAndLastSync(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	local := &types.Issue{
+		ID:          "bd-prelinked-failure",
+		Title:       "Local stub",
+		Description: "stub",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		CreatedAt:   time.Now().UTC().Add(-4 * time.Hour),
+		UpdatedAt:   time.Now().UTC().Add(-4 * time.Hour),
+	}
+	if err := store.CreateIssue(ctx, local, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue error: %v", err)
+	}
+
+	lastSync := time.Now().UTC()
+	lastSyncStr := lastSync.Format(time.RFC3339Nano)
+	if err := store.SetLocalMetadata(ctx, "linear.last_sync", lastSyncStr); err != nil {
+		t.Fatalf("SetLocalMetadata error: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	localRef := "https://linear.app/team/issue/TEAM-789/stub"
+	if err := store.UpdateIssue(ctx, local.ID, map[string]interface{}{"external_ref": localRef}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue external_ref error: %v", err)
+	}
+
+	base := newMockTracker("linear")
+	base.fetchIssueErr = fmt.Errorf("linear fetch failed")
+	base.fetchIssues = func(_ context.Context, opts FetchOptions) ([]TrackerIssue, error) {
+		if opts.Since == nil {
+			return base.issues, nil
+		}
+		return nil, nil
+	}
+	lt := &mockExternalRefTracker{
+		mockTracker: base,
+		buildRef: func(issue *TrackerIssue) string {
+			return "https://linear.app/team/issue/" + issue.Identifier
+		},
+		extract: func(ref string) string {
+			parts := strings.Split(ref, "/issue/")
+			if len(parts) != 2 {
+				return ""
+			}
+			return strings.Split(parts[1], "/")[0]
+		},
+		isRef: func(ref string) bool {
+			return strings.Contains(ref, "linear.app/") && strings.Contains(ref, "/issue/")
+		},
+	}
+
+	engine := NewEngine(lt, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true, Push: true})
+	if err == nil {
+		t.Fatalf("Sync error = nil, want hydration failure")
+	}
+	if result == nil || result.Success {
+		t.Fatalf("result = %+v, want unsuccessful result", result)
+	}
+	if !strings.Contains(err.Error(), "hydrating pre-linked linear issues") {
+		t.Fatalf("Sync error = %v, want hydration context", err)
+	}
+	if len(base.created) != 0 || len(base.updated) != 0 {
+		t.Fatalf("push ran after hydration failure: created=%d updated=%d", len(base.created), len(base.updated))
+	}
+	gotLastSync, err := store.GetLocalMetadata(ctx, "linear.last_sync")
+	if err != nil {
+		t.Fatalf("GetLocalMetadata error: %v", err)
+	}
+	if gotLastSync != lastSyncStr {
+		t.Fatalf("last_sync = %q, want unchanged %q", gotLastSync, lastSyncStr)
 	}
 }
 

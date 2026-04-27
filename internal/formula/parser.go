@@ -388,6 +388,12 @@ func ExtractVariables(formula *Formula) []string {
 		extract(step.Description)
 		extract(step.Assignee)
 		extract(step.Condition)
+		if step.Gate != nil {
+			extract(step.Gate.Type)
+			extract(step.Gate.ID)
+			extract(step.Gate.AwaitID)
+			extract(step.Gate.Timeout)
+		}
 		for _, child := range step.Children {
 			extractFromStep(child)
 		}

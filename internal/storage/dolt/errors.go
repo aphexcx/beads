@@ -28,6 +28,12 @@ var (
 
 	// ErrExec indicates a database exec (INSERT/UPDATE/DELETE) failure.
 	ErrExec = errors.New("exec error")
+
+	// ErrDanglingReference indicates that the pre-push integrity check detected
+	// missing chunks in the local Dolt noms store. The push was aborted to
+	// prevent propagating the corruption to the remote. Run bd dolt verify
+	// to diagnose and recover.
+	ErrDanglingReference = errors.New("dangling chunk reference")
 )
 
 // isTableNotExistError returns true if the error indicates a MySQL/Dolt
@@ -37,6 +43,15 @@ var (
 func isTableNotExistError(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1146
+}
+
+// isBranchTrackingError returns true if the error indicates that DOLT_PULL
+// failed because upstream branch tracking is not configured. This happens
+// when a remote was added via DOLT_REMOTE('add') or bd dolt remote add
+// rather than via dolt clone / bd bootstrap, leaving repo_state.json with
+// an empty "branches" map (GH#3144).
+func isBranchTrackingError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "did not specify a branch")
 }
 
 // isSerializationError returns true if the error is a Dolt/MySQL serialization

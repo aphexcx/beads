@@ -22,6 +22,11 @@ type pushState struct {
 	LastCommit string `json:"last_commit"` // Dolt commit hash
 }
 
+type autoPushTarget interface {
+	GetCurrentCommit(ctx context.Context) (string, error)
+	Push(ctx context.Context) error
+}
+
 func pushStatePath() (string, error) {
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
@@ -61,38 +66,38 @@ func savePushState(ps *pushState) error {
 	return atomicWriteFile(path, data)
 }
 
-// Default timeouts for auto-push operations. The push timeout bounds
-// the st.Push() call that shells out to git fetch, which blocks
-// indefinitely when the remote is unreachable (GH#3370).
-const (
-	autoPushTimeout       = 30 * time.Second
-	autoPushRemoteTimeout = 5 * time.Second
-)
+// autoPushTimeout bounds the st.Push() call that shells out to git fetch,
+// which blocks indefinitely when the remote is unreachable (GH#3370).
+const autoPushTimeout = 30 * time.Second
 
 // isDoltAutoPushEnabled returns whether auto-push to Dolt remote should run.
-// If user explicitly configured dolt.auto-push, use that.
-// Otherwise, auto-enable when a Dolt remote named "origin" exists.
-func isDoltAutoPushEnabled(ctx context.Context) bool {
-	if config.GetValueSource("dolt.auto-push") != config.SourceDefault {
-		return config.GetBool("dolt.auto-push")
+// Returns true only when explicitly opted in via dolt.auto-push=true in
+// .beads/config.yaml (or BD_DOLT_AUTO_PUSH=true env var).
+//
+// Previously the default was to auto-enable when an "origin" remote exists.
+// That is unsafe at any concurrency above one writer: git+ssh remotes have no
+// chunk-level upload atomicity, so concurrent dolt pushes race on the remote
+// manifest and can leave it referencing chunks that were never uploaded. Any
+// subsequent fetch/clone/push propagates the dangling reference. Set
+// dolt.auto-push=true to restore the old behavior on single-writer setups.
+func isDoltAutoPushEnabled(_ context.Context) bool {
+	return config.GetBool("dolt.auto-push")
+}
+
+// pushWithContext is a caller-side guard. Push implementations should honor
+// ctx directly, but this keeps auto-push from blocking forever if one does not.
+func pushWithContext(ctx context.Context, target autoPushTarget) error {
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- target.Push(ctx)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	// Auto-enable when a Dolt remote exists
-	st := getStore()
-	if st == nil {
-		return false
-	}
-	if lm, ok := storage.UnwrapStore(st).(storage.LifecycleManager); ok && lm.IsClosed() {
-		return false
-	}
-	// Bound the remote check so a hung network doesn't block the CLI (GH#3370).
-	remoteCtx, cancel := context.WithTimeout(ctx, autoPushRemoteTimeout)
-	defer cancel()
-	has, err := st.HasRemote(remoteCtx, "origin")
-	if err != nil {
-		debug.Logf("dolt auto-push: failed to check remote: %v\n", err)
-		return false
-	}
-	return has
 }
 
 // maybeAutoPush pushes to the Dolt remote if enabled and the debounce interval has passed.
@@ -159,7 +164,7 @@ func maybeAutoPush(ctx context.Context) {
 	defer pushCancel()
 
 	debug.Logf("dolt auto-push: pushing to origin (timeout %s)...\n", pushTimeout)
-	if err := st.Push(pushCtx); err != nil {
+	if err := pushWithContext(pushCtx, st); err != nil {
 		if !isQuiet() && !jsonOutput {
 			if pushCtx.Err() == context.DeadlineExceeded {
 				fmt.Fprintf(os.Stderr, "Warning: dolt auto-push timed out after %s (remote may be unreachable)\n", pushTimeout)

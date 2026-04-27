@@ -432,11 +432,19 @@ func TestExtractVariables(t *testing.T) {
 		Steps: []*Step{
 			{ID: "s1", Title: "Deploy {{project}} to {{env}}"},
 			{ID: "s2", Title: "Notify {{owner}}"},
+			{ID: "s3", Gate: &Gate{Type: "gh:{{gate_kind}}", AwaitID: "{{pr_url}}", Timeout: "{{gate_timeout}}"}},
 		},
 	}
 
 	vars := ExtractVariables(formula)
-	want := map[string]bool{"project": true, "env": true, "owner": true}
+	want := map[string]bool{
+		"project":      true,
+		"env":          true,
+		"owner":        true,
+		"gate_kind":    true,
+		"pr_url":       true,
+		"gate_timeout": true,
+	}
 
 	if len(vars) != len(want) {
 		t.Errorf("ExtractVariables found %d vars, want %d", len(vars), len(want))
@@ -1262,6 +1270,7 @@ func TestParse_GateField(t *testing.T) {
       "gate": {
         "type": "gh:run",
         "id": "ci-tests",
+        "await_id": "12345",
         "timeout": "1h"
       }
     },
@@ -1290,6 +1299,9 @@ func TestParse_GateField(t *testing.T) {
 	if gate.ID != "ci-tests" {
 		t.Errorf("Gate.ID = %q, want 'ci-tests'", gate.ID)
 	}
+	if gate.AwaitID != "12345" {
+		t.Errorf("Gate.AwaitID = %q, want '12345'", gate.AwaitID)
+	}
 	if gate.Timeout != "1h" {
 		t.Errorf("Gate.Timeout = %q, want '1h'", gate.Timeout)
 	}
@@ -1306,6 +1318,7 @@ id = "wait-for-approval"
 title = "Wait for human approval"
 [steps.gate]
 type = "human"
+await_id = "approval-ticket"
 timeout = "24h"
 
 [[steps]]
@@ -1331,6 +1344,9 @@ depends_on = ["wait-for-approval"]
 	}
 	if gate.Type != "human" {
 		t.Errorf("Gate.Type = %q, want 'human'", gate.Type)
+	}
+	if gate.AwaitID != "approval-ticket" {
+		t.Errorf("Gate.AwaitID = %q, want 'approval-ticket'", gate.AwaitID)
 	}
 	if gate.Timeout != "24h" {
 		t.Errorf("Gate.Timeout = %q, want '24h'", gate.Timeout)

@@ -74,17 +74,32 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		skipHooks, _ := cmd.Flags().GetBool("skip-hooks")
 		skipAgents, _ := cmd.Flags().GetBool("skip-agents")
 		force, _ := cmd.Flags().GetBool("force")
+		reinitLocal, _ := cmd.Flags().GetBool("reinit-local")
+		discardRemote, _ := cmd.Flags().GetBool("discard-remote")
 		nonInteractiveFlag, _ := cmd.Flags().GetBool("non-interactive")
 		roleFlag, _ := cmd.Flags().GetString("role")
 		fromJSONL, _ := cmd.Flags().GetBool("from-jsonl")
+		initRemote, _ := cmd.Flags().GetString("remote")
+		initRemoteChanged := cmd.Flags().Changed("remote")
 		// Dolt server connection flags
 		backendFlag, _ := cmd.Flags().GetString("backend")
 		initServerMode, _ := cmd.Flags().GetBool("server")
 		serverHost, _ := cmd.Flags().GetString("server-host")
 		serverPort, _ := cmd.Flags().GetInt("server-port")
+		serverSocket, _ := cmd.Flags().GetString("server-socket")
 		serverUser, _ := cmd.Flags().GetString("server-user")
 		database, _ := cmd.Flags().GetString("database")
 		destroyToken, _ := cmd.Flags().GetString("destroy-token")
+
+		// --force is a deprecated alias for --reinit-local. They share
+		// semantics for the local data-safety guard; both refuse remote
+		// divergence unless --discard-remote is also passed. See
+		// docs/adr/0002-init-safety-invariants.md.
+		if force && !reinitLocal {
+			fmt.Fprintf(os.Stderr, "%s --force is deprecated; use --reinit-local instead.\n", ui.RenderWarn("DeprecationWarning:"))
+			fmt.Fprintf(os.Stderr, "  See 'bd help init-safety' for the init flag surface.\n\n")
+			reinitLocal = true
+		}
 		sharedServer, _ := cmd.Flags().GetBool("shared-server")
 		externalServer, _ := cmd.Flags().GetBool("external")
 
@@ -178,19 +193,22 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Non-fatal - continue with defaults
 		}
 
-		// Safety guard: check for existing beads data
-		// This prevents accidental re-initialization
-		if !force {
+		// Safety guard: check for existing beads data.
+		// This prevents accidental re-initialization. --force and
+		// --reinit-local both bypass this local-only guard; they do NOT
+		// authorize cross-boundary operations on remote history (see
+		// CheckRemoteSafety at cmd/bd/init_safety.go and
+		// docs/adr/0002-init-safety-invariants.md).
+		if !reinitLocal {
 			if err := checkExistingBeadsData(prefix); err != nil {
 				FatalError("%v", err)
 			}
 		}
 
-		// Even with --force, warn about existing data and require confirmation.
-		// In non-interactive mode, accepts --destroy-token for explicit opt-in,
-		// or --quiet for legacy (deprecated) bypass.
-		// This prevents AI agents and users from accidentally destroying data.
-		if force {
+		// Even with --reinit-local, warn about existing data and require
+		// confirmation. Non-interactive mode accepts --destroy-token for
+		// explicit opt-in; interactive mode prompts for typed confirmation.
+		if reinitLocal {
 			if count, err := countExistingIssues(prefix); err == nil && count > 0 {
 				fmt.Fprintf(os.Stderr, "\n%s Re-initializing will destroy the existing database.\n\n", ui.RenderWarn("WARNING:"))
 				fmt.Fprintf(os.Stderr, "  Existing issues: %d\n\n", count)
@@ -206,18 +224,24 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					expected := fmt.Sprintf("destroy %d issues", count)
 					if strings.TrimSpace(scanner.Text()) != expected {
 						fmt.Fprintf(os.Stderr, "\nAborted. Database was NOT modified.\n")
-						os.Exit(1)
+						os.Exit(ExitLocalExistsRefused)
 					}
 				} else {
 					// Non-interactive (piped input, AI agent, etc.)
-					expectedToken := fmt.Sprintf("DESTROY-%s", prefix)
+					//
+					// ADR invariant (docs/adr/0002-init-safety-invariants.md):
+					// runtime error text must not echo a complete destructive
+					// invocation. See 'bd help init-safety' for the token
+					// format. This closes the 58f5989bf failure class where
+					// an agent copy-pasted the suggested command.
+					expectedToken := FormatDestroyToken(prefix)
 					if destroyToken == expectedToken {
 						fmt.Fprintf(os.Stderr, "Destroy token accepted. Proceeding with re-initialization.\n")
 					} else {
 						fmt.Fprintf(os.Stderr, "Refusing to destroy %d issues in non-interactive mode.\n", count)
-						fmt.Fprintf(os.Stderr, "To proceed, use: bd init --force --destroy-token=%s\n", expectedToken)
-						fmt.Fprintf(os.Stderr, "Or export first: bd export > backup.jsonl\n")
-						os.Exit(1)
+						fmt.Fprintf(os.Stderr, "  See 'bd help init-safety' for the required --destroy-token format.\n")
+						fmt.Fprintf(os.Stderr, "  Or export first: bd export > backup.jsonl\n")
+						os.Exit(ExitDestroyTokenMissing)
 					}
 				}
 			}
@@ -272,6 +296,46 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// MySQL identifiers must start with a letter or underscore.
 		if len(prefix) > 0 && !((prefix[0] >= 'a' && prefix[0] <= 'z') || (prefix[0] >= 'A' && prefix[0] <= 'Z') || prefix[0] == '_') {
 			prefix = "bd_" + prefix
+		}
+
+		// Cross-boundary safety (bd-q83 / ADR 0002): check remote state
+		// BEFORE any filesystem side-effects so a refusal exits cleanly.
+		// We only refuse here; bootstrap decisions happen later once
+		// beadsDir is computed. See CheckRemoteSafety in init_safety.go.
+		{
+			var earlySyncURL string
+			earlyRemoteSource := initSyncRemoteNone
+			earlyRemoteHasDoltData := false
+			earlySyncURL, earlyRemoteSource = resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
+			if earlyRemoteSource == initSyncRemoteExplicit {
+				// An explicit --remote is intent to bootstrap or wire that URL,
+				// but it is not proof that the remote already contains Dolt
+				// history. Let the clone attempt below distinguish populated
+				// remotes from empty remotes so --reinit-local can still fall
+				// back to a fresh local init against a new remote.
+			} else if earlyRemoteSource == initSyncRemoteConfigured {
+				earlyRemoteHasDoltData = true // sync.remote configured = user intends bootstrap
+			} else if earlyRemoteSource == initSyncRemoteNone && isGitRepo() && !isBareGitRepo() {
+				if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
+					earlySyncURL = normalizeRemoteURL(originURL)
+					earlyRemoteHasDoltData = gitOriginHasDoltDataRef()
+				}
+			}
+			if earlySyncURL != "" {
+				earlyDecision := CheckRemoteSafety(RemoteSafetyInput{
+					Force:             force,
+					ReinitLocal:       reinitLocal,
+					DiscardRemote:     discardRemote,
+					DestroyToken:      destroyToken,
+					ExpectedToken:     FormatDestroyToken(prefix),
+					RemoteHasDoltData: earlyRemoteHasDoltData,
+					IsInteractive:     term.IsTerminal(int(os.Stdin.Fd())),
+				})
+				if earlyDecision.Action == ActionRefuseDivergence || earlyDecision.Action == ActionRequireDestroyToken {
+					fmt.Fprintf(os.Stderr, "\n%s\n\n", earlyDecision.UserMessage)
+					os.Exit(earlyDecision.ExitCode)
+				}
+			}
 		}
 
 		// Determine beadsDir first (used for all storage path calculations).
@@ -492,34 +556,104 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			}
 		}
 
-		// Auto-bootstrap from git remote if sync.git-remote is configured
-		// or origin has refs/dolt/data. This makes bd init and bd bootstrap
 		// Auto-bootstrap from remote if sync.remote (or deprecated
 		// sync.git-remote) is configured, or git origin has Dolt data
 		// (refs/dolt/data). This makes bd init and bd bootstrap
 		// interchangeable — both clone from the remote when one exists.
-		syncURL := resolveSyncRemote()
+		//
+		// Cross-boundary safety (bd-q83 / ADR 0002): when the caller
+		// passes --force or --reinit-local and the remote already has
+		// refs/dolt/data, we must refuse — the new local identity would
+		// orphan-push over the team's history on first write. The
+		// CheckRemoteSafety chokepoint encodes this invariant; any future
+		// flag that can interact with remote history must route through
+		// it rather than adding another `&& !someFlag` here.
+		syncResolutionURL, syncRemoteSource := resolveInitConfiguredSyncRemote(initRemote, initRemoteChanged, resolveSyncRemote)
+		syncURL := syncResolutionURL
+		syncURLFromConfig := syncURL != "" && syncRemoteSource != initSyncRemoteNone // true when URL came from explicit user config
 		bootstrappedFromRemote := false
 		syncFromRemote := false
+		remoteHasDoltData := false
+
 		if syncURL != "" {
-			syncURL = normalizeRemoteURL(syncURL)
+			// sync.remote was explicitly configured. Treat as bootstrap-
+			// from-remote intent; CheckRemoteSafety still enforces that
+			// --force/--reinit-local can't silently fight that intent.
+			// Trust the URL format as-is: normalizeRemoteURL would convert
+			// http:// to git+http:// and break Dolt remotesapi endpoints
+			// configured explicitly by the user (GH#3339).
 			syncFromRemote = true
-		} else if isGitRepo() && !isBareGitRepo() {
-			if originURL, err := gitRemoteGetURL("origin"); err == nil && originURL != "" {
+		} else if syncRemoteSource == initSyncRemoteNone && isGitRepo() && !isBareGitRepo() {
+			if originURL, err := gitOriginGetURL(); err == nil && originURL != "" {
 				syncURL = normalizeRemoteURL(originURL)
-				if !force && gitLsRemoteHasRef("origin", "refs/dolt/data") {
+				remoteHasDoltData = gitOriginHasDoltDataRef()
+
+				decision := CheckRemoteSafety(RemoteSafetyInput{
+					Force:             force,
+					ReinitLocal:       reinitLocal,
+					DiscardRemote:     discardRemote,
+					DestroyToken:      destroyToken,
+					ExpectedToken:     FormatDestroyToken(prefix),
+					RemoteHasDoltData: remoteHasDoltData,
+					IsInteractive:     term.IsTerminal(int(os.Stdin.Fd())),
+				})
+
+				switch decision.Action {
+				case ActionRefuseDivergence, ActionRequireDestroyToken:
+					fmt.Fprintf(os.Stderr, "\n%s\n\n", decision.UserMessage)
+					os.Exit(decision.ExitCode)
+				case ActionBootstrap:
 					syncFromRemote = true
+				case ActionProceedWithDivergence:
+					// Interactive destroy-token prompt (non-interactive
+					// path already validated by CheckRemoteSafety).
+					if decision.Reason == "authorized-divergence" && term.IsTerminal(int(os.Stdin.Fd())) && destroyToken == "" {
+						expected := FormatDestroyToken(prefix)
+						fmt.Fprintf(os.Stderr, "\n%s You are about to discard the remote's Dolt history.\n\n", ui.RenderWarn("WARNING:"))
+						fmt.Fprintf(os.Stderr, "  Remote: %s\n", syncURL)
+						fmt.Fprintf(os.Stderr, "  Type %q to confirm: ", expected)
+						scanner := bufio.NewScanner(os.Stdin)
+						scanner.Scan()
+						if strings.TrimSpace(scanner.Text()) != expected {
+							fmt.Fprintf(os.Stderr, "\nAborted. See 'bd help init-safety' for details.\n")
+							os.Exit(ExitDestroyTokenMissing)
+						}
+					}
+					// Race-safety: re-verify the remote state hasn't
+					// changed between our earlier gitOriginHasDoltDataRef and
+					// the user's confirmation. If another agent pushed
+					// during the prompt window, fail rather than silently
+					// overwriting their fresh work.
+					if gitOriginHasDoltDataRef() != remoteHasDoltData {
+						fmt.Fprintf(os.Stderr, "\nAborted: remote state changed during confirmation. Re-run to re-verify intent.\n")
+						os.Exit(ExitRemoteDivergenceRefused)
+					}
+					// Proceed without bootstrap; remote will be overwritten on next push.
+					// syncFromRemote stays false.
+				case ActionNoRemoteData:
+					// Fresh remote, no-op for bootstrap decision.
 				}
 			}
 		}
 		if syncFromRemote {
-			if err := cloneFromRemote(ctx, beadsDir, syncURL, dbName, nil); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-			bootstrappedFromRemote = true
-			if !quiet {
-				fmt.Printf("  %s Bootstrapped from remote: %s\n", ui.RenderPass("✓"), syncURL)
+			var err error
+			cloneCfg := initTimeCloneConfig(initServerMode, serverHost, serverPort, serverSocket, serverUser, dbName)
+			err = cloneFromRemoteWithMode(ctx, beadsDir, syncURL, dbName, cloneCfg, initRemoteCloneMode(initServerMode, externalServer))
+			if err != nil {
+				if isEmptyRemoteCloneError(err) {
+					if !quiet {
+						fmt.Printf("  %s Remote has no Dolt data yet; initialized a fresh local database\n", ui.RenderWarn("!"))
+					}
+					syncFromRemote = false
+				} else {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				bootstrappedFromRemote = true
+				if !quiet {
+					fmt.Printf("  %s Bootstrapped from remote: %s\n", ui.RenderPass("✓"), syncURL)
+				}
 			}
 		}
 
@@ -558,6 +692,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 		if serverPort != 0 {
 			doltCfg.ServerPort = serverPort
+		}
+		if serverSocket != "" {
+			doltCfg.ServerSocket = serverSocket
 		}
 		if serverUser != "" {
 			doltCfg.ServerUser = serverUser
@@ -632,10 +769,13 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		}
 
 		// Configure the remote in the Dolt store so bd dolt push/pull
-		// work immediately after bootstrap. Also add the remote when
-		// sync.remote is configured but bootstrap was skipped (DB already
-		// existed) — ensures the remote is always wired up.
-		if syncURL != "" {
+		// work immediately after bootstrap. Only register the remote when
+		// the URL came from explicit config (sync.remote) or the remote
+		// was confirmed to have Dolt data (refs/dolt/data). Auto-detected
+		// git origin URLs for plain source repos must NOT be registered —
+		// they cause every Dolt fetch to fail and leak tmp_pack_* files
+		// that can consume 100+ GB of disk space (GH#3354, GH#3356).
+		if shouldWireInitRemote(syncURL, syncFromRemote, syncURLFromConfig) {
 			hasRemote, _ := store.HasRemote(ctx, "origin")
 			if !hasRemote {
 				if err := store.AddRemote(ctx, "origin", syncURL); err != nil {
@@ -779,6 +919,9 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				if serverPort != 0 {
 					cfg.DoltServerPort = serverPort
 				}
+				if serverSocket != "" {
+					cfg.DoltServerSocket = serverSocket
+				}
 				if serverUser != "" {
 					cfg.DoltServerUser = serverUser
 				}
@@ -805,12 +948,11 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 			// Persist sync.remote to config.yaml so fresh clones can
 			// bootstrap from it (the Dolt database is gitignored).
 			// Must run AFTER createConfigYaml which creates the file.
-			if syncURL != "" {
-				if existing := config.GetYamlConfig("sync.remote"); existing == "" {
-					if err := config.SetYamlConfig("sync.remote", syncURL); err != nil {
-						FatalError("failed to persist sync.remote to config.yaml: %v", err)
-					}
-				}
+			// Only persist when the URL is from explicit config or a
+			// confirmed Dolt remote — not an auto-detected git origin
+			// for a plain source repo (GH#3356).
+			if err := persistInitSyncRemote(beadsDir, initRemote, syncURL, syncFromRemote, syncURLFromConfig); err != nil {
+				FatalError("failed to persist sync.remote to config.yaml: %v", err)
 			}
 
 			// Enable shared server mode if requested via flag OR env var (GH#2377).
@@ -1148,10 +1290,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					giCmd := exec.Command("git", "add", ".gitignore")
 					_ = giCmd.Run()
 				}
-				commitArgs := []string{"commit", "-m", "bd init: initialize beads issue tracking"}
-				if fromJSONL {
-					commitArgs = append(commitArgs, "--no-verify")
-				}
+				// Hooks installed by this init can call back into bd. Skip them
+				// for the bootstrap commit to avoid self-deadlocking while init
+				// still owns the embedded Dolt lock.
+				commitArgs := []string{"commit", "--no-verify", "-m", "bd init: initialize beads issue tracking"}
 				commitCmd := exec.Command("git", commitArgs...)
 				if commitOut, commitErr := commitCmd.CombinedOutput(); commitErr != nil {
 					if !quiet && !strings.Contains(string(commitOut), "nothing to commit") {
@@ -1263,12 +1405,15 @@ func init() {
 	initCmd.Flags().Bool("setup-exclude", false, "Configure .git/info/exclude to keep beads files local (for forks)")
 	initCmd.Flags().Bool("skip-hooks", false, "Skip git hooks installation")
 	initCmd.Flags().Bool("skip-agents", false, "Skip AGENTS.md and Claude settings generation")
-	initCmd.Flags().Bool("force", false, "Force re-initialization even if database already has issues (may cause data loss)")
+	initCmd.Flags().Bool("force", false, "Deprecated alias for --reinit-local. Bypasses only the LOCAL data-safety guard; does NOT authorize remote divergence (see 'bd help init-safety').")
+	initCmd.Flags().Bool("reinit-local", false, "Re-initialize local .beads/ over existing local data. Does NOT authorize remote divergence; see --discard-remote.")
+	initCmd.Flags().Bool("discard-remote", false, "Authorize discarding the configured remote's Dolt history when re-initializing. Requires --destroy-token in non-interactive mode; see 'bd help init-safety'.")
 	initCmd.Flags().Bool("from-jsonl", false, "Import issues from .beads/issues.jsonl instead of git history")
 	initCmd.Flags().String("destroy-token", "", "Explicit confirmation token for destructive re-init in non-interactive mode (format: 'DESTROY-<prefix>')")
 	initCmd.Flags().String("agents-template", "", "Path to custom AGENTS.md template (overrides embedded default)")
 	initCmd.Flags().String("agents-profile", "", "AGENTS.md profile: 'minimal' (default, pointer to bd prime) or 'full' (complete command reference)")
 	initCmd.Flags().String("agents-file", "", "Custom filename for agent instructions (default: AGENTS.md)")
+	initCmd.Flags().String("remote", "", "Dolt remote URL to clone from and persist as sync.remote")
 
 	// Non-interactive mode for CI/cloud agents
 	initCmd.Flags().Bool("non-interactive", false, "Skip all interactive prompts (auto-detected in CI or non-TTY environments)")
@@ -1281,6 +1426,7 @@ func init() {
 	initCmd.Flags().Bool("server", false, "Use external dolt sql-server instead of embedded engine")
 	initCmd.Flags().String("server-host", "", "Dolt server host (default: 127.0.0.1)")
 	initCmd.Flags().Int("server-port", 0, "Dolt server port (default: 3307)")
+	initCmd.Flags().String("server-socket", "", "Unix domain socket path (overrides host/port)")
 	initCmd.Flags().String("server-user", "", "Dolt server MySQL user (default: root)")
 	initCmd.Flags().String("database", "", "Use existing server database name (overrides prefix-based naming)")
 	initCmd.Flags().Bool("shared-server", false, "Enable shared Dolt server mode (all projects share one server at ~/.beads/shared-server/)")
@@ -1703,6 +1849,87 @@ func promptAutoExport() (bool, error) {
 
 	// Default to yes (empty or "y" or "yes")
 	return response == "" || response == "y" || response == "yes", nil
+}
+
+func shouldWireInitRemote(syncURL string, syncFromRemote, syncURLFromConfig bool) bool {
+	// Auto-detected plain git origins are not Dolt remotes. Only wire origin
+	// when it was explicitly configured or proven to carry refs/dolt/data.
+	return syncURL != "" && (syncFromRemote || syncURLFromConfig)
+}
+
+type initSyncRemoteSource int
+
+const (
+	initSyncRemoteNone initSyncRemoteSource = iota
+	initSyncRemoteExplicit
+	initSyncRemoteConfigured
+)
+
+func resolveInitConfiguredSyncRemote(initRemote string, initRemoteChanged bool, resolveConfiguredRemote func() string) (string, initSyncRemoteSource) {
+	if initRemoteChanged {
+		return initRemote, initSyncRemoteExplicit
+	}
+	if syncURL := resolveConfiguredRemote(); syncURL != "" {
+		return syncURL, initSyncRemoteConfigured
+	}
+	return "", initSyncRemoteNone
+}
+
+func initRemoteCloneMode(initServerMode, externalServer bool) remoteCloneMode {
+	if !initServerMode {
+		return remoteCloneEmbedded
+	}
+	if externalServer {
+		return remoteCloneExternalServer
+	}
+	return remoteCloneCLI
+}
+
+func initTimeCloneConfig(serverMode bool, serverHost string, serverPort int, serverSocket, serverUser, dbName string) *configfile.Config {
+	cfg := configfile.DefaultConfig()
+	cfg.Backend = configfile.BackendDolt
+	cfg.DoltDatabase = dbName
+	if serverMode {
+		cfg.DoltMode = configfile.DoltModeServer
+		cfg.DoltServerHost = configfile.DefaultDoltServerHost
+		cfg.DoltServerUser = configfile.DefaultDoltServerUser
+	} else {
+		cfg.DoltMode = configfile.DoltModeEmbedded
+	}
+	if serverHost != "" {
+		cfg.DoltServerHost = serverHost
+	}
+	if serverPort != 0 {
+		cfg.DoltServerPort = serverPort
+	}
+	if serverSocket != "" {
+		cfg.DoltServerSocket = serverSocket
+	}
+	if serverUser != "" {
+		cfg.DoltServerUser = serverUser
+	}
+	return cfg
+}
+
+func persistInitSyncRemote(beadsDir, initRemote, syncURL string, syncFromRemote, syncURLFromConfig bool) error {
+	if initRemote != "" {
+		return config.SetYamlConfigInDir(beadsDir, "sync.remote", initRemote)
+	}
+	if !shouldWireInitRemote(syncURL, syncFromRemote, syncURLFromConfig) {
+		return nil
+	}
+	if existing := config.GetStringFromDir(beadsDir, "sync.remote"); existing != "" {
+		return nil
+	}
+	return config.SetYamlConfigInDir(beadsDir, "sync.remote", syncURL)
+}
+
+func isEmptyRemoteCloneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "contains no dolt data")
 }
 
 // verifyMetadata writes a metadata field and verifies the write succeeded.

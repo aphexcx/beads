@@ -269,6 +269,27 @@ func TestEmbeddedList(t *testing.T) {
 		}
 	})
 
+	t.Run("exclude_label", func(t *testing.T) {
+		issues := bdListJSON(t, bd, dir, "--exclude-label", "urgent")
+		// openBug has labels: backend,urgent — should be excluded
+		if containsID(issues, seed.openBug) {
+			t.Error("openBug with 'urgent' label should be excluded by --exclude-label urgent")
+		}
+		// overdueTask also has label: urgent — should be excluded
+		if containsID(issues, seed.overdueTask) {
+			t.Error("overdueTask with 'urgent' label should be excluded by --exclude-label urgent")
+		}
+	})
+
+	t.Run("exclude_label_with_include", func(t *testing.T) {
+		// Include backend but exclude urgent — should get issues with backend but not urgent
+		issues := bdListJSON(t, bd, dir, "--label", "backend", "--exclude-label", "urgent")
+		// openBug has both backend and urgent — should be excluded
+		if containsID(issues, seed.openBug) {
+			t.Error("openBug with backend+urgent should be excluded when --exclude-label urgent")
+		}
+	})
+
 	// --- C. Status/special filtering ---
 	// Note: --ready, --pinned, --status closed/deferred/in_progress tests are
 	// skipped because bd update and bd close are not yet implemented on
@@ -284,6 +305,16 @@ func TestEmbeddedList(t *testing.T) {
 		// All seeded issues are open, so --ready should return most of them
 		if len(issues) == 0 {
 			t.Error("--ready should return open issues")
+		}
+	})
+
+	t.Run("ready_exclude_type", func(t *testing.T) {
+		issues := bdListJSON(t, bd, dir, "--ready", "--exclude-type", "epic", "--limit", "0")
+		if containsID(issues, seed.epic) {
+			t.Errorf("--ready --exclude-type epic should exclude epic %s, got %v", seed.epic, listIssueIDs(issues))
+		}
+		if !containsID(issues, seed.readyTask) {
+			t.Errorf("--ready --exclude-type epic should still include ready task %s, got %v", seed.readyTask, listIssueIDs(issues))
 		}
 	})
 
@@ -327,6 +358,36 @@ func TestEmbeddedList(t *testing.T) {
 		out := bdList(t, bd, dir, "--tree", "--parent", seed.epic)
 		if !strings.Contains(out, seed.epic) {
 			t.Errorf("tree output should contain parent ID %s", seed.epic)
+		}
+	})
+
+	t.Run("ready_parent_tree_excludes_blocked_descendants", func(t *testing.T) {
+		parent := bdCreate(t, bd, dir, "Ready parent tree", "--type", "epic")
+		readyChild := bdCreate(t, bd, dir, "Ready child in tree", "--type", "task", "--parent", parent.ID)
+		blockedChild := bdCreate(t, bd, dir, "Blocked child in tree", "--type", "task", "--parent", parent.ID)
+		blocker := bdCreate(t, bd, dir, "Tree child blocker", "--type", "task")
+		bdDepAdd(t, bd, dir, blockedChild.ID, blocker.ID)
+
+		out := bdList(t, bd, dir, "--ready", "--parent", parent.ID, "--no-pager")
+		if !strings.Contains(out, readyChild.ID) {
+			t.Errorf("ready child %s should appear in ready parent tree:\n%s", readyChild.ID, out)
+		}
+		if strings.Contains(out, blockedChild.ID) {
+			t.Errorf("blocked child %s should not appear in ready parent tree:\n%s", blockedChild.ID, out)
+		}
+	})
+
+	t.Run("ready_parent_filter_includes_grandchildren", func(t *testing.T) {
+		parent := bdCreate(t, bd, dir, "Ready parent recursive", "--type", "epic")
+		child := bdCreate(t, bd, dir, "Ready child recursive", "--type", "task", "--parent", parent.ID)
+		grandchild := bdCreate(t, bd, dir, "Ready grandchild recursive", "--type", "task", "--parent", child.ID)
+
+		issues := bdListJSON(t, bd, dir, "--ready", "--parent", parent.ID, "--limit", "0")
+		if !containsID(issues, child.ID) {
+			t.Errorf("ready parent filter should include direct child %s, got %v", child.ID, listIssueIDs(issues))
+		}
+		if !containsID(issues, grandchild.ID) {
+			t.Errorf("ready parent filter should include recursive grandchild %s, got %v", grandchild.ID, listIssueIDs(issues))
 		}
 	})
 
@@ -470,6 +531,9 @@ func TestEmbeddedList(t *testing.T) {
 		out := bdList(t, bd, dir, "--long", "--flat")
 		if !strings.Contains(out, "Found") {
 			t.Error("--long format should contain 'Found N issues'")
+		}
+		if !strings.Contains(out, "Description:") || !strings.Contains(out, "This is a bug") {
+			t.Errorf("--long format should include issue descriptions, got: %s", out)
 		}
 	})
 
