@@ -31,6 +31,11 @@ var (
 	latestVer  int
 )
 
+const schemaMigrationsBootstrapSQL = `CREATE TABLE IF NOT EXISTS schema_migrations (
+	version INT PRIMARY KEY,
+	applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+)`
+
 // LatestVersion returns the highest version number among the embedded .up.sql files.
 // Computed once and cached.
 func LatestVersion() int {
@@ -55,8 +60,9 @@ func LatestVersion() int {
 	return latestVer
 }
 
-// AllMigrationsSQL returns all .up.sql migration contents concatenated in order.
-// Used by integration tests that need to initialize a schema via dolt sql CLI.
+// AllMigrationsSQL returns the schema_migrations bootstrap plus all .up.sql
+// migration contents concatenated in order. Used by integration tests that need
+// to initialize a schema via dolt sql CLI.
 func AllMigrationsSQL() string {
 	entries, err := fs.ReadDir(upMigrations, "migrations")
 	if err != nil {
@@ -81,6 +87,8 @@ func AllMigrationsSQL() string {
 	sort.Slice(files, func(i, j int) bool { return files[i].version < files[j].version })
 
 	var b strings.Builder
+	b.WriteString(schemaMigrationsBootstrapSQL)
+	b.WriteString(";\n")
 	for _, f := range files {
 		data, err := upMigrations.ReadFile("migrations/" + f.name)
 		if err != nil {
@@ -108,10 +116,7 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// Bootstrap the tracking table.
 	// Bootstrap with applied_at so migration 0032 can unconditionally drop it.
 	// After 0032 runs, the table has only the version column.
-	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version INT PRIMARY KEY,
-		applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-	)`); err != nil {
+	if _, err := db.ExecContext(ctx, schemaMigrationsBootstrapSQL); err != nil {
 		return 0, fmt.Errorf("creating schema_migrations table: %w", err)
 	}
 
