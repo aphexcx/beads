@@ -2299,3 +2299,89 @@ func TestBuildPullIssueUpdatesClearsCloseReasonOnReopen(t *testing.T) {
 		t.Errorf("close_reason update = %q, want empty (reopen clears it)", got)
 	}
 }
+
+func TestEngineExcludeLabels(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	// Create three issues — one carrying the agent label, one normal,
+	// one carrying multiple labels including the excluded one.
+	cases := []struct {
+		id     string
+		labels []string
+	}{
+		{"bd-agent1", []string{"gt:agent"}},
+		{"bd-feature1", []string{"frontend"}},
+		{"bd-multi", []string{"frontend", "gt:agent"}},
+	}
+	for _, tc := range cases {
+		issue := &types.Issue{
+			ID:        tc.id,
+			Title:     "Issue " + tc.id,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeTask,
+			Priority:  2,
+			Labels:    tc.labels,
+		}
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue(%s) error: %v", tc.id, err)
+		}
+		if err := store.UpdateIssue(ctx, tc.id, map[string]interface{}{"labels": tc.labels}, "test-actor"); err != nil {
+			t.Fatalf("UpdateIssue(%s) labels error: %v", tc.id, err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+
+	result, err := engine.Sync(ctx, SyncOptions{
+		Push:          true,
+		ExcludeLabels: []string{"gt:agent"},
+	})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Errorf("Sync() not successful: %s", result.Error)
+	}
+	// Only bd-feature1 should make it through; bd-agent1 + bd-multi share gt:agent.
+	if len(tracker.created) != 1 {
+		t.Errorf("created %d issues (excluding gt:agent), want 1; tracker.created=%v", len(tracker.created), tracker.created)
+	}
+	for _, c := range tracker.created {
+		if c.ID != "bd-feature1" {
+			t.Errorf("unexpected issue created: %s (only bd-feature1 should pass the gt:agent filter)", c.ID)
+		}
+	}
+}
+
+func TestEngineExcludeLabelsEmpty(t *testing.T) {
+	// Empty ExcludeLabels (or no labels on issue) must not filter anything.
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	for _, id := range []string{"bd-a", "bd-b"} {
+		issue := &types.Issue{
+			ID: id, Title: "x", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2,
+		}
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue(%s) error: %v", id, err)
+		}
+	}
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+
+	// Empty ExcludeLabels — should NOT filter.
+	result, err := engine.Sync(ctx, SyncOptions{Push: true, ExcludeLabels: nil})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Errorf("Sync() not successful: %s", result.Error)
+	}
+	if len(tracker.created) != 2 {
+		t.Errorf("created %d issues with empty ExcludeLabels, want 2", len(tracker.created))
+	}
+}
