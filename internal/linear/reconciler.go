@@ -44,6 +44,76 @@ type LabelRename struct {
 	ID      string
 }
 
+type renameClass struct {
+	applied            []LabelRename
+	dropped            []LabelRename // OldName + ID only matter; NewName captured for diagnostics
+	consumedSnapshotID map[string]bool
+	consumedLinearID   map[string]bool
+	consumedBeadsName  map[string]bool
+}
+
+// classifyRenames is pass 2 of the reconciler. It detects Linear-side renames
+// (snapshot ID matches Linear ID, names differ) and decides which to apply
+// vs. which to drop based on whether the user has deleted the old name in beads.
+//
+// "Consume" means: the row should be removed from pass-3's input. The boolean
+// maps record what to skip.
+//
+// Case-insensitive `beadsSet` lookup: rename detection compares snapshot.Name
+// against beadsSet using case-folded keys. Without this, a casing mismatch
+// (snapshot has "Bug" from a prior Linear sync, bead has "bug") combined with
+// a Linear rename would falsely classify as DROPPED rename and emit
+// RemoveFromLinear — destroying the Linear label even though the user just
+// has a casing inconsistency. The truth table (pass 3) still matches by exact
+// name; case-insensitive matching for that broader case is deferred to v2.
+func classifyRenames(beads []string, linear []LinearLabel, snap []SnapshotEntry) renameClass {
+	r := renameClass{
+		consumedSnapshotID: map[string]bool{},
+		consumedLinearID:   map[string]bool{},
+		consumedBeadsName:  map[string]bool{},
+	}
+	// beadsSetExact preserves original case for consumption marking.
+	// beadsSetFold provides case-insensitive lookup for rename classification.
+	beadsSetExact := make(map[string]bool, len(beads))
+	beadsSetFold := make(map[string]string, len(beads)) // lower → original
+	for _, b := range beads {
+		beadsSetExact[b] = true
+		beadsSetFold[strings.ToLower(b)] = b
+	}
+	snapByID := make(map[string]SnapshotEntry, len(snap))
+	for _, s := range snap {
+		snapByID[s.ID] = s
+	}
+
+	for _, l := range linear {
+		s, ok := snapByID[l.ID]
+		if !ok {
+			continue
+		}
+		if s.Name == l.Name {
+			// Names match — pass-3 will see them as in-agreement; no consumption needed.
+			continue
+		}
+		// Case-insensitive: does beads still have the old (pre-rename) name?
+		if beadOriginal, exists := beadsSetFold[strings.ToLower(s.Name)]; exists {
+			r.applied = append(r.applied, LabelRename{OldName: beadOriginal, NewName: l.Name, ID: l.ID})
+			r.consumedSnapshotID[l.ID] = true
+			r.consumedLinearID[l.ID] = true
+			r.consumedBeadsName[beadOriginal] = true // mark the bead's actual spelling
+		} else {
+			r.dropped = append(r.dropped, LabelRename{OldName: s.Name, NewName: l.Name, ID: l.ID})
+			r.consumedSnapshotID[l.ID] = true
+			r.consumedLinearID[l.ID] = true
+			// Also consume the new-name beads row if the user happens to have
+			// independently re-added the new name (case-insensitive too) — prevents spurious add.
+			if beadOriginal, exists := beadsSetFold[strings.ToLower(l.Name)]; exists {
+				r.consumedBeadsName[beadOriginal] = true
+			}
+		}
+	}
+	return r
+}
+
 // applyExclusionFilter returns the three input sets with excluded labels removed.
 // Matching is case-insensitive on the label name.
 func applyExclusionFilter(in LabelReconcileInput) (beads []string, linear []LinearLabel, snap []SnapshotEntry) {
