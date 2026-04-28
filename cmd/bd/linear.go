@@ -221,6 +221,15 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	if err := lt.Init(ctx, store); err != nil {
 		FatalError("initializing Linear tracker: %v", err)
 	}
+
+	// Wire label-sync config so PushHooks/PullHooks builders see the right
+	// LabelSyncEnabled() value when they install the label-aware hooks below.
+	allCfg, _ := store.GetAllConfig(ctx)
+	lsCfg := loadLinearLabelSyncConfig(allCfg)
+	lt.SetLabelSyncConfig(lsCfg.Enabled, lsCfg.Exclude, lsCfg.CreateScope, func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, "Warning: linear label sync: "+format+"\n", args...)
+	})
+
 	if willPush {
 		if err := lt.ValidatePushStateMappings(ctx); err != nil {
 			FatalError("%v", err)
@@ -981,6 +990,41 @@ func loadLinearMappingConfig(ctx context.Context) *linear.MappingConfig {
 		return linear.DefaultMappingConfig()
 	}
 	return linear.LoadMappingConfig(&storeConfigLoader{ctx: ctx})
+}
+
+// linearLabelSyncConfig holds the parsed label-sync configuration that the
+// Linear tracker needs to enable bidirectional label reconciliation.
+type linearLabelSyncConfig struct {
+	Enabled     bool
+	Exclude     map[string]bool
+	CreateScope linear.LabelScope
+}
+
+// loadLinearLabelSyncConfig parses the three label-sync config keys from a
+// flat config map. Pass `store.GetAllConfig()` results in.
+func loadLinearLabelSyncConfig(cfg map[string]string) linearLabelSyncConfig {
+	out := linearLabelSyncConfig{
+		Exclude:     map[string]bool{},
+		CreateScope: linear.LabelScopeTeam,
+	}
+	if v := cfg["linear.label_sync_enabled"]; strings.EqualFold(strings.TrimSpace(v), "true") {
+		out.Enabled = true
+	}
+	if v := cfg["linear.label_sync_exclude"]; v != "" {
+		for _, raw := range strings.Split(v, ",") {
+			n := strings.ToLower(strings.TrimSpace(raw))
+			if n != "" {
+				out.Exclude[n] = true
+			}
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg["linear.label_create_scope"])) {
+	case "workspace":
+		out.CreateScope = linear.LabelScopeWorkspace
+	default:
+		out.CreateScope = linear.LabelScopeTeam
+	}
+	return out
 }
 
 // getLinearIDMode returns the configured ID mode for Linear imports.
