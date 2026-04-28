@@ -55,6 +55,17 @@ type PullHooks struct {
 	// Returns true if local and the converted-remote are equal and the pull
 	// should skip. If nil, pullIssueEqual is used.
 	ContentEqual func(local, remote *types.Issue) bool
+
+	// ReconcileLabels overrides the legacy "Linear-authoritative" label sync
+	// at engine.go:496. When set, the hook owns reading current labels,
+	// running its own reconciliation logic, and writing back through tx
+	// (including any per-tracker snapshot tables).
+	//
+	// When nil, the engine falls back to legacySyncIssueLabels (the prior
+	// behavior, renamed in this commit). This keeps non-Linear trackers
+	// (GitHub/GitLab) unaffected — they have no opinion about label
+	// reconciliation and rely on the legacy flow.
+	ReconcileLabels func(ctx context.Context, tx storage.Transaction, issueID string, desired []string, extIssue *TrackerIssue, actor string) error
 }
 
 // PushHooks contains optional callbacks that customize push (export) behavior.
@@ -493,7 +504,10 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				if err := tx.UpdateIssue(ctx, existing.ID, updates, e.Actor); err != nil {
 					return err
 				}
-				return syncIssueLabels(ctx, tx, existing.ID, conv.Issue.Labels, e.Actor)
+				if e.PullHooks != nil && e.PullHooks.ReconcileLabels != nil {
+					return e.PullHooks.ReconcileLabels(ctx, tx, existing.ID, conv.Issue.Labels, &extIssue, e.Actor)
+				}
+				return legacySyncIssueLabels(ctx, tx, existing.ID, conv.Issue.Labels, e.Actor)
 			}); err != nil {
 				e.warn("Failed to update %s: %v", existing.ID, err)
 				continue
@@ -641,7 +655,7 @@ func marshalTrackerMetadata(metadata interface{}) (json.RawMessage, bool) {
 	return json.RawMessage(raw), true
 }
 
-func syncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
+func legacySyncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
 	current, err := tx.GetLabels(ctx, issueID)
 	if err != nil {
 		return err
