@@ -28,6 +28,12 @@ type mockLinearServer struct {
 	teamKey  string // e.g. "MOCK"
 	states   []linear.State
 	stateMap map[string]linear.State // state type → State
+
+	// Label state for Phase G tests.
+	teamLabels      map[string]linear.Label // ID → Label, scoped to teamID
+	workspaceLabels map[string]linear.Label // ID → Label, organization-wide
+	labelCreates    []string                // names passed to issueLabelCreate, in order
+	updateCalls     map[string]int          // issueID → count of issueUpdate calls
 }
 
 func newMockLinearServer(teamID, teamKey string) *mockLinearServer {
@@ -43,11 +49,14 @@ func newMockLinearServer(teamID, teamKey string) *mockLinearServer {
 		stateMap[s.Type] = s
 	}
 	return &mockLinearServer{
-		issues:   make(map[string]*linear.Issue),
-		teamID:   teamID,
-		teamKey:  teamKey,
-		states:   states,
-		stateMap: stateMap,
+		issues:          make(map[string]*linear.Issue),
+		teamID:          teamID,
+		teamKey:         teamKey,
+		states:          states,
+		stateMap:        stateMap,
+		teamLabels:      make(map[string]linear.Label),
+		workspaceLabels: make(map[string]linear.Label),
+		updateCalls:     make(map[string]int),
 	}
 }
 
@@ -62,6 +71,10 @@ func (m *mockLinearServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
 
 	switch {
+	case strings.Contains(req.Query, "issueLabelCreate"):
+		data, err = m.handleLabelCreate(req)
+	case strings.Contains(req.Query, "LabelsByName"):
+		data, err = m.handleLabelsByName(req)
 	case strings.Contains(req.Query, "issueCreate"):
 		data, err = m.handleCreate(req)
 	case strings.Contains(req.Query, "issueUpdate"):
@@ -130,6 +143,23 @@ func (m *mockLinearServer) handleCreate(req linear.GraphQLRequest) (interface{},
 		}
 	}
 
+	// Apply labelIds if provided (mirrors handleUpdate logic for replace semantics).
+	if labelIDsRaw, ok := input["labelIds"]; ok {
+		labelIDs, _ := labelIDsRaw.([]interface{})
+		nodes := make([]linear.Label, 0, len(labelIDs))
+		for _, raw := range labelIDs {
+			idStr, _ := raw.(string)
+			if l, ok := m.teamLabels[idStr]; ok {
+				nodes = append(nodes, l)
+			} else if l, ok := m.workspaceLabels[idStr]; ok {
+				nodes = append(nodes, l)
+			} else {
+				nodes = append(nodes, linear.Label{ID: idStr, Name: "<unknown:" + idStr + ">"})
+			}
+		}
+		issue.Labels = &linear.Labels{Nodes: nodes}
+	}
+
 	m.issues[id] = issue
 
 	return map[string]interface{}{
@@ -183,6 +213,29 @@ func (m *mockLinearServer) handleUpdate(req linear.GraphQLRequest) (interface{},
 			}
 		}
 	}
+
+	// Track call count.
+	m.updateCalls[id]++
+
+	// Apply labelIds REPLACE semantics — Linear's actual behavior per the spec.
+	if labelIDsRaw, ok := input["labelIds"]; ok {
+		labelIDs, _ := labelIDsRaw.([]interface{})
+		nodes := make([]linear.Label, 0, len(labelIDs))
+		for _, raw := range labelIDs {
+			idStr, _ := raw.(string)
+			if l, ok := m.teamLabels[idStr]; ok {
+				nodes = append(nodes, l)
+			} else if l, ok := m.workspaceLabels[idStr]; ok {
+				nodes = append(nodes, l)
+			} else {
+				// Unknown ID — keep it but with a synthetic name (mirrors Linear's behavior of error-on-unknown,
+				// but we're permissive so tests can verify the wire format separately).
+				nodes = append(nodes, linear.Label{ID: idStr, Name: "<unknown:" + idStr + ">"})
+			}
+		}
+		issue.Labels = &linear.Labels{Nodes: nodes}
+	}
+
 	issue.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
 	return map[string]interface{}{
@@ -545,4 +598,132 @@ func buildLinearPullHooksForTest(ctx context.Context, store interface {
 	}
 
 	return hooks
+}
+
+func (m *mockLinearServer) handleLabelsByName(req linear.GraphQLRequest) (interface{}, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	teamNodes := make([]linear.Label, 0, len(m.teamLabels))
+	for _, l := range m.teamLabels {
+		teamNodes = append(teamNodes, l)
+	}
+	orgNodes := make([]linear.Label, 0, len(m.workspaceLabels))
+	for _, l := range m.workspaceLabels {
+		orgNodes = append(orgNodes, l)
+	}
+	return map[string]interface{}{
+		"team": map[string]interface{}{
+			"labels": map[string]interface{}{"nodes": teamNodes},
+		},
+		"organization": map[string]interface{}{
+			"labels": map[string]interface{}{"nodes": orgNodes},
+		},
+	}, nil
+}
+
+func (m *mockLinearServer) handleLabelCreate(req linear.GraphQLRequest) (interface{}, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	inputRaw, ok := req.Variables["input"]
+	if !ok {
+		return nil, fmt.Errorf("missing input")
+	}
+	input, ok := inputRaw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("input is not a map")
+	}
+	name := strVal(input, "name")
+	teamID := strVal(input, "teamId")
+
+	m.nextSeq++
+	id := fmt.Sprintf("auto-label-%d", m.nextSeq)
+	label := linear.Label{ID: id, Name: name}
+
+	if teamID != "" {
+		m.teamLabels[id] = label
+	} else {
+		m.workspaceLabels[id] = label
+	}
+	m.labelCreates = append(m.labelCreates, name)
+
+	return map[string]interface{}{
+		"issueLabelCreate": map[string]interface{}{
+			"success":    true,
+			"issueLabel": label,
+		},
+	}, nil
+}
+
+// SeedLinearLabels lets tests pre-populate labels on the team or workspace.
+// Use scope="team" or "workspace".
+func (m *mockLinearServer) SeedLinearLabels(scope string, labels ...linear.Label) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	target := m.teamLabels
+	if scope == "workspace" {
+		target = m.workspaceLabels
+	}
+	for _, l := range labels {
+		target[l.ID] = l
+	}
+}
+
+// SetIssueLabels assigns labels to an existing issue (test helper).
+func (m *mockLinearServer) SetIssueLabels(issueID string, labels []linear.Label) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if issue, ok := m.issues[issueID]; ok {
+		issue.Labels = &linear.Labels{Nodes: labels}
+		issue.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+}
+
+// IssueLabels returns the current labels on a Linear issue (test helper).
+func (m *mockLinearServer) IssueLabels(issueID string) []linear.Label {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	issue, ok := m.issues[issueID]
+	if !ok || issue.Labels == nil {
+		return nil
+	}
+	out := make([]linear.Label, len(issue.Labels.Nodes))
+	copy(out, issue.Labels.Nodes)
+	return out
+}
+
+// LabelCreates returns names that were created via issueLabelCreate, in order.
+func (m *mockLinearServer) LabelCreates() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.labelCreates))
+	copy(out, m.labelCreates)
+	return out
+}
+
+// UpdateCallCount returns how many issueUpdate calls were made for an issue.
+func (m *mockLinearServer) UpdateCallCount(issueID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.updateCalls[issueID]
+}
+
+// enableLabelSyncForTest sets the three label sync config keys in a test store.
+// Call this BEFORE Tracker.Init so the config is available when SetLabelSyncConfig
+// is called from runLinearSync (or call SetLabelSyncConfig directly after Init
+// for finer-grained tests).
+func enableLabelSyncForTest(t *testing.T, store interface {
+	SetConfig(ctx context.Context, key, value string) error
+}) {
+	t.Helper()
+	ctx := context.Background()
+	for k, v := range map[string]string{
+		"linear.label_sync_enabled": "true",
+		"linear.label_create_scope": "team",
+	} {
+		if err := store.SetConfig(ctx, k, v); err != nil {
+			t.Fatalf("SetConfig(%s): %v", k, err)
+		}
+	}
 }
