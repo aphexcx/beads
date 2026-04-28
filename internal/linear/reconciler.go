@@ -201,6 +201,96 @@ func synthesizeFirstSyncSnapshot(beads []string, linear []LinearLabel) []Snapsho
 	return out
 }
 
+// ReconcileLabels runs the three-pass reconciler.
+//
+// Pass 1: apply exclusion filter to all input sets.
+// Pass 2: classify Linear-side renames (rename map + per-row consumption flags).
+// Pass 3: run the per-label decision table on the unconsumed rows.
+//
+// Returns adds/removes for each side, the rename events to surface, and the
+// next snapshot. Callers apply the mutations and persist NewSnapshot inside a
+// transaction (see internal/tracker/engine.go for the integration point).
+//
+// First-sync rule: if Snapshot is empty and either side has labels, synthesize
+// a snapshot equal to the intersection of beads and Linear, then run normally.
+// This guarantees no removals on first sync (rows in only one side become adds,
+// rows in both become in-agreement).
+func ReconcileLabels(in LabelReconcileInput) LabelReconcileResult {
+	beads, linear, snap := applyExclusionFilter(in)
+
+	if len(snap) == 0 && (len(beads) > 0 || len(linear) > 0) {
+		snap = synthesizeFirstSyncSnapshot(beads, linear)
+	}
+
+	rc := classifyRenames(beads, linear, snap)
+	res := applyTruthTable(beads, linear, snap, rc)
+
+	// Apply rename effects to the user-visible result.
+	for _, r := range rc.applied {
+		res.RemoveFromBeads = append(res.RemoveFromBeads, r.OldName)
+		res.AddToBeads = append(res.AddToBeads, r.NewName)
+		res.RenamesApplied = append(res.RenamesApplied, r)
+	}
+	// For dropped renames, the user deleted the OLD name locally so the rename
+	// is not propagated. Normally we mirror that delete to Linear by removing
+	// the renamed label. BUT if the user has independently re-added the NEW
+	// name in beads (case-insensitive), the local state already matches Linear
+	// and we should leave the label alone — pass-2 marks this with
+	// consumedBeadsName on the new-name row.
+	beadsLower := make(map[string]bool, len(beads))
+	for _, b := range beads {
+		beadsLower[strings.ToLower(b)] = true
+	}
+	for _, r := range rc.dropped {
+		if beadsLower[strings.ToLower(r.NewName)] {
+			continue
+		}
+		res.RemoveFromLinear = append(res.RemoveFromLinear, r.ID)
+	}
+
+	res.NewSnapshot = computeNewSnapshot(beads, linear, res)
+	return res
+}
+
+// computeNewSnapshot builds the post-sync snapshot. It contains an entry for
+// every label that exists on BOTH sides after the reconciler's mutations would
+// be applied. Labels added to Linear via auto-create are NOT included here —
+// the caller adds them after resolving/creating IDs.
+func computeNewSnapshot(beads []string, linear []LinearLabel, res LabelReconcileResult) []SnapshotEntry {
+	// Project end-state on each side.
+	beadsEnd := make(map[string]bool, len(beads))
+	for _, b := range beads {
+		beadsEnd[b] = true
+	}
+	for _, n := range res.RemoveFromBeads {
+		delete(beadsEnd, n)
+	}
+	for _, n := range res.AddToBeads {
+		beadsEnd[n] = true
+	}
+
+	linearEnd := make(map[string]LinearLabel, len(linear))
+	for _, l := range linear {
+		linearEnd[l.Name] = l
+	}
+	for _, id := range res.RemoveFromLinear {
+		for name, l := range linearEnd {
+			if l.ID == id {
+				delete(linearEnd, name)
+			}
+		}
+	}
+	// AddToLinear has no IDs yet; caller resolves and re-snapshot writes after push.
+
+	out := make([]SnapshotEntry, 0)
+	for name, l := range linearEnd {
+		if beadsEnd[name] {
+			out = append(out, SnapshotEntry{Name: name, ID: l.ID})
+		}
+	}
+	return out
+}
+
 // applyExclusionFilter returns the three input sets with excluded labels removed.
 // Matching is case-insensitive on the label name.
 func applyExclusionFilter(in LabelReconcileInput) (beads []string, linear []LinearLabel, snap []SnapshotEntry) {

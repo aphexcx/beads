@@ -237,3 +237,136 @@ func TestSynthesizeFirstSyncSnapshot_NoOverlap(t *testing.T) {
 		t.Fatalf("expected empty intersection, got %+v", got)
 	}
 }
+
+func TestReconcileLabels_FirstSyncIntersectionPreservesBoth(t *testing.T) {
+	// Empty snapshot, bead has [A, B], Linear has [A] → first-sync rule.
+	// Expect: nothing removed; B pushed; new snapshot covers what's currently agreed.
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"A", "B"},
+		Linear:   []LinearLabel{{Name: "A", ID: "lin-A"}},
+		Snapshot: nil,
+	})
+	if len(res.RemoveFromBeads) != 0 || len(res.RemoveFromLinear) != 0 {
+		t.Errorf("first-sync should remove nothing, got removeBeads=%v removeLinear=%v",
+			res.RemoveFromBeads, res.RemoveFromLinear)
+	}
+	if !reflect.DeepEqual(sortedNames(res.AddToLinear), []string{"B"}) {
+		t.Errorf("AddToLinear: got %v, want [B]", res.AddToLinear)
+	}
+	if len(res.AddToBeads) != 0 {
+		t.Errorf("AddToBeads should be empty (A in agreement), got %v", res.AddToBeads)
+	}
+	// New snapshot reflects what's CURRENTLY agreed; pushed B has no Linear
+	// ID yet, so the orchestrator emits a snapshot containing only A. The
+	// caller writes the post-push-resolved snapshot separately.
+	if len(res.NewSnapshot) != 1 || res.NewSnapshot[0].Name != "A" {
+		t.Errorf("NewSnapshot: got %+v, want one entry for A", res.NewSnapshot)
+	}
+}
+
+func TestReconcileLabels_AppliedRename(t *testing.T) {
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"old"},
+		Linear:   []LinearLabel{{Name: "new", ID: "X"}},
+		Snapshot: []SnapshotEntry{{Name: "old", ID: "X"}},
+	})
+	if !reflect.DeepEqual(sortedNames(res.RemoveFromBeads), []string{"old"}) {
+		t.Errorf("RemoveFromBeads: got %v, want [old]", res.RemoveFromBeads)
+	}
+	if !reflect.DeepEqual(sortedNames(res.AddToBeads), []string{"new"}) {
+		t.Errorf("AddToBeads: got %v, want [new]", res.AddToBeads)
+	}
+	if len(res.RenamesApplied) != 1 || res.RenamesApplied[0].ID != "X" {
+		t.Errorf("RenamesApplied: got %+v", res.RenamesApplied)
+	}
+	if len(res.NewSnapshot) != 1 || res.NewSnapshot[0].Name != "new" || res.NewSnapshot[0].ID != "X" {
+		t.Errorf("NewSnapshot: got %+v, want [{new, X}]", res.NewSnapshot)
+	}
+}
+
+func TestReconcileLabels_DroppedRenameDeleteWins(t *testing.T) {
+	// Decision #10 — user deleted "old" locally, Linear renamed to "new".
+	// Delete wins: RemoveFromLinear, no AddToBeads.
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{},
+		Linear:   []LinearLabel{{Name: "new", ID: "X"}},
+		Snapshot: []SnapshotEntry{{Name: "old", ID: "X"}},
+	})
+	if !reflect.DeepEqual(sortedNames(res.RemoveFromLinear), []string{"X"}) {
+		t.Errorf("RemoveFromLinear: got %v, want [X]", res.RemoveFromLinear)
+	}
+	if len(res.AddToBeads) != 0 {
+		t.Errorf("AddToBeads should be empty (delete wins), got %v", res.AddToBeads)
+	}
+	if len(res.NewSnapshot) != 0 {
+		t.Errorf("NewSnapshot: got %+v, want empty", res.NewSnapshot)
+	}
+}
+
+func TestReconcileLabels_DroppedRenameWithLocalReAdd(t *testing.T) {
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"new"},
+		Linear:   []LinearLabel{{Name: "new", ID: "X"}},
+		Snapshot: []SnapshotEntry{{Name: "old", ID: "X"}},
+	})
+	// Pass-2 consumed beads row "new" (suppressing AddToBeads), Linear row X,
+	// snapshot row X. Pass-3 sees nothing. End-state in agreement.
+	if len(res.AddToBeads) != 0 || len(res.AddToLinear) != 0 ||
+		len(res.RemoveFromBeads) != 0 || len(res.RemoveFromLinear) != 0 {
+		t.Errorf("expected no changes, got %+v", res)
+	}
+	if len(res.NewSnapshot) != 1 || res.NewSnapshot[0].Name != "new" || res.NewSnapshot[0].ID != "X" {
+		t.Errorf("NewSnapshot: got %+v, want [{new, X}]", res.NewSnapshot)
+	}
+}
+
+func TestReconcileLabels_OldDeleteNewAddIndependent(t *testing.T) {
+	// No ID match — these are independent labels, not a rename.
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"bar"},
+		Linear:   []LinearLabel{{Name: "foo", ID: "F"}},
+		Snapshot: []SnapshotEntry{{Name: "foo", ID: "F"}},
+	})
+	if !reflect.DeepEqual(sortedNames(res.RemoveFromLinear), []string{"F"}) {
+		t.Errorf("RemoveFromLinear: got %v, want [F]", res.RemoveFromLinear)
+	}
+	if !reflect.DeepEqual(sortedNames(res.AddToLinear), []string{"bar"}) {
+		t.Errorf("AddToLinear: got %v, want [bar]", res.AddToLinear)
+	}
+}
+
+func TestReconcileLabels_StandardThreeWayMerge(t *testing.T) {
+	// Snapshot has [A, B]. Linear added C, removed B. Beads added D, removed A.
+	// Expect: A removed from Linear, B removed from beads, C added to beads,
+	// D added to Linear.
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:  []string{"B", "D"},
+		Linear: []LinearLabel{{Name: "A", ID: "ia"}, {Name: "C", ID: "ic"}},
+		Snapshot: []SnapshotEntry{
+			{Name: "A", ID: "ia"},
+			{Name: "B", ID: "ib"},
+		},
+	})
+	if !reflect.DeepEqual(sortedNames(res.RemoveFromLinear), []string{"ia"}) {
+		t.Errorf("RemoveFromLinear: got %v, want [ia]", res.RemoveFromLinear)
+	}
+	if !reflect.DeepEqual(sortedNames(res.RemoveFromBeads), []string{"B"}) {
+		t.Errorf("RemoveFromBeads: got %v, want [B]", res.RemoveFromBeads)
+	}
+	if !reflect.DeepEqual(sortedNames(res.AddToBeads), []string{"C"}) {
+		t.Errorf("AddToBeads: got %v, want [C]", res.AddToBeads)
+	}
+	if !reflect.DeepEqual(sortedNames(res.AddToLinear), []string{"D"}) {
+		t.Errorf("AddToLinear: got %v, want [D]", res.AddToLinear)
+	}
+}
+
+func TestReconcileLabels_EmptyInputs(t *testing.T) {
+	res := ReconcileLabels(LabelReconcileInput{})
+	if len(res.AddToBeads)+len(res.RemoveFromBeads)+len(res.AddToLinear)+len(res.RemoveFromLinear) != 0 {
+		t.Errorf("expected no changes, got %+v", res)
+	}
+	if len(res.NewSnapshot) != 0 {
+		t.Errorf("NewSnapshot: got %+v, want empty", res.NewSnapshot)
+	}
+}
