@@ -63,6 +63,23 @@ Data Mapping (optional, sensible defaults provided):
     bd config set linear.relation_map.duplicate duplicates
     bd config set linear.relation_map.related related
 
+  Bidirectional label sync (opt-in):
+    bd config set linear.label_sync_enabled true
+    bd config set linear.label_sync_exclude "internal-tag,gt:agent"
+    bd config set linear.label_create_scope team   # or workspace
+
+  When enabled, label changes propagate in both directions:
+  - Adding/removing a label in Linear flows to the bead on next sync.
+  - Adding/removing a label in beads flows to Linear on next sync.
+  - Renaming a label in Linear (same ID) flows as a name change.
+  - The first sync after enabling never removes labels on either side;
+    both sides' labels merge into a unified set.
+
+  Note: enabling this changes pull semantics for existing beads. Today the
+  pull-side already mirrors Linear labels destructively (beads labels not on
+  Linear are silently removed). With label sync enabled, removal becomes
+  intent-aware: a label is only removed when one side actively removes it.
+
   ID generation (optional, hash IDs to match bd/Jira hash mode):
     bd config set linear.id_mode "hash"      # hash (default)
     bd config set linear.hash_length "6"     # hash length 3-8 (default: 6)
