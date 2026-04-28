@@ -59,11 +59,16 @@ func (t *Tracker) LabelSyncEnabled() bool { return t.labelSyncEnabled }
 func (t *Tracker) LabelExclude() map[string]bool { return t.labelExclude }
 
 // LoadSnapshot reads the persisted snapshot for an issue using the tracker's
-// own store. Returns an empty slice when no snapshot exists. Used by the
-// pull/push hooks AND the dry-run gate in ContentEqual.
+// own store. Returns nil when no snapshot exists or no store is configured.
+// Reconciler treats nil and empty-slice equivalently. Used by the pull/push
+// hooks AND the dry-run gate in ContentEqual.
 //
 // This method does its own short-lived read transaction; it does NOT need to
 // participate in any caller's transaction (snapshots are read-only here).
+//
+// Note: this opens a short read-only transaction per call. In a sync of N
+// issues, ContentEqual + UpdateIssue collectively read snapshots N times.
+// Acceptable for v1; a future cache could short-circuit repeated reads.
 func (t *Tracker) LoadSnapshot(ctx context.Context, issueID string) ([]SnapshotEntry, error) {
 	if t.store == nil {
 		return nil, nil
@@ -240,6 +245,9 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	mapper := t.FieldMapper()
 	updates := mapper.IssueToTracker(issue)
 
+	// Resolve and include state so status changes are pushed to Linear.
+	// Uses the issue-aware resolver so close_reason distinguishes
+	// Done vs. Canceled for closed beads.
 	stateID, err := t.findStateIDForIssue(ctx, client, issue)
 	if err != nil {
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
@@ -251,97 +259,12 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	// Label sync (decision #12: independent path, runs even when other fields are equal).
 	var snapshotToWrite []storage.LinearLabelSnapshotEntry
 	if t.labelSyncEnabled {
-		// Fetch current Linear labels for this issue so the reconciler has fresh state.
-		// Note: the engine already fetched the issue once for ContentEqual; this is an
-		// extra round-trip. Acceptable for v1.
-		fresh, err := client.FetchIssueByIdentifier(ctx, externalID)
-		if err != nil {
-			return nil, fmt.Errorf("fetch for label reconciliation: %w", err)
-		}
-		if fresh == nil {
-			return nil, fmt.Errorf("label reconcile: issue %s not found in Linear", externalID)
-		}
-
-		linearLabels := make([]LinearLabel, 0)
-		if fresh.Labels != nil {
-			for _, l := range fresh.Labels.Nodes {
-				linearLabels = append(linearLabels, LinearLabel{Name: l.Name, ID: l.ID})
-			}
-		}
-
-		snap, err := t.LoadSnapshot(ctx, issue.ID)
-		if err != nil {
-			return nil, fmt.Errorf("load snapshot: %w", err)
-		}
-
-		res := ReconcileLabels(LabelReconcileInput{
-			Beads:    issue.Labels,
-			Linear:   linearLabels,
-			Snapshot: snap,
-			Exclude:  t.labelExclude,
-		})
-
-		resolved, err := resolveLabelIDs(ctx, client, res.AddToLinear, t.labelCreateScope, t.labelWarnFn)
+		ids, snap, err := t.reconcileAndBuildLabelUpdate(ctx, client, externalID, issue)
 		if err != nil {
 			return nil, err
 		}
-
-		// Build labelIds, deduplicating by ID. Duplicates can occur when
-		// case-insensitive resolution maps a bead label like "bug" to the
-		// SAME Linear ID that's already in linearLabels under "Bug" — the
-		// reconciler treated them as distinct (case-sensitive matching), but
-		// LabelsByName resolved them to the same ID. Without dedup we'd send
-		// `[L1, L1]` to Linear AND fail the snapshot insert on PK conflict.
-		removeSet := make(map[string]bool, len(res.RemoveFromLinear))
-		for _, id := range res.RemoveFromLinear {
-			removeSet[id] = true
-		}
-		labelIDSet := make(map[string]bool)
-		labelIDs := make([]string, 0)
-		for _, l := range linearLabels {
-			if !removeSet[l.ID] && !labelIDSet[l.ID] {
-				labelIDs = append(labelIDs, l.ID)
-				labelIDSet[l.ID] = true
-			}
-		}
-		for _, n := range res.AddToLinear {
-			if id, ok := resolved[n]; ok && !labelIDSet[id] {
-				labelIDs = append(labelIDs, id)
-				labelIDSet[id] = true
-			}
-		}
-		updates["labelIds"] = labelIDs
-
-		// Build the snapshot to persist. Reflects the post-push agreed state:
-		// every labelID we just sent to Linear, with its name. Skipped labels
-		// (CreateLabel failures) are absent — they retry next sync.
-		//
-		// CRITICAL: persist Linear's display case for the label name, NOT the
-		// bead's spelling. Otherwise, when LabelsByName matches case-insensitively
-		// (e.g. bead "bug" → Linear "Bug" with id L1), we'd persist {L1, "bug"}
-		// in the snapshot. Next sync's reconciler sees snapshot.Name="bug" and
-		// Linear.Name="Bug" with the same ID L1 → false rename detection → infinite
-		// churn. We pre-populate nameByID with Linear's display case from the
-		// fetched labels, then ONLY add resolved entries for IDs not already
-		// known (i.e., labels that were freshly auto-created with the bead's
-		// spelling — those names ARE Linear's spelling, since CreateLabel just
-		// created them with that name).
-		nameByID := make(map[string]string, len(linearLabels)+len(resolved))
-		for _, l := range linearLabels {
-			nameByID[l.ID] = l.Name // Linear's display case wins for known IDs
-		}
-		for n, id := range resolved {
-			if _, alreadyKnown := nameByID[id]; !alreadyKnown {
-				nameByID[id] = n // freshly-created via CreateLabel; n is Linear's name now
-			}
-		}
-		snapshotToWrite = make([]storage.LinearLabelSnapshotEntry, 0, len(labelIDs))
-		for _, id := range labelIDs {
-			snapshotToWrite = append(snapshotToWrite, storage.LinearLabelSnapshotEntry{
-				LabelID:   id,
-				LabelName: nameByID[id],
-			})
-		}
+		updates["labelIds"] = ids
+		snapshotToWrite = snap
 	}
 
 	updated, err := client.UpdateIssue(ctx, externalID, updates)
@@ -364,6 +287,115 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 
 	ti := linearToTrackerIssue(updated)
 	return &ti, nil
+}
+
+// reconcileAndBuildLabelUpdate fetches fresh Linear labels, runs the reconciler,
+// resolves new label IDs (with auto-create), deduplicates, and returns the
+// labelIds slice to send to Linear AND the snapshot rows to persist after a
+// successful push. Caller is responsible for actually persisting after push.
+//
+// Returns (nil, nil, nil) when label sync is disabled (caller should not call
+// in that case, but defensive fallthrough is harmless).
+func (t *Tracker) reconcileAndBuildLabelUpdate(
+	ctx context.Context, client *Client, externalID string, issue *types.Issue,
+) (labelIDs []string, snapshotToWrite []storage.LinearLabelSnapshotEntry, err error) {
+	// Fetch current Linear labels for this issue so the reconciler has fresh state.
+	// Note: the engine already fetched the issue once for ContentEqual; this is an
+	// extra round-trip. Acceptable for v1.
+	//
+	// V1 behavior: if FetchIssueByIdentifier fails (rate limit, network, missing
+	// issue), the entire UpdateIssue aborts — including non-label fields like
+	// status/title/description. We can't safely send labelIds without knowing the
+	// current Linear state. Future: degrade to "push other fields, skip labels,
+	// reconcile labels next sync" when the fetch fails for transient reasons.
+	fresh, err := client.FetchIssueByIdentifier(ctx, externalID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetch for label reconciliation: %w", err)
+	}
+	if fresh == nil {
+		return nil, nil, fmt.Errorf("label reconcile: issue %s not found in Linear", externalID)
+	}
+
+	linearLabels := make([]LinearLabel, 0)
+	if fresh.Labels != nil {
+		for _, l := range fresh.Labels.Nodes {
+			linearLabels = append(linearLabels, LinearLabel{Name: l.Name, ID: l.ID})
+		}
+	}
+
+	snap, err := t.LoadSnapshot(ctx, issue.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load snapshot: %w", err)
+	}
+
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    issue.Labels,
+		Linear:   linearLabels,
+		Snapshot: snap,
+		Exclude:  t.labelExclude,
+	})
+
+	resolved, err := resolveLabelIDs(ctx, client, res.AddToLinear, t.labelCreateScope, t.labelWarnFn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Build labelIds, deduplicating by ID. Duplicates can occur when
+	// case-insensitive resolution maps a bead label like "bug" to the
+	// SAME Linear ID that's already in linearLabels under "Bug" — the
+	// reconciler treated them as distinct (case-sensitive matching), but
+	// LabelsByName resolved them to the same ID. Without dedup we'd send
+	// `[L1, L1]` to Linear AND fail the snapshot insert on PK conflict.
+	removeSet := make(map[string]bool, len(res.RemoveFromLinear))
+	for _, id := range res.RemoveFromLinear {
+		removeSet[id] = true
+	}
+	labelIDSet := make(map[string]bool)
+	labelIDs = make([]string, 0)
+	for _, l := range linearLabels {
+		if !removeSet[l.ID] && !labelIDSet[l.ID] {
+			labelIDs = append(labelIDs, l.ID)
+			labelIDSet[l.ID] = true
+		}
+	}
+	for _, n := range res.AddToLinear {
+		if id, ok := resolved[n]; ok && !labelIDSet[id] {
+			labelIDs = append(labelIDs, id)
+			labelIDSet[id] = true
+		}
+	}
+
+	// Build the snapshot to persist. Reflects the post-push agreed state:
+	// every labelID we just sent to Linear, with its name. Skipped labels
+	// (CreateLabel failures) are absent — they retry next sync.
+	//
+	// CRITICAL: persist Linear's display case for the label name, NOT the
+	// bead's spelling. Otherwise, when LabelsByName matches case-insensitively
+	// (e.g. bead "bug" → Linear "Bug" with id L1), we'd persist {L1, "bug"}
+	// in the snapshot. Next sync's reconciler sees snapshot.Name="bug" and
+	// Linear.Name="Bug" with the same ID L1 → false rename detection → infinite
+	// churn. We pre-populate nameByID with Linear's display case from the
+	// fetched labels, then ONLY add resolved entries for IDs not already
+	// known (i.e., labels that were freshly auto-created with the bead's
+	// spelling — those names ARE Linear's spelling, since CreateLabel just
+	// created them with that name).
+	nameByID := make(map[string]string, len(linearLabels)+len(resolved))
+	for _, l := range linearLabels {
+		nameByID[l.ID] = l.Name // Linear's display case wins for known IDs
+	}
+	for n, id := range resolved {
+		if _, alreadyKnown := nameByID[id]; !alreadyKnown {
+			nameByID[id] = n // freshly-created via CreateLabel; n is Linear's name now
+		}
+	}
+	snapshotToWrite = make([]storage.LinearLabelSnapshotEntry, 0, len(labelIDs))
+	for _, id := range labelIDs {
+		snapshotToWrite = append(snapshotToWrite, storage.LinearLabelSnapshotEntry{
+			LabelID:   id,
+			LabelName: nameByID[id],
+		})
+	}
+	return labelIDs, snapshotToWrite, nil
 }
 
 // writeSnapshot persists the post-sync label snapshot for an issue.
