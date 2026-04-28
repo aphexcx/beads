@@ -102,3 +102,47 @@ func TestLinearLabelSnapshotReplace(t *testing.T) {
 		t.Fatalf("expected only [{lin-2, new}], got %+v", got)
 	}
 }
+
+func TestLinearLabelSnapshotClearOnEmpty(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		ID:        "test-1",
+		Title:     "test",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	// Seed with one entry, then clear with nil and assert empty.
+	seeded := []storage.LinearLabelSnapshotEntry{{LabelID: "lin-1", LabelName: "bug"}}
+	if err := store.RunInTransaction(ctx, "seed", func(tx storage.Transaction) error {
+		return tx.PutLinearLabelSnapshot(ctx, "test-1", seeded)
+	}); err != nil {
+		t.Fatalf("Put seed: %v", err)
+	}
+	if err := store.RunInTransaction(ctx, "clear", func(tx storage.Transaction) error {
+		return tx.PutLinearLabelSnapshot(ctx, "test-1", nil)
+	}); err != nil {
+		t.Fatalf("Put nil: %v", err)
+	}
+
+	var got []storage.LinearLabelSnapshotEntry
+	if err := store.RunInTransaction(ctx, "read", func(tx storage.Transaction) error {
+		var err error
+		got, err = tx.GetLinearLabelSnapshot(ctx, "test-1")
+		return err
+	}); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty after clear, got %+v", got)
+	}
+}

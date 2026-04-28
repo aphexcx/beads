@@ -3,7 +3,6 @@ package dolt
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
@@ -15,7 +14,7 @@ func selectLinearLabelSnapshot(ctx context.Context, q sqlQuerier, issueID string
 	rows, err := q.QueryContext(ctx,
 		`SELECT label_id, label_name FROM linear_label_snapshots WHERE issue_id = ?`, issueID)
 	if err != nil {
-		return nil, fmt.Errorf("query linear_label_snapshots: %w", err)
+		return nil, wrapQueryError("query linear_label_snapshots", err)
 	}
 	defer rows.Close()
 
@@ -23,12 +22,12 @@ func selectLinearLabelSnapshot(ctx context.Context, q sqlQuerier, issueID string
 	for rows.Next() {
 		var e storage.LinearLabelSnapshotEntry
 		if err := rows.Scan(&e.LabelID, &e.LabelName); err != nil {
-			return nil, fmt.Errorf("scan linear_label_snapshots row: %w", err)
+			return nil, wrapScanError("scan linear_label_snapshots row", err)
 		}
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, wrapQueryError("query linear_label_snapshots", err)
 	}
 	return out, nil
 }
@@ -41,7 +40,7 @@ func selectLinearLabelSnapshot(ctx context.Context, q sqlQuerier, issueID string
 func replaceLinearLabelSnapshot(ctx context.Context, x sqlExecer, issueID string, entries []storage.LinearLabelSnapshotEntry) error {
 	if _, err := x.ExecContext(ctx,
 		`DELETE FROM linear_label_snapshots WHERE issue_id = ?`, issueID); err != nil {
-		return fmt.Errorf("delete linear_label_snapshots: %w", err)
+		return wrapExecError("delete linear_label_snapshots", err)
 	}
 	if len(entries) == 0 {
 		return nil
@@ -51,7 +50,7 @@ func replaceLinearLabelSnapshot(ctx context.Context, x sqlExecer, issueID string
 		if _, err := x.ExecContext(ctx,
 			`INSERT INTO linear_label_snapshots (issue_id, label_id, label_name, synced_at) VALUES (?, ?, ?, ?)`,
 			issueID, e.LabelID, e.LabelName, now); err != nil {
-			return fmt.Errorf("insert linear_label_snapshots row: %w", err)
+			return wrapExecError("insert linear_label_snapshots row", err)
 		}
 	}
 	return nil
