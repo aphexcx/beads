@@ -657,6 +657,109 @@ func (c *Client) FetchIssueByIdentifier(ctx context.Context, identifier string) 
 	return nil, nil // Issue not found
 }
 
+// LabelsByName resolves a set of label names to their Linear IDs by querying
+// both team-scoped and workspace-scoped labels. Names not found in Linear are
+// simply absent from the returned map; the caller decides whether to auto-create.
+//
+// On collision (same name in both team and workspace scope), team-scoped wins.
+// Duplicate names within a single scope cause an ambiguity error per
+// the precedent in commit d4df404a — we never silently pick one.
+//
+// Result map is KEYED BY LOWERCASE NAME (case-insensitive — Linear matches that
+// way, and bead label casing may differ from Linear's display case).
+// LinearLabel.Name preserves Linear's display casing.
+func (c *Client) LabelsByName(ctx context.Context, names []string) (map[string]LinearLabel, error) {
+	if len(names) == 0 {
+		return map[string]LinearLabel{}, nil
+	}
+
+	query := `
+		query LabelsByName($teamId: String!) {
+			team(id: $teamId) {
+				labels(first: 250) {
+					nodes { id name }
+				}
+			}
+			organization {
+				labels(first: 250) {
+					nodes { id name }
+				}
+			}
+		}
+	`
+	req := &GraphQLRequest{
+		Query:     query,
+		Variables: map[string]interface{}{"teamId": c.TeamID},
+	}
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("LabelsByName: %w", err)
+	}
+
+	var resp struct {
+		Team struct {
+			Labels struct {
+				Nodes []struct{ ID, Name string }
+			}
+		}
+		Organization struct {
+			Labels struct {
+				Nodes []struct{ ID, Name string }
+			}
+		}
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("LabelsByName: parse response: %w", err)
+	}
+
+	wanted := make(map[string]bool, len(names))
+	for _, n := range names {
+		wanted[strings.ToLower(n)] = true
+	}
+
+	// First fold: detect duplicates within either scope. Team or workspace
+	// individually having two labels with the same name is the ambiguity
+	// case we fail on.
+	checkScope := func(scope string, nodes []struct{ ID, Name string }) error {
+		seen := map[string]string{}
+		for _, n := range nodes {
+			key := strings.ToLower(n.Name)
+			if !wanted[key] {
+				continue
+			}
+			if existing, ok := seen[key]; ok {
+				return fmt.Errorf("ambiguous label %q in %s scope: ids %s and %s — dedupe in Linear before sync", n.Name, scope, existing, n.ID)
+			}
+			seen[key] = n.ID
+		}
+		return nil
+	}
+	if err := checkScope("team", resp.Team.Labels.Nodes); err != nil {
+		return nil, err
+	}
+	if err := checkScope("workspace", resp.Organization.Labels.Nodes); err != nil {
+		return nil, err
+	}
+
+	// Second fold: build the output. Keyed by lowercase name (case-insensitive
+	// lookup); LinearLabel.Name preserves Linear's display case. Team scope
+	// wins on cross-scope collision (more specific).
+	out := map[string]LinearLabel{}
+	for _, n := range resp.Organization.Labels.Nodes {
+		key := strings.ToLower(n.Name)
+		if wanted[key] {
+			out[key] = LinearLabel{Name: n.Name, ID: n.ID}
+		}
+	}
+	for _, n := range resp.Team.Labels.Nodes {
+		key := strings.ToLower(n.Name)
+		if wanted[key] {
+			out[key] = LinearLabel{Name: n.Name, ID: n.ID}
+		}
+	}
+	return out, nil
+}
+
 // BuildStateCache fetches and caches team states.
 func BuildStateCache(ctx context.Context, client *Client) (*StateCache, error) {
 	states, err := client.GetTeamStates(ctx)
