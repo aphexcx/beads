@@ -70,7 +70,7 @@ func RunCompatMigrations(db *sql.DB) error {
 		"issues", "wisps", "events", "wisp_events", "dependencies",
 		"wisp_dependencies", "labels", "wisp_labels", "comments",
 		"wisp_comments", "metadata", "child_counters", "issue_counter",
-		"issue_snapshots", "compaction_snapshots", "federation_peers",
+		"issue_snapshots", "compaction_snapshots", "linear_label_snapshots", "federation_peers",
 		"custom_statuses", "custom_types",
 		"dolt_ignore",
 	}

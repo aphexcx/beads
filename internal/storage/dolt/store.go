@@ -1467,7 +1467,7 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 		schemaTables := []string{
 			"issues", "dependencies", "labels", "comments", "events",
 			"config", "metadata", "child_counters",
-			"issue_snapshots", "compaction_snapshots",
+			"issue_snapshots", "compaction_snapshots", "linear_label_snapshots",
 			"routes", "issue_counter",
 			"interactions", "federation_peers",
 			"custom_statuses", "custom_types",
