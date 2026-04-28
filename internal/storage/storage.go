@@ -297,4 +297,16 @@ type Transaction interface {
 	AddComment(ctx context.Context, issueID, actor, comment string) error
 	ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
+
+	// Linear label snapshot operations (per-bead, written inside sync transactions).
+	GetLinearLabelSnapshot(ctx context.Context, issueID string) ([]LinearLabelSnapshotEntry, error)
+	PutLinearLabelSnapshot(ctx context.Context, issueID string, entries []LinearLabelSnapshotEntry) error
+}
+
+// LinearLabelSnapshotEntry represents one row of a label-sync snapshot for a bead.
+// The snapshot captures the last-known agreed state between beads and Linear,
+// keyed by Linear label ID so renames can be detected on subsequent syncs.
+type LinearLabelSnapshotEntry struct {
+	LabelID   string
+	LabelName string
 }
