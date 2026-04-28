@@ -26,12 +26,62 @@ type Tracker struct {
 	store     storage.Storage
 	teamIDs   []string // ordered list of configured team IDs
 	projectID string
+
+	// Label sync state (set via SetLabelSyncConfig from cmd/bd; defaults disable sync).
+	labelSyncEnabled bool
+	labelExclude     map[string]bool
+	labelCreateScope LabelScope
+	labelWarnFn      func(format string, args ...interface{}) // optional, for resolveLabelIDs warnings
 }
 
 // SetTeamIDs sets the team IDs before Init(). When set, Init() uses these
 // instead of reading from config. This supports the --team CLI flag.
 func (t *Tracker) SetTeamIDs(ids []string) {
 	t.teamIDs = ids
+}
+
+// SetLabelSyncConfig configures bidirectional label sync. When enabled is
+// false (the default), label-related code paths short-circuit and the legacy
+// behavior is preserved. The warn callback receives messages for non-fatal
+// failures (e.g., CreateLabel rate limits); pass nil to discard.
+func (t *Tracker) SetLabelSyncConfig(enabled bool, exclude map[string]bool, scope LabelScope, warn func(string, ...interface{})) {
+	t.labelSyncEnabled = enabled
+	t.labelExclude = exclude
+	t.labelCreateScope = scope
+	t.labelWarnFn = warn
+}
+
+// LabelSyncEnabled is read by cmd/bd to decide whether to install the
+// label-aware ContentEqual hook and PullHooks.ReconcileLabels callback.
+func (t *Tracker) LabelSyncEnabled() bool { return t.labelSyncEnabled }
+
+// LabelExclude is read by cmd/bd hooks to pass into the reconciler.
+func (t *Tracker) LabelExclude() map[string]bool { return t.labelExclude }
+
+// LoadSnapshot reads the persisted snapshot for an issue using the tracker's
+// own store. Returns an empty slice when no snapshot exists. Used by the
+// pull/push hooks AND the dry-run gate in ContentEqual.
+//
+// This method does its own short-lived read transaction; it does NOT need to
+// participate in any caller's transaction (snapshots are read-only here).
+func (t *Tracker) LoadSnapshot(ctx context.Context, issueID string) ([]SnapshotEntry, error) {
+	if t.store == nil {
+		return nil, nil
+	}
+	var entries []storage.LinearLabelSnapshotEntry
+	err := t.store.RunInTransaction(ctx, "linear: read snapshot", func(tx storage.Transaction) error {
+		var err error
+		entries, err = tx.GetLinearLabelSnapshot(ctx, issueID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SnapshotEntry, len(entries))
+	for i, e := range entries {
+		out[i] = SnapshotEntry{Name: e.LabelName, ID: e.LabelID}
+	}
+	return out, nil
 }
 
 func (t *Tracker) Name() string         { return "linear" }
@@ -172,8 +222,16 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 	return &ti, nil
 }
 
+// UpdateIssue pushes a bead's changes to Linear. When label sync is enabled,
+// it also runs the label reconciler and pushes labelIds in the same mutation,
+// then persists a fresh snapshot reflecting the post-push agreed state.
+//
+// Pull-side label reconciliation (PullHooks.ReconcileLabels in cmd/bd/linear.go)
+// runs in the engine's pull-side transaction and writes its own snapshot
+// reflecting only beads-side mutations. When push runs after pull in the same
+// sync cycle, push's later snapshot write replaces pull's — they don't conflict
+// because they cover the same set of labels with consistent IDs.
 func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *types.Issue) (*tracker.TrackerIssue, error) {
-	// Route to the correct team's client based on the external ID.
 	client := t.clientForExternalID(ctx, externalID)
 	if client == nil {
 		return nil, fmt.Errorf("cannot determine Linear team for issue %s", externalID)
@@ -182,9 +240,6 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	mapper := t.FieldMapper()
 	updates := mapper.IssueToTracker(issue)
 
-	// Resolve and include state so status changes are pushed to Linear.
-	// Uses the issue-aware resolver so close_reason distinguishes
-	// Done vs. Canceled for closed beads.
 	stateID, err := t.findStateIDForIssue(ctx, client, issue)
 	if err != nil {
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
@@ -193,13 +248,133 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 		updates["stateId"] = stateID
 	}
 
+	// Label sync (decision #12: independent path, runs even when other fields are equal).
+	var snapshotToWrite []storage.LinearLabelSnapshotEntry
+	if t.labelSyncEnabled {
+		// Fetch current Linear labels for this issue so the reconciler has fresh state.
+		// Note: the engine already fetched the issue once for ContentEqual; this is an
+		// extra round-trip. Acceptable for v1.
+		fresh, err := client.FetchIssueByIdentifier(ctx, externalID)
+		if err != nil {
+			return nil, fmt.Errorf("fetch for label reconciliation: %w", err)
+		}
+		if fresh == nil {
+			return nil, fmt.Errorf("label reconcile: issue %s not found in Linear", externalID)
+		}
+
+		linearLabels := make([]LinearLabel, 0)
+		if fresh.Labels != nil {
+			for _, l := range fresh.Labels.Nodes {
+				linearLabels = append(linearLabels, LinearLabel{Name: l.Name, ID: l.ID})
+			}
+		}
+
+		snap, err := t.LoadSnapshot(ctx, issue.ID)
+		if err != nil {
+			return nil, fmt.Errorf("load snapshot: %w", err)
+		}
+
+		res := ReconcileLabels(LabelReconcileInput{
+			Beads:    issue.Labels,
+			Linear:   linearLabels,
+			Snapshot: snap,
+			Exclude:  t.labelExclude,
+		})
+
+		resolved, err := resolveLabelIDs(ctx, client, res.AddToLinear, t.labelCreateScope, t.labelWarnFn)
+		if err != nil {
+			return nil, err
+		}
+
+		// Build labelIds, deduplicating by ID. Duplicates can occur when
+		// case-insensitive resolution maps a bead label like "bug" to the
+		// SAME Linear ID that's already in linearLabels under "Bug" — the
+		// reconciler treated them as distinct (case-sensitive matching), but
+		// LabelsByName resolved them to the same ID. Without dedup we'd send
+		// `[L1, L1]` to Linear AND fail the snapshot insert on PK conflict.
+		removeSet := make(map[string]bool, len(res.RemoveFromLinear))
+		for _, id := range res.RemoveFromLinear {
+			removeSet[id] = true
+		}
+		labelIDSet := make(map[string]bool)
+		labelIDs := make([]string, 0)
+		for _, l := range linearLabels {
+			if !removeSet[l.ID] && !labelIDSet[l.ID] {
+				labelIDs = append(labelIDs, l.ID)
+				labelIDSet[l.ID] = true
+			}
+		}
+		for _, n := range res.AddToLinear {
+			if id, ok := resolved[n]; ok && !labelIDSet[id] {
+				labelIDs = append(labelIDs, id)
+				labelIDSet[id] = true
+			}
+		}
+		updates["labelIds"] = labelIDs
+
+		// Build the snapshot to persist. Reflects the post-push agreed state:
+		// every labelID we just sent to Linear, with its name. Skipped labels
+		// (CreateLabel failures) are absent — they retry next sync.
+		//
+		// CRITICAL: persist Linear's display case for the label name, NOT the
+		// bead's spelling. Otherwise, when LabelsByName matches case-insensitively
+		// (e.g. bead "bug" → Linear "Bug" with id L1), we'd persist {L1, "bug"}
+		// in the snapshot. Next sync's reconciler sees snapshot.Name="bug" and
+		// Linear.Name="Bug" with the same ID L1 → false rename detection → infinite
+		// churn. We pre-populate nameByID with Linear's display case from the
+		// fetched labels, then ONLY add resolved entries for IDs not already
+		// known (i.e., labels that were freshly auto-created with the bead's
+		// spelling — those names ARE Linear's spelling, since CreateLabel just
+		// created them with that name).
+		nameByID := make(map[string]string, len(linearLabels)+len(resolved))
+		for _, l := range linearLabels {
+			nameByID[l.ID] = l.Name // Linear's display case wins for known IDs
+		}
+		for n, id := range resolved {
+			if _, alreadyKnown := nameByID[id]; !alreadyKnown {
+				nameByID[id] = n // freshly-created via CreateLabel; n is Linear's name now
+			}
+		}
+		snapshotToWrite = make([]storage.LinearLabelSnapshotEntry, 0, len(labelIDs))
+		for _, id := range labelIDs {
+			snapshotToWrite = append(snapshotToWrite, storage.LinearLabelSnapshotEntry{
+				LabelID:   id,
+				LabelName: nameByID[id],
+			})
+		}
+	}
+
 	updated, err := client.UpdateIssue(ctx, externalID, updates)
 	if err != nil {
 		return nil, err
 	}
 
+	// After successful push, persist the snapshot. Done OUTSIDE the local
+	// transaction since the engine doesn't expose a tx here. If the snapshot
+	// write fails, the push has already happened — log and move on; the next
+	// sync's reconciler will compute correctly from prior snapshot state and
+	// converge.
+	if t.labelSyncEnabled {
+		if err := t.writeSnapshot(ctx, issue.ID, snapshotToWrite); err != nil {
+			if t.labelWarnFn != nil {
+				t.labelWarnFn("snapshot write failed for %s: %v", issue.ID, err)
+			}
+		}
+	}
+
 	ti := linearToTrackerIssue(updated)
 	return &ti, nil
+}
+
+// writeSnapshot persists the post-sync label snapshot for an issue.
+// Used by both UpdateIssue and CreateIssue after a successful push.
+func (t *Tracker) writeSnapshot(ctx context.Context, issueID string, entries []storage.LinearLabelSnapshotEntry) error {
+	if t.store == nil {
+		return nil
+	}
+	return t.store.RunInTransaction(ctx, fmt.Sprintf("linear: snapshot labels %s", issueID), func(tx storage.Transaction) error {
+		return tx.PutLinearLabelSnapshot(ctx, issueID, entries)
+	})
 }
 
 func (t *Tracker) FieldMapper() tracker.FieldMapper {
