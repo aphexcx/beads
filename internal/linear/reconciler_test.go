@@ -218,3 +218,22 @@ func TestApplyTruthTable_RespectsConsumption(t *testing.T) {
 		t.Errorf("expected AddToLinear=[x] after Linear+snapshot consumed, got %+v", res.AddToLinear)
 	}
 }
+
+func TestSynthesizeFirstSyncSnapshot(t *testing.T) {
+	beads := []string{"a", "b"}
+	linear := []LinearLabel{
+		{Name: "a", ID: "ID-A"},
+		{Name: "c", ID: "ID-C"},
+	}
+	got := synthesizeFirstSyncSnapshot(beads, linear)
+	if len(got) != 1 || got[0].Name != "a" || got[0].ID != "ID-A" {
+		t.Fatalf("expected intersection [{a, ID-A}], got %+v", got)
+	}
+}
+
+func TestSynthesizeFirstSyncSnapshot_NoOverlap(t *testing.T) {
+	got := synthesizeFirstSyncSnapshot([]string{"a"}, []LinearLabel{{Name: "b", ID: "ID-B"}})
+	if len(got) != 0 {
+		t.Fatalf("expected empty intersection, got %+v", got)
+	}
+}

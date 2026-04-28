@@ -182,6 +182,25 @@ func applyTruthTable(beads []string, linear []LinearLabel, snap []SnapshotEntry,
 	return res
 }
 
+// synthesizeFirstSyncSnapshot returns the intersection of beads and Linear
+// label names, with IDs taken from the Linear side. Used as the synthetic
+// snapshot input on the first sync for a bead, so the truth table behaves
+// as if both sides were already in agreement on shared labels — preventing
+// removals while still allowing both-side adds to flow.
+func synthesizeFirstSyncSnapshot(beads []string, linear []LinearLabel) []SnapshotEntry {
+	beadsSet := make(map[string]bool, len(beads))
+	for _, b := range beads {
+		beadsSet[b] = true
+	}
+	var out []SnapshotEntry
+	for _, l := range linear {
+		if beadsSet[l.Name] {
+			out = append(out, SnapshotEntry{Name: l.Name, ID: l.ID})
+		}
+	}
+	return out
+}
+
 // applyExclusionFilter returns the three input sets with excluded labels removed.
 // Matching is case-insensitive on the label name.
 func applyExclusionFilter(in LabelReconcileInput) (beads []string, linear []LinearLabel, snap []SnapshotEntry) {
