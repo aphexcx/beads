@@ -1175,6 +1175,18 @@ func (e *Engine) shouldPushIssue(issue *types.Issue, opts SyncOptions) bool {
 		}
 	}
 
+	if len(opts.ExcludeLabels) > 0 && len(issue.Labels) > 0 {
+		excludeSet := make(map[string]struct{}, len(opts.ExcludeLabels))
+		for _, l := range opts.ExcludeLabels {
+			excludeSet[l] = struct{}{}
+		}
+		for _, label := range issue.Labels {
+			if _, hit := excludeSet[label]; hit {
+				return false
+			}
+		}
+	}
+
 	if opts.State == "open" && issue.Status == types.StatusClosed {
 		return false
 	}

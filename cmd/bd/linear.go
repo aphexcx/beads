@@ -103,6 +103,9 @@ Type Filtering (--push only):
   Persistent exclude types (merged with --exclude-type):
     bd config set linear.exclude_types "molecule,event"
 
+  Persistent exclude by label (comma-separated, matched against issue.Labels):
+    bd config set linear.exclude_labels "gt:agent"
+
 Conflict Resolution:
   By default, newer timestamp wins. Override with:
   --prefer-local    Always prefer local beads version
@@ -259,6 +262,17 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	}
 	for _, t := range excludeTypes {
 		opts.ExcludeTypes = append(opts.ExcludeTypes, types.IssueType(strings.ToLower(t)))
+	}
+	// Read config linear.exclude_labels — comma-separated list of labels to
+	// skip from push (e.g. "gt:agent" filters out polecat agent beads).
+	configExcludeLabels, _ := store.GetConfig(ctx, "linear.exclude_labels")
+	if configExcludeLabels != "" {
+		for _, l := range strings.Split(configExcludeLabels, ",") {
+			l = strings.TrimSpace(l)
+			if l != "" {
+				opts.ExcludeLabels = append(opts.ExcludeLabels, l)
+			}
+		}
 	}
 	if !includeEphemeral {
 		opts.ExcludeEphemeral = true

@@ -92,6 +92,11 @@ type SyncOptions struct {
 	TypeFilter []types.IssueType
 	// ExcludeTypes excludes specific issue types from sync.
 	ExcludeTypes []types.IssueType
+	// ExcludeLabels excludes issues that carry any of the listed labels.
+	// Useful for filtering out internal-infrastructure beads (e.g. agent
+	// beads tagged "gt:agent") that shouldn't be exported to the external
+	// tracker. Matched case-sensitively against issue.Labels.
+	ExcludeLabels []string
 	// ExcludeEphemeral skips ephemeral/wisp issues from push (default behavior in CLI).
 	ExcludeEphemeral bool
 	// ParentID limits push to this beads issue and all its descendants via
