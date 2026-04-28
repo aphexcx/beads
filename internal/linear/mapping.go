@@ -659,8 +659,18 @@ func PushFieldsDiff(local *types.Issue, remote *Issue, config *MappingConfig) []
 		diffs = append(diffs, fmt.Sprintf("title: %q → %q", remote.Title, local.Title))
 	}
 	localDesc := BuildLinearDescription(local)
-	if NormalizeLinearMarkdown(localDesc) != NormalizeLinearMarkdown(remote.Description) {
-		diffs = append(diffs, describeTextDiff("description", remote.Description, localDesc))
+	normalizedRemote := NormalizeLinearMarkdown(remote.Description)
+	normalizedLocal := NormalizeLinearMarkdown(localDesc)
+	if normalizedRemote != normalizedLocal {
+		// Show diff against the normalized strings so the reported byte
+		// position points to genuine drift, not noise the normalizer would
+		// neutralize. Length still reflects the raw strings (more useful for
+		// understanding what's about to be pushed) but the first-diff window
+		// is taken from normalized form.
+		diffs = append(diffs, describeNormalizedTextDiff(
+			"description", remote.Description, localDesc,
+			normalizedRemote, normalizedLocal,
+		))
 	}
 	localPrio := PriorityToLinear(local.Priority, config)
 	if localPrio != remote.Priority {
@@ -686,6 +696,49 @@ func PushFieldsDiff(local *types.Issue, remote *Issue, config *MappingConfig) []
 		}
 	}
 	return diffs
+}
+
+// describeNormalizedTextDiff is like describeTextDiff but takes both the raw
+// and the normalized forms of the two strings. Length numbers come from raw
+// (so users see the size of what would be pushed), but the first-diff byte
+// position and surrounding excerpt come from the normalized strings — the
+// raw position would just point at noise the normalizer neutralizes (markdown
+// bullet style, escape backslashes, etc.) and mislead the reader about where
+// the genuine drift starts.
+func describeNormalizedTextDiff(label, before, after, normBefore, normAfter string) string {
+	if normBefore == normAfter {
+		// Defensive: caller shouldn't invoke this when normalized strings
+		// match, but guard against drift in the call site by emitting nothing.
+		return ""
+	}
+	minLen := len(normBefore)
+	if len(normAfter) < minLen {
+		minLen = len(normAfter)
+	}
+	firstDiff := minLen
+	for i := 0; i < minLen; i++ {
+		if normBefore[i] != normAfter[i] {
+			firstDiff = i
+			break
+		}
+	}
+	const window = 30
+	start := firstDiff - window
+	if start < 0 {
+		start = 0
+	}
+	beforeEnd := firstDiff + window
+	if beforeEnd > len(normBefore) {
+		beforeEnd = len(normBefore)
+	}
+	afterEnd := firstDiff + window
+	if afterEnd > len(normAfter) {
+		afterEnd = len(normAfter)
+	}
+	beforeWin := sanitizeForOneLine(normBefore[start:beforeEnd])
+	afterWin := sanitizeForOneLine(normAfter[start:afterEnd])
+	return fmt.Sprintf("%s: %d → %d chars, first real diff (after markdown-noise normalization) at byte %d\n        remote: …%s…\n        local:  …%s…",
+		label, len(before), len(after), firstDiff, beforeWin, afterWin)
 }
 
 // describeTextDiff returns a short, human-readable summary of how two strings
