@@ -1,6 +1,7 @@
 package linear
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -386,11 +387,20 @@ func canonicalPushStatus(status types.Status) types.Status {
 	return status
 }
 
+// errNoStateMatch is returned by resolveStateIDExact when no Linear state in
+// the workflow cache maps to the requested beads status. Distinct from
+// ambiguity errors so callers (e.g. ResolveStateIDForBeadsStatus's canonical
+// fallback) can decide whether to retry — only "no match" should fall back;
+// ambiguity should surface immediately so misconfigurations aren't masked.
+var errNoStateMatch = errors.New("no Linear state matches beads status")
+
 // ResolveStateIDForBeadsStatus returns the unique Linear workflow state ID to
 // use when pushing the given beads status. Push only trusts explicit
 // linear.state_map.* entries; defaults are safe for pull but too ambiguous for
 // mutation. If the explicit map has no entry for the actual status, falls back
 // to the category-canonical status (e.g. hooked → in_progress) before failing.
+// Ambiguity errors are NOT swallowed by the fallback path — they surface
+// immediately so misconfigured state_map entries don't go silently hidden.
 func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config *MappingConfig) (string, error) {
 	if cache == nil || len(cache.States) == 0 {
 		return "", fmt.Errorf("no workflow states found")
@@ -399,26 +409,32 @@ func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config
 		return "", fmt.Errorf("%s", missingExplicitStateMapMessage)
 	}
 
-	// Try the original status first; if that yields no match, retry with the
-	// category-canonical status before returning an error. This lets users
-	// explicitly map secondary statuses (e.g. linear.state_map.foo = hooked)
-	// while still providing a sensible default for the common case.
-	if id, err := resolveStateIDExact(cache, status, config); err == nil && id != "" {
+	// Try the original status first.
+	id, err := resolveStateIDExact(cache, status, config)
+	if err == nil {
 		return id, nil
 	}
-	canonical := canonicalPushStatus(status)
-	if canonical != status {
-		if id, err := resolveStateIDExact(cache, canonical, config); err == nil && id != "" {
-			return id, nil
-		}
-	}
-	// Fall through to the original error reporting (with the original status
-	// in the error message so the user knows what was missing).
-	_, err := resolveStateIDExact(cache, status, config)
-	if err != nil {
+	// Ambiguity (or any non-no-match error) surfaces directly — never masked
+	// by the canonical fallback below.
+	if !errors.Is(err, errNoStateMatch) {
 		return "", err
 	}
-	return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q", status)
+
+	// No-match on the original status: try the category-canonical status
+	// (e.g. hooked → in_progress) once. Errors from this attempt — including
+	// ambiguity on the canonical side — surface as-is.
+	canonical := canonicalPushStatus(status)
+	if canonical == status {
+		return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q", status)
+	}
+	id, err = resolveStateIDExact(cache, canonical, config)
+	if err == nil {
+		return id, nil
+	}
+	if errors.Is(err, errNoStateMatch) {
+		return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q (also tried category-canonical %q)", status, canonical)
+	}
+	return "", fmt.Errorf("resolving canonical state for beads status %q (canonical=%q): %w", status, canonical, err)
 }
 
 // resolveStateIDExact does the explicit name + type lookup against state_map
@@ -462,7 +478,7 @@ func resolveStateIDExact(cache *StateCache, status types.Status, config *Mapping
 		return "", fmt.Errorf("linear.state_map type fallback is ambiguous for beads status %q across Linear states: %s", status, strings.Join(names, ", "))
 	}
 
-	return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q", status)
+	return "", fmt.Errorf("%w: %q", errNoStateMatch, status)
 }
 
 // CloseIntent describes whether a closed bead represents completion (Done)

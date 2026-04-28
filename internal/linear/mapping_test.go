@@ -1053,3 +1053,91 @@ func TestResolveStateIDForBeadsStatusFallsBackToCanonical(t *testing.T) {
 		t.Errorf("hooked should map to state-wip (in progress), got %q", id)
 	}
 }
+
+func TestResolveStateIDForBeadsStatusOriginalAmbiguityNotMasked(t *testing.T) {
+	// User configured an ambiguous explicit map for the requested status —
+	// must surface the ambiguity error, NOT silently fall back to canonical.
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"in progress": "hooked", // explicit (and ambiguous when paired with below)
+		"working":     "hooked", // also maps to hooked
+		"backlog":     "open",
+		"done":        "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-wip1", Name: "In Progress", Type: "started"},
+			{ID: "state-wip2", Name: "Working", Type: "started"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+	_, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err == nil {
+		t.Fatal("expected ambiguity error, got nil")
+	}
+	if !strings.Contains(err.Error(), "multiple Linear states") {
+		t.Errorf("expected 'multiple Linear states' ambiguity error, got: %v", err)
+	}
+}
+
+func TestResolveStateIDForBeadsStatusCanonicalAmbiguitySurfaces(t *testing.T) {
+	// Original status has no match; canonical fallback hits an ambiguity.
+	// Must surface the canonical ambiguity error directly.
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"in progress": "in_progress",
+		"working":     "in_progress", // ambiguous in_progress
+		"backlog":     "open",
+		"done":        "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-wip1", Name: "In Progress", Type: "started"},
+			{ID: "state-wip2", Name: "Working", Type: "started"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+	// hooked has no explicit entry → canonical fallback to in_progress → ambiguous
+	_, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err == nil {
+		t.Fatal("expected ambiguity error from canonical fallback, got nil")
+	}
+	if !strings.Contains(err.Error(), "multiple Linear states") {
+		t.Errorf("expected canonical ambiguity to surface, got: %v", err)
+	}
+}
+
+func TestResolveStateIDForBeadsStatusNoMatchAnywhere(t *testing.T) {
+	// No explicit entry for the original status, no canonical-equivalent
+	// state in the workflow either — error message should mention both.
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"backlog": "open",
+		"done":    "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+	_, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err == nil {
+		t.Fatal("expected no-state error, got nil")
+	}
+	if !strings.Contains(err.Error(), "category-canonical") {
+		t.Errorf("expected error to mention canonical fallback was tried, got: %v", err)
+	}
+}
+
+func TestCanonicalPushStatusUnknownStatusPassesThrough(t *testing.T) {
+	// A custom status that BuiltInStatusCategory doesn't recognize stays
+	// unchanged — the function shouldn't claim a guess.
+	custom := types.Status("triage-pending")
+	got := canonicalPushStatus(custom)
+	if got != custom {
+		t.Errorf("canonicalPushStatus(%q) = %q, want unchanged %q", custom, got, custom)
+	}
+}
