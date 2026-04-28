@@ -218,9 +218,62 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
 	}
 
-	created, err := client.CreateIssue(ctx, issue.Title, issue.Description, priority, stateID, nil)
+	// Label sync: filter excluded labels, resolve to IDs (auto-create as needed),
+	// then pass to client.CreateIssue. Different from UpdateIssue's flow because
+	// there's no fresh Linear state to reconcile against — the issue doesn't
+	// exist yet. Just push what the bead has.
+	var labelIDs []string
+	var snapshotToWrite []storage.LinearLabelSnapshotEntry
+	if t.labelSyncEnabled && len(issue.Labels) > 0 {
+		toResolve := make([]string, 0, len(issue.Labels))
+		for _, name := range issue.Labels {
+			if t.labelExclude == nil || !t.labelExclude[strings.ToLower(name)] {
+				toResolve = append(toResolve, name)
+			}
+		}
+		resolved, err := resolveLabelIDs(ctx, client, toResolve, t.labelCreateScope, t.labelWarnFn)
+		if err != nil {
+			return nil, err
+		}
+		// Build labelIDs (deduplicated by ID — same case-mismatch concern as UpdateIssue)
+		// and snapshot rows in lockstep.
+		labelIDSet := make(map[string]bool)
+		for _, n := range toResolve {
+			id, ok := resolved[n]
+			if !ok {
+				continue // CreateLabel failed for this name; skip and let next sync retry
+			}
+			if labelIDSet[id] {
+				continue // dedupe
+			}
+			labelIDSet[id] = true
+			labelIDs = append(labelIDs, id)
+			// For CreateIssue, the bead's spelling IS Linear's spelling
+			// (CreateLabel just stored it verbatim) for any auto-created label.
+			// For pre-existing labels matched case-insensitively, n is the bead's
+			// spelling — Linear's display case may differ. The snapshot ideally
+			// would store Linear's case, but here we don't have it (resolveLabelIDs
+			// returns just IDs). This is acceptable: the next pull will overwrite
+			// the snapshot with Linear's display case via the reconciler. The
+			// Linear-update path persists Linear's case correctly via the helper.
+			snapshotToWrite = append(snapshotToWrite, storage.LinearLabelSnapshotEntry{
+				LabelID:   id,
+				LabelName: n,
+			})
+		}
+	}
+
+	created, err := client.CreateIssue(ctx, issue.Title, issue.Description, priority, stateID, labelIDs)
 	if err != nil {
 		return nil, err
+	}
+
+	if t.labelSyncEnabled && len(snapshotToWrite) > 0 {
+		if err := t.writeSnapshot(ctx, issue.ID, snapshotToWrite); err != nil {
+			if t.labelWarnFn != nil {
+				t.labelWarnFn("snapshot write failed for new bead %s: %v", issue.ID, err)
+			}
+		}
 	}
 
 	ti := linearToTrackerIssue(created)
