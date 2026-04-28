@@ -382,6 +382,13 @@ func buildLinearPullHooks(ctx context.Context, lt *linear.Tracker) *tracker.Pull
 		if remote.Status != types.StatusClosed && strings.TrimSpace(local.CloseReason) != "" {
 			return false
 		}
+		// Decision #12 (pull-side mirror): when label sync is enabled, a label
+		// delta forces ContentEqual to false so the engine enters the update
+		// transaction at engine.go:492 and our ReconcileLabels callback runs.
+		// Without this, Linear-only label adds would be silently skipped.
+		if lt.LabelSyncEnabled() && pullHasLabelDelta(lt, local, remote) {
+			return false
+		}
 		return true
 	}
 
@@ -421,6 +428,66 @@ func buildLinearPullHooks(ctx context.Context, lt *linear.Tracker) *tracker.Pull
 			// Track the newly generated ID for future collision avoidance
 			usedIDs[issue.ID] = true
 			return nil
+		}
+	}
+
+	// Bidirectional label sync — Linear-specific reconciliation, gated on config.
+	if lt.LabelSyncEnabled() {
+		hooks.ReconcileLabels = func(ctx context.Context, tx storage.Transaction, issueID string, desired []string, extIssue *tracker.TrackerIssue, actor string) error {
+			remoteIssue, ok := extIssue.Raw.(*linear.Issue)
+			if !ok || remoteIssue == nil {
+				return fmt.Errorf("ReconcileLabels: unexpected raw type %T", extIssue.Raw)
+			}
+
+			linearLabels := make([]linear.LinearLabel, 0)
+			if remoteIssue.Labels != nil {
+				for _, l := range remoteIssue.Labels.Nodes {
+					linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
+				}
+			}
+
+			snap, err := tx.GetLinearLabelSnapshot(ctx, issueID)
+			if err != nil {
+				return fmt.Errorf("load snapshot: %w", err)
+			}
+			snapEntries := make([]linear.SnapshotEntry, len(snap))
+			for i, s := range snap {
+				snapEntries[i] = linear.SnapshotEntry{Name: s.LabelName, ID: s.LabelID}
+			}
+
+			currentLabels, err := tx.GetLabels(ctx, issueID)
+			if err != nil {
+				return fmt.Errorf("get current labels: %w", err)
+			}
+
+			res := linear.ReconcileLabels(linear.LabelReconcileInput{
+				Beads:    currentLabels,
+				Linear:   linearLabels,
+				Snapshot: snapEntries,
+				Exclude:  lt.LabelExclude(),
+			})
+
+			// Apply Beads-side mutations only — Linear-side mutations
+			// (RemoveFromLinear, AddToLinear) are owned by the push path
+			// (Tracker.UpdateIssue), which runs in a separate transaction
+			// and writes its own snapshot after a successful API call.
+			for _, n := range res.RemoveFromBeads {
+				if err := tx.RemoveLabel(ctx, issueID, n, actor); err != nil {
+					return fmt.Errorf("remove label %q: %w", n, err)
+				}
+			}
+			for _, n := range res.AddToBeads {
+				if err := tx.AddLabel(ctx, issueID, n, actor); err != nil {
+					return fmt.Errorf("add label %q: %w", n, err)
+				}
+			}
+
+			// Snapshot reflects the agreed state after pull-side mutations.
+			snapshotEntries := make([]storage.LinearLabelSnapshotEntry, len(res.NewSnapshot))
+			for i, e := range res.NewSnapshot {
+				snapshotEntries[i] = storage.LinearLabelSnapshotEntry{LabelID: e.ID, LabelName: e.Name}
+			}
+			return tx.PutLinearLabelSnapshot(ctx, issueID, snapshotEntries)
 		}
 	}
 
@@ -978,4 +1045,43 @@ func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, 
 		Exclude:  lt.LabelExclude(),
 	})
 	return len(res.AddToLinear) > 0 || len(res.RemoveFromLinear) > 0
+}
+
+// pullHasLabelDelta is the pull-side counterpart to hasLabelDelta. It compares
+// local.Labels (the bead's current label set) against remote.Labels (the
+// converted-from-Linear bead's label set) by name, and returns true if any
+// name differs.
+//
+// The pull-side hook only applies beads-side mutations, so a name-set diff
+// is sufficient to decide whether to enter the update path. The full
+// reconciler runs inside the transaction with full IDs.
+//
+// Excluded labels are ignored on both sides (case-insensitive).
+func pullHasLabelDelta(lt *linear.Tracker, local *types.Issue, remote *types.Issue) bool {
+	localSet := make(map[string]bool, len(local.Labels))
+	for _, n := range local.Labels {
+		localSet[n] = true
+	}
+	remoteSet := make(map[string]bool, len(remote.Labels))
+	for _, n := range remote.Labels {
+		remoteSet[n] = true
+	}
+	excluded := lt.LabelExclude()
+	for n := range remoteSet {
+		if excluded != nil && excluded[strings.ToLower(n)] {
+			continue
+		}
+		if !localSet[n] {
+			return true // Linear has a label beads doesn't
+		}
+	}
+	for n := range localSet {
+		if excluded != nil && excluded[strings.ToLower(n)] {
+			continue
+		}
+		if !remoteSet[n] {
+			return true // beads has a label Linear doesn't
+		}
+	}
+	return false
 }
