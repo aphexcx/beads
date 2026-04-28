@@ -774,6 +774,25 @@ func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor
 	return wrapExecError("remove label in tx", err)
 }
 
+// GetLinearLabelSnapshot returns the last-known label snapshot for the given bead.
+// Order is unspecified — callers must not depend on it.
+func (t *doltTransaction) GetLinearLabelSnapshot(ctx context.Context, issueID string) ([]storage.LinearLabelSnapshotEntry, error) {
+	return selectLinearLabelSnapshot(ctx, t.tx, issueID)
+}
+
+// PutLinearLabelSnapshot replaces the entire snapshot for the given bead.
+// The replacement is atomic within the transaction (delete-then-insert).
+// Passing an empty (or nil) entries slice clears the snapshot for the issue.
+func (t *doltTransaction) PutLinearLabelSnapshot(ctx context.Context, issueID string, entries []storage.LinearLabelSnapshotEntry) error {
+	if err := replaceLinearLabelSnapshot(ctx, t.tx, issueID, entries); err != nil {
+		return err
+	}
+	// CRITICAL: Dolt only commits tables in tx.dirty.DirtyTables() — without
+	// MarkDirty the rows are written to the session but dropped on commit.
+	t.dirty.MarkDirty("linear_label_snapshots")
+	return nil
+}
+
 // SetConfig sets a config value within the transaction
 func (t *doltTransaction) SetConfig(ctx context.Context, key, value string) error {
 	_, err := t.tx.ExecContext(ctx, `
