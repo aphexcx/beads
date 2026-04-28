@@ -30,6 +30,7 @@ var compatMigrationsList = []CompatMigration{
 	{"uuid_primary_keys", MigrateUUIDPrimaryKeys},
 	{"add_no_history_column", MigrateAddNoHistoryColumn},
 	{"add_started_at_column", MigrateAddStartedAtColumn},
+	{"create_linear_label_snapshots", MigrateCreateLinearLabelSnapshots},
 	{"drop_hop_columns", MigrateDropHOPColumns},
 	{"drop_child_counters_fk", MigrateDropChildCountersFK},
 	{"wisp_events_created_at_index", MigrateWispEventsCreatedAtIndex},
