@@ -1000,3 +1000,56 @@ func TestPushFieldsDiffEmptyForEqualIssues(t *testing.T) {
 		t.Errorf("expected empty diff for equal issues (modulo normalization), got: %v", diffs)
 	}
 }
+
+func TestCanonicalPushStatus(t *testing.T) {
+	tests := []struct {
+		in   types.Status
+		want types.Status
+	}{
+		// CategoryActive
+		{types.StatusOpen, types.StatusOpen},
+		// CategoryWIP — secondary statuses canonicalize to in_progress
+		{types.StatusInProgress, types.StatusInProgress},
+		{types.StatusBlocked, types.StatusInProgress},
+		{types.StatusHooked, types.StatusInProgress},
+		// CategoryDone
+		{types.StatusClosed, types.StatusClosed},
+		// CategoryFrozen — pinned/deferred canonicalize to open
+		{types.StatusDeferred, types.StatusOpen},
+		{types.StatusPinned, types.StatusOpen},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.in), func(t *testing.T) {
+			got := canonicalPushStatus(tt.in)
+			if got != tt.want {
+				t.Errorf("canonicalPushStatus(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveStateIDForBeadsStatusFallsBackToCanonical(t *testing.T) {
+	// state_map only has explicit entry for in_progress; pushing a hooked bead
+	// must succeed via canonical fallback (hooked → in_progress).
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"in progress": "in_progress",
+		"backlog":     "open",
+		"done":        "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-wip", Name: "In Progress", Type: "started"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+
+	id, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err != nil {
+		t.Fatalf("expected hooked to resolve via canonical fallback, got error: %v", err)
+	}
+	if id != "state-wip" {
+		t.Errorf("hooked should map to state-wip (in progress), got %q", id)
+	}
+}

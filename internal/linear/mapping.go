@@ -363,10 +363,34 @@ func stateMapMatchesStatus(mapped string, status types.Status) bool {
 	return false
 }
 
+// canonicalPushStatus reduces a beads status to one of the four standard
+// statuses Linear can natively represent (open/in_progress/closed) using the
+// beads StatusCategory grouping. Used as a fallback when the user's explicit
+// state_map doesn't have an entry for a less-common status (hooked, blocked,
+// pinned, deferred). Without this, push fails with "no configured Linear
+// state for beads status X" for any status the user hasn't explicitly mapped,
+// even though the category-equivalent state already maps cleanly.
+func canonicalPushStatus(status types.Status) types.Status {
+	switch types.BuiltInStatusCategory(status) {
+	case types.CategoryWIP:
+		return types.StatusInProgress
+	case types.CategoryDone:
+		return types.StatusClosed
+	case types.CategoryActive:
+		return types.StatusOpen
+	case types.CategoryFrozen:
+		// Frozen statuses (pinned/deferred) are paused work — closest tracker
+		// equivalent is open/backlog.
+		return types.StatusOpen
+	}
+	return status
+}
+
 // ResolveStateIDForBeadsStatus returns the unique Linear workflow state ID to
 // use when pushing the given beads status. Push only trusts explicit
 // linear.state_map.* entries; defaults are safe for pull but too ambiguous for
-// mutation.
+// mutation. If the explicit map has no entry for the actual status, falls back
+// to the category-canonical status (e.g. hooked → in_progress) before failing.
 func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config *MappingConfig) (string, error) {
 	if cache == nil || len(cache.States) == 0 {
 		return "", fmt.Errorf("no workflow states found")
@@ -375,6 +399,33 @@ func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config
 		return "", fmt.Errorf("%s", missingExplicitStateMapMessage)
 	}
 
+	// Try the original status first; if that yields no match, retry with the
+	// category-canonical status before returning an error. This lets users
+	// explicitly map secondary statuses (e.g. linear.state_map.foo = hooked)
+	// while still providing a sensible default for the common case.
+	if id, err := resolveStateIDExact(cache, status, config); err == nil && id != "" {
+		return id, nil
+	}
+	canonical := canonicalPushStatus(status)
+	if canonical != status {
+		if id, err := resolveStateIDExact(cache, canonical, config); err == nil && id != "" {
+			return id, nil
+		}
+	}
+	// Fall through to the original error reporting (with the original status
+	// in the error message so the user knows what was missing).
+	_, err := resolveStateIDExact(cache, status, config)
+	if err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q", status)
+}
+
+// resolveStateIDExact does the explicit name + type lookup against state_map
+// for a single status, returning the unique state ID or an error describing
+// ambiguity / no-match. Extracted from ResolveStateIDForBeadsStatus so the
+// caller can retry with a canonical-fallback status before failing.
+func resolveStateIDExact(cache *StateCache, status types.Status, config *MappingConfig) (string, error) {
 	var nameMatches []State
 	for _, state := range cache.States {
 		mapped, ok := config.ExplicitStateMap[strings.ToLower(strings.TrimSpace(state.Name))]
