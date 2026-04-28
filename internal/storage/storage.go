@@ -299,7 +299,15 @@ type Transaction interface {
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
 
 	// Linear label snapshot operations (per-bead, written inside sync transactions).
+
+	// GetLinearLabelSnapshot returns the last-known label snapshot for the given bead.
+	// Returns an empty slice (never nil) when no snapshot exists. Order is unspecified;
+	// callers must not depend on a particular row order.
 	GetLinearLabelSnapshot(ctx context.Context, issueID string) ([]LinearLabelSnapshotEntry, error)
+
+	// PutLinearLabelSnapshot replaces the entire snapshot for the given bead.
+	// The replacement is atomic within the transaction (delete-then-insert).
+	// Passing an empty (or nil) entries slice clears the snapshot for the issue.
 	PutLinearLabelSnapshot(ctx context.Context, issueID string, entries []LinearLabelSnapshotEntry) error
 }
 
