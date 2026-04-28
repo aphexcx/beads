@@ -621,6 +621,52 @@ func BuildStateCacheFromTracker(ctx context.Context, t *Tracker) (*StateCache, e
 	return BuildStateCache(ctx, client)
 }
 
+// labelClient is the narrow interface resolveLabelIDs uses; *Client satisfies it.
+// Defined as an interface so tests can stub without spinning up an HTTP server.
+type labelClient interface {
+	LabelsByName(ctx context.Context, names []string) (map[string]LinearLabel, error)
+	CreateLabel(ctx context.Context, name string, scope LabelScope) (LinearLabel, error)
+}
+
+// resolveLabelIDs maps a set of beads label names to Linear label IDs, auto-
+// creating any that don't exist. Per the spec (Atomicity & partial failure):
+// a CreateLabel failure does NOT abort the whole push — the failed label is
+// omitted from the result map, and the snapshot writer omits it too, so the
+// next sync sees it as a fresh add and retries.
+//
+// LabelsByName ambiguity errors DO abort, since a duplicate label needs human
+// resolution before further pushes are safe.
+//
+// LabelsByName returns lowercase-keyed results. We match case-insensitively
+// (Linear matches that way; beads label casing may differ from Linear's).
+// Output keys preserve the bead's original spelling so callers can use the
+// map with their original list.
+func resolveLabelIDs(ctx context.Context, c labelClient, names []string, scope LabelScope, warn func(format string, args ...interface{})) (map[string]string, error) {
+	if len(names) == 0 {
+		return map[string]string{}, nil
+	}
+	existing, err := c.LabelsByName(ctx, names)
+	if err != nil {
+		return nil, err // LabelsByName failure (incl. ambiguity) is fatal for this push
+	}
+	out := make(map[string]string, len(names))
+	for _, n := range names {
+		if l, ok := existing[strings.ToLower(n)]; ok {
+			out[n] = l.ID
+			continue
+		}
+		l, err := c.CreateLabel(ctx, n, scope)
+		if err != nil {
+			if warn != nil {
+				warn("auto-create label %q failed; skipping for this sync (will retry next): %v", n, err)
+			}
+			continue // skip this label; do NOT abort the whole push
+		}
+		out[n] = l.ID
+	}
+	return out, nil
+}
+
 // configLoaderAdapter wraps storage.Storage to implement linear.ConfigLoader.
 type configLoaderAdapter struct {
 	ctx   context.Context

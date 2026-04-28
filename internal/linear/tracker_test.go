@@ -1,11 +1,62 @@
 package linear
 
 import (
+	"context"
+	"reflect"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// fakeLabelClient stubs LabelsByName and CreateLabel for tracker tests.
+type fakeLabelClient struct {
+	existing map[string]string // name → ID (case-insensitive — keys are lowercase)
+	created  []string          // names passed to CreateLabel, in order
+	scope    LabelScope
+}
+
+func (f *fakeLabelClient) LabelsByName(ctx context.Context, names []string) (map[string]LinearLabel, error) {
+	out := map[string]LinearLabel{}
+	for _, n := range names {
+		// Mirror real LabelsByName: lowercase key, preserve display case in Name.
+		if id, ok := f.existing[n]; ok { // exact match (already lowercase here for simplicity)
+			out[n] = LinearLabel{Name: n, ID: id}
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeLabelClient) CreateLabel(ctx context.Context, name string, scope LabelScope) (LinearLabel, error) {
+	f.created = append(f.created, name)
+	f.scope = scope
+	id := "auto-" + name
+	if f.existing == nil {
+		f.existing = map[string]string{}
+	}
+	f.existing[name] = id
+	return LinearLabel{Name: name, ID: id}, nil
+}
+
+func TestResolveLabelIDs_AutoCreatesMissing(t *testing.T) {
+	fc := &fakeLabelClient{existing: map[string]string{"bug": "L-bug"}}
+	got, err := resolveLabelIDs(context.Background(), fc, []string{"bug", "flaky-test"}, LabelScopeTeam, nil)
+	if err != nil {
+		t.Fatalf("resolveLabelIDs: %v", err)
+	}
+	if got["bug"] != "L-bug" {
+		t.Errorf("bug: got %q, want L-bug", got["bug"])
+	}
+	if got["flaky-test"] != "auto-flaky-test" {
+		t.Errorf("flaky-test: got %q, want auto-flaky-test", got["flaky-test"])
+	}
+	if !reflect.DeepEqual(fc.created, []string{"flaky-test"}) {
+		t.Errorf("created: got %v, want [flaky-test]", fc.created)
+	}
+	if fc.scope != LabelScopeTeam {
+		t.Errorf("scope: got %v, want team", fc.scope)
+	}
+}
 
 func TestRegistered(t *testing.T) {
 	factory := tracker.Get("linear")
