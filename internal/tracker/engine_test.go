@@ -2385,3 +2385,35 @@ func TestEngineExcludeLabelsEmpty(t *testing.T) {
 		t.Errorf("created %d issues with empty ExcludeLabels, want 2", len(tracker.created))
 	}
 }
+
+func TestEngineExcludeLabelsNoLabelsOnIssue(t *testing.T) {
+	// Non-empty ExcludeLabels filter but the issue has zero labels — must
+	// pass through unfiltered. Covers the implicit early-return when
+	// issue.Labels is empty/nil.
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issue := &types.Issue{
+		ID: "bd-nolabel", Title: "x", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+
+	result, err := engine.Sync(ctx, SyncOptions{
+		Push:          true,
+		ExcludeLabels: []string{"gt:agent"},
+	})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Errorf("Sync() not successful: %s", result.Error)
+	}
+	if len(tracker.created) != 1 {
+		t.Errorf("created %d issues; expected the no-label issue to pass through (want 1)", len(tracker.created))
+	}
+}

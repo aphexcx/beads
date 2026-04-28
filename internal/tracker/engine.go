@@ -1175,13 +1175,12 @@ func (e *Engine) shouldPushIssue(issue *types.Issue, opts SyncOptions) bool {
 		}
 	}
 
-	if len(opts.ExcludeLabels) > 0 && len(issue.Labels) > 0 {
-		excludeSet := make(map[string]struct{}, len(opts.ExcludeLabels))
-		for _, l := range opts.ExcludeLabels {
-			excludeSet[l] = struct{}{}
-		}
+	// Linear scan matches ExcludeTypes' style above. Both ExcludeLabels and
+	// issue.Labels are typically short (<=5), so the nested loop is faster
+	// than allocating a per-issue map.
+	for _, ex := range opts.ExcludeLabels {
 		for _, label := range issue.Labels {
-			if _, hit := excludeSet[label]; hit {
+			if label == ex {
 				return false
 			}
 		}
