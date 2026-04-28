@@ -1141,3 +1141,35 @@ func TestCanonicalPushStatusUnknownStatusPassesThrough(t *testing.T) {
 		t.Errorf("canonicalPushStatus(%q) = %q, want unchanged %q", custom, got, custom)
 	}
 }
+
+func TestNormalizeLinearMarkdownEscapeBrackets(t *testing.T) {
+	// Linear escapes square brackets in plain text to avoid markdown-link
+	// parsing. Local sends bare brackets. Both must normalize to the bare form.
+	in := `default seed \[5,5,5\] confirmed`
+	want := `default seed [5,5,5] confirmed`
+	got := NormalizeLinearMarkdown(in)
+	if got != want {
+		t.Errorf("escape-brackets: got %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeLinearMarkdownBoldUnderscore(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"simple", `Run __tests__ first`, `Run **tests** first`},
+		{"file path", `lib/simulation/__tests__/foo.test.ts`, `lib/simulation/**tests**/foo.test.ts`},
+		{"already bold", `Run **tests** first`, `Run **tests** first`}, // no-op
+		{"single underscore not matched", `_emphasis_ stays`, `_emphasis_ stays`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeLinearMarkdown(tt.in)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

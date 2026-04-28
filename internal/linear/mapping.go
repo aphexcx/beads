@@ -16,8 +16,15 @@ import (
 // that only differs in rendering-equivalent markdown syntax.
 var (
 	// Backslash escapes before punctuation Linear's editor emits verbatim
-	// (e.g. `1\. WiFi`, `\~880`). Strip escape to match human-authored form.
-	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~` + "`" + `])`)
+	// (e.g. `1\. WiFi`, `\~880`, `\[5,5,5\]`). Strip escape to match
+	// human-authored form. Includes `[` and `]` because Linear escapes
+	// brackets in plain text to disambiguate markdown links.
+	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]` + "`" + `])`)
+	// Bold marker style: `__text__` and `**text**` render identically; Linear
+	// canonicalizes to `**text**`. Match local's underscore form and rewrite.
+	// Inner content excludes underscores and newlines so this doesn't munge
+	// nested or ambiguous cases like `__a_b__`.
+	reMarkdownBoldUnderscore = regexp.MustCompile(`__([^_\n]+?)__`)
 	// Bullet marker at line start: normalize `- ` / `+ ` to `* ` (Linear's form).
 	reMarkdownBullet = regexp.MustCompile(`(?m)^(\s*)[-+] `)
 	// GFM table separator: collapse any run of dashes within a cell to `---`
@@ -42,6 +49,7 @@ var (
 func NormalizeLinearMarkdown(s string) string {
 	s = reMarkdownAutoLink.ReplaceAllString(s, "$1")
 	s = reMarkdownEscape.ReplaceAllString(s, "$1")
+	s = reMarkdownBoldUnderscore.ReplaceAllString(s, "**$1**")
 	s = reMarkdownBullet.ReplaceAllString(s, "$1* ")
 	s = reMarkdownTableSep.ReplaceAllString(s, "| --- ")
 	s = reTableCellPad.ReplaceAllString(s, "| ")
