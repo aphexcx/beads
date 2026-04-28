@@ -321,7 +321,7 @@ CREATE TABLE linear_label_snapshots (
     issue_id     VARCHAR(255) NOT NULL,    -- beads issue ID (matches issues.id)
     label_id     VARCHAR(64)  NOT NULL,    -- Linear label UUID
     label_name   VARCHAR(255) NOT NULL,    -- canonical name as last seen on Linear
-    synced_at    TIMESTAMP    NOT NULL,
+    synced_at    DATETIME     NOT NULL,
     PRIMARY KEY (issue_id, label_id),
     INDEX idx_linear_label_snapshots_issue (issue_id),
     CONSTRAINT fk_linear_label_snapshots_issue
