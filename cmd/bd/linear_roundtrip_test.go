@@ -1028,3 +1028,290 @@ func TestRoundtrip_FirstSyncPreservesBothSides(t *testing.T) {
 		t.Errorf("snapshot: got %+v, want entries for [A B]", snap)
 	}
 }
+
+// G2: pull-side removal works
+func TestRoundtrip_PullSideRemovalApplies(t *testing.T) {
+	store, mock, _, engine := setupLabelSyncTest(t)
+	ctx := context.Background()
+
+	mock.SeedLinearLabels("team", linear.Label{ID: "id-A", Name: "A"}, linear.Label{ID: "id-B", Name: "B"})
+	mock.issues["lin-1"] = &linear.Issue{
+		ID: "lin-1", Identifier: "MOCK-1", Title: "test",
+		URL:       "https://linear.app/mock/issue/MOCK-1",
+		Labels:    &linear.Labels{Nodes: []linear.Label{{ID: "id-A", Name: "A"}}}, // B already gone from Linear
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	extRef := "https://linear.app/mock/issue/MOCK-1"
+	beadID := "bd-1"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: beadID, Title: "test", Status: types.StatusOpen,
+		ExternalRef: &extRef,
+		Labels:      []string{"A", "B"}, // bead still has B locally
+	}, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	// Seed snapshot showing both A and B were last agreed.
+	writeSnapshotForTest(t, store, beadID, []storage.LinearLabelSnapshotEntry{
+		{LabelID: "id-A", LabelName: "A"},
+		{LabelID: "id-B", LabelName: "B"},
+	})
+
+	pushAndPull(t, engine)
+
+	pulled, err := store.GetIssue(ctx, beadID)
+	if err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if !setEq(pulled.Labels, []string{"A"}) {
+		t.Errorf("bead labels: got %v, want [A] (B removed in Linear)", pulled.Labels)
+	}
+}
+
+// G3: new bead pushes labels (CreateIssue regression — was passing nil for labelIDs)
+func TestRoundtrip_NewBeadPushesLabels(t *testing.T) {
+	store, mock, _, engine := setupLabelSyncTest(t)
+	ctx := context.Background()
+
+	mock.SeedLinearLabels("team", linear.Label{ID: "id-bug", Name: "bug"})
+
+	beadID := "bd-1"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: beadID, Title: "test", Status: types.StatusOpen,
+		Labels: []string{"bug", "p1"}, // bug exists on Linear, p1 will auto-create
+	}, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	pushAndPull(t, engine)
+
+	// Find the Linear issue created from this push (only one in mock).
+	var created *linear.Issue
+	for _, issue := range mock.issues {
+		created = issue
+		break
+	}
+	if created == nil {
+		t.Fatal("no issue was created in Linear")
+	}
+	got := labelNames(created.Labels.Nodes)
+	if !setEq(got, []string{"bug", "p1"}) {
+		t.Errorf("created issue labels: got %v, want [bug p1]", got)
+	}
+	if !sliceContains(mock.LabelCreates(), "p1") {
+		t.Errorf("expected p1 to be auto-created, LabelCreates=%v", mock.LabelCreates())
+	}
+}
+
+func sliceContains(xs []string, x string) bool {
+	for _, s := range xs {
+		if s == x {
+			return true
+		}
+	}
+	return false
+}
+
+// G4: label-only push fires (gate regression for decision #12 — ContentEqual must be label-aware)
+func TestRoundtrip_LabelOnlyPushFires(t *testing.T) {
+	store, mock, _, engine := setupLabelSyncTest(t)
+	ctx := context.Background()
+
+	mock.SeedLinearLabels("team",
+		linear.Label{ID: "id-A", Name: "A"},
+		linear.Label{ID: "id-B", Name: "B"},
+	)
+	mock.issues["lin-1"] = &linear.Issue{
+		ID: "lin-1", Identifier: "MOCK-1", Title: "test", Description: "body", Priority: 0,
+		URL:       "https://linear.app/mock/issue/MOCK-1",
+		Labels:    &linear.Labels{Nodes: []linear.Label{{ID: "id-A", Name: "A"}}},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	extRef := "https://linear.app/mock/issue/MOCK-1"
+	beadID := "bd-1"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: beadID, Title: "test", Description: "body", Priority: 0, Status: types.StatusOpen,
+		ExternalRef: &extRef,
+		Labels:      []string{"A", "B"}, // only labels differ from Linear
+	}, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	writeSnapshotForTest(t, store, beadID, []storage.LinearLabelSnapshotEntry{
+		{LabelID: "id-A", LabelName: "A"},
+	})
+
+	pushAndPull(t, engine)
+
+	got := labelNames(mock.IssueLabels("lin-1"))
+	if !setEq(got, []string{"A", "B"}) {
+		t.Errorf("expected B pushed to Linear, got %v", got)
+	}
+	if mock.UpdateCallCount("lin-1") == 0 {
+		t.Errorf("expected at least one issueUpdate call (gate must allow label-only deltas)")
+	}
+}
+
+// G5: Linear labelIds replace semantics
+func TestRoundtrip_LabelIdsReplaceSemantics(t *testing.T) {
+	store, mock, _, engine := setupLabelSyncTest(t)
+	ctx := context.Background()
+
+	mock.SeedLinearLabels("team",
+		linear.Label{ID: "id-X", Name: "X"},
+		linear.Label{ID: "id-Y", Name: "Y"},
+	)
+	mock.issues["lin-1"] = &linear.Issue{
+		ID: "lin-1", Identifier: "MOCK-1", Title: "test",
+		URL:       "https://linear.app/mock/issue/MOCK-1",
+		Labels:    &linear.Labels{Nodes: []linear.Label{{ID: "id-X", Name: "X"}}},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	extRef := "https://linear.app/mock/issue/MOCK-1"
+	beadID := "bd-1"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: beadID, Title: "test", Status: types.StatusOpen,
+		ExternalRef: &extRef,
+		Labels:      []string{"Y"}, // user removed X locally and added Y
+	}, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	writeSnapshotForTest(t, store, beadID, []storage.LinearLabelSnapshotEntry{
+		{LabelID: "id-X", LabelName: "X"},
+	})
+
+	pushAndPull(t, engine)
+
+	got := labelNames(mock.IssueLabels("lin-1"))
+	if !setEq(got, []string{"Y"}) {
+		t.Errorf("expected Linear labels [Y] after replace, got %v", got)
+	}
+}
+
+// G6: auto-create missing label on push
+func TestRoundtrip_AutoCreatesMissingLabel(t *testing.T) {
+	store, mock, _, engine := setupLabelSyncTest(t)
+	ctx := context.Background()
+
+	mock.issues["lin-1"] = &linear.Issue{
+		ID: "lin-1", Identifier: "MOCK-1", Title: "test",
+		URL:       "https://linear.app/mock/issue/MOCK-1",
+		Labels:    &linear.Labels{Nodes: []linear.Label{}},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	extRef := "https://linear.app/mock/issue/MOCK-1"
+	beadID := "bd-1"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: beadID, Title: "test", Status: types.StatusOpen,
+		ExternalRef: &extRef,
+		Labels:      []string{"never-seen"},
+	}, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+
+	pushAndPull(t, engine)
+
+	created := mock.LabelCreates()
+	if len(created) != 1 || created[0] != "never-seen" {
+		t.Errorf("expected one CreateLabel call for never-seen, got %v", created)
+	}
+	got := labelNames(mock.IssueLabels("lin-1"))
+	if !setEq(got, []string{"never-seen"}) {
+		t.Errorf("expected Linear to have never-seen label, got %v", got)
+	}
+}
+
+// G7: concurrent both-sides changes converge
+func TestRoundtrip_ConcurrentBothSidesChangesConverge(t *testing.T) {
+	store, mock, _, engine := setupLabelSyncTest(t)
+	ctx := context.Background()
+
+	mock.SeedLinearLabels("team",
+		linear.Label{ID: "id-A", Name: "A"},
+		linear.Label{ID: "id-C", Name: "C"},
+		linear.Label{ID: "id-D", Name: "D"},
+	)
+	mock.issues["lin-1"] = &linear.Issue{
+		ID: "lin-1", Identifier: "MOCK-1", Title: "test",
+		URL:       "https://linear.app/mock/issue/MOCK-1",
+		Labels:    &linear.Labels{Nodes: []linear.Label{{ID: "id-A", Name: "A"}, {ID: "id-D", Name: "D"}}},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	extRef := "https://linear.app/mock/issue/MOCK-1"
+	beadID := "bd-1"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: beadID, Title: "test", Status: types.StatusOpen,
+		ExternalRef: &extRef,
+		Labels:      []string{"B", "C"}, // beads removed A, added C; B is local-only
+	}, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	writeSnapshotForTest(t, store, beadID, []storage.LinearLabelSnapshotEntry{
+		{LabelID: "id-A", LabelName: "A"},
+		{LabelID: "id-B", LabelName: "B"},
+	})
+
+	pushAndPull(t, engine)
+
+	pulled, _ := store.GetIssue(ctx, beadID)
+	if !setEq(pulled.Labels, []string{"C", "D"}) {
+		t.Errorf("bead labels: got %v, want [C D]", pulled.Labels)
+	}
+	got := labelNames(mock.IssueLabels("lin-1"))
+	if !setEq(got, []string{"C", "D"}) {
+		t.Errorf("linear labels: got %v, want [C D]", got)
+	}
+}
+
+// G8: rename + concurrent local delete (decision #10)
+func TestRoundtrip_RenamePlusLocalDeleteWins(t *testing.T) {
+	store, mock, _, engine := setupLabelSyncTest(t)
+	ctx := context.Background()
+
+	mock.SeedLinearLabels("team", linear.Label{ID: "X", Name: "new"})
+	mock.issues["lin-1"] = &linear.Issue{
+		ID: "lin-1", Identifier: "MOCK-1", Title: "test",
+		URL:       "https://linear.app/mock/issue/MOCK-1",
+		Labels:    &linear.Labels{Nodes: []linear.Label{{ID: "X", Name: "new"}}}, // Linear renamed
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	extRef := "https://linear.app/mock/issue/MOCK-1"
+	beadID := "bd-1"
+	if err := store.CreateIssue(ctx, &types.Issue{
+		ID: beadID, Title: "test", Status: types.StatusOpen,
+		ExternalRef: &extRef,
+		Labels:      []string{}, // user deleted "old" locally
+	}, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	writeSnapshotForTest(t, store, beadID, []storage.LinearLabelSnapshotEntry{
+		{LabelID: "X", LabelName: "old"},
+	})
+
+	pushAndPull(t, engine)
+
+	// Delete wins: bead stays empty, Linear loses the label entirely.
+	pulled, _ := store.GetIssue(ctx, beadID)
+	if len(pulled.Labels) != 0 {
+		t.Errorf("bead: got %v, want empty", pulled.Labels)
+	}
+	got := mock.IssueLabels("lin-1")
+	if len(got) != 0 {
+		t.Errorf("linear: got %v, want empty (delete wins)", labelNames(got))
+	}
+	snap := readSnapshot(t, store, beadID)
+	if len(snap) != 0 {
+		t.Errorf("snapshot: got %+v, want empty", snap)
+	}
+}
