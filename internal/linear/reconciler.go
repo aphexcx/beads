@@ -1,5 +1,7 @@
 package linear
 
+import "strings"
+
 // LinearLabel pairs a Linear label name with its server-assigned ID.
 // IDs are required so renames (same ID, different name) can be detected.
 type LinearLabel struct {
@@ -40,4 +42,31 @@ type LabelRename struct {
 	OldName string
 	NewName string
 	ID      string
+}
+
+// applyExclusionFilter returns the three input sets with excluded labels removed.
+// Matching is case-insensitive on the label name.
+func applyExclusionFilter(in LabelReconcileInput) (beads []string, linear []LinearLabel, snap []SnapshotEntry) {
+	excluded := func(name string) bool {
+		if in.Exclude == nil {
+			return false
+		}
+		return in.Exclude[strings.ToLower(name)]
+	}
+	for _, n := range in.Beads {
+		if !excluded(n) {
+			beads = append(beads, n)
+		}
+	}
+	for _, l := range in.Linear {
+		if !excluded(l.Name) {
+			linear = append(linear, l)
+		}
+	}
+	for _, s := range in.Snapshot {
+		if !excluded(s.Name) {
+			snap = append(snap, s)
+		}
+	}
+	return beads, linear, snap
 }
