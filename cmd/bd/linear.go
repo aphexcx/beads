@@ -437,7 +437,16 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 		ContentEqual: func(local *types.Issue, remote *tracker.TrackerIssue) bool {
 			remoteIssue, ok := remote.Raw.(*linear.Issue)
 			if ok && remoteIssue != nil {
-				return linear.PushFieldsEqual(local, remoteIssue, config)
+				if !linear.PushFieldsEqual(local, remoteIssue, config) {
+					return false
+				}
+				// Decision #12: label sync gate. When label sync is enabled,
+				// non-empty PUSH-DIRECTION label delta forces a push even if all
+				// other fields are equal.
+				if lt.LabelSyncEnabled() && hasLabelDelta(ctx, lt, local, remoteIssue) {
+					return false
+				}
+				return true
 			}
 			remoteConv := lt.FieldMapper().IssueToBeads(remote)
 			if remoteConv == nil || remoteConv.Issue == nil {
@@ -936,4 +945,37 @@ func getLinearHashLength(ctx context.Context) int {
 		return 8
 	}
 	return value
+}
+
+// hasLabelDelta runs the reconciler in dry-run mode against the persisted
+// snapshot and returns true if any **push-direction** label adds/removes
+// would fire. Used by the push-side ContentEqual to bypass the engine-level
+// skip when only labels differ in the push direction.
+//
+// Pull-direction deltas (AddToBeads, RemoveFromBeads) are deliberately NOT
+// checked here — those are the pull path's concern. Including them here would
+// cause push to issue an IssueUpdate carrying labelIds identical to Linear's
+// current state (a wasted API call) just because the bead is missing labels
+// Linear has.
+//
+// Fail-safe: if the snapshot read errors, return true to force a push;
+// worse to silently swallow a label change than to issue a no-op mutation.
+func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, remoteIssue *linear.Issue) bool {
+	linearLabels := make([]linear.LinearLabel, 0)
+	if remoteIssue.Labels != nil {
+		for _, l := range remoteIssue.Labels.Nodes {
+			linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
+		}
+	}
+	snap, err := lt.LoadSnapshot(ctx, local.ID)
+	if err != nil {
+		return true
+	}
+	res := linear.ReconcileLabels(linear.LabelReconcileInput{
+		Beads:    local.Labels,
+		Linear:   linearLabels,
+		Snapshot: snap,
+		Exclude:  lt.LabelExclude(),
+	})
+	return len(res.AddToLinear) > 0 || len(res.RemoveFromLinear) > 0
 }
