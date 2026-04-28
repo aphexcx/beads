@@ -114,6 +114,74 @@ func classifyRenames(beads []string, linear []LinearLabel, snap []SnapshotEntry)
 	return r
 }
 
+// applyTruthTable is pass 3 of the reconciler. It takes the post-exclusion
+// inputs and the consumption decisions from pass 2, then computes adds/removes
+// per the 7-row truth table in the design doc.
+//
+// It does not handle the rename results themselves — those are emitted
+// separately by the orchestrator using the LabelRename entries from pass 2.
+func applyTruthTable(beads []string, linear []LinearLabel, snap []SnapshotEntry, rc renameClass) LabelReconcileResult {
+	// Build presence sets, skipping consumed rows.
+	beadsSet := map[string]bool{}
+	for _, b := range beads {
+		if rc.consumedBeadsName[b] {
+			continue
+		}
+		beadsSet[b] = true
+	}
+	linearByName := map[string]LinearLabel{}
+	for _, l := range linear {
+		if rc.consumedLinearID[l.ID] {
+			continue
+		}
+		linearByName[l.Name] = l
+	}
+	snapByName := map[string]SnapshotEntry{}
+	for _, s := range snap {
+		if rc.consumedSnapshotID[s.ID] {
+			continue
+		}
+		snapByName[s.Name] = s
+	}
+
+	// Union of all names across the three sets.
+	all := map[string]bool{}
+	for n := range beadsSet {
+		all[n] = true
+	}
+	for n := range linearByName {
+		all[n] = true
+	}
+	for n := range snapByName {
+		all[n] = true
+	}
+
+	var res LabelReconcileResult
+	for n := range all {
+		inBeads := beadsSet[n]
+		_, inLinear := linearByName[n]
+		snapEntry, inSnap := snapByName[n]
+
+		switch {
+		case inSnap && inBeads && inLinear:
+			// unchanged
+		case !inSnap && inBeads && !inLinear:
+			res.AddToLinear = append(res.AddToLinear, n)
+		case !inSnap && !inBeads && inLinear:
+			res.AddToBeads = append(res.AddToBeads, n)
+		case !inSnap && inBeads && inLinear:
+			// agreement — nothing
+		case inSnap && !inBeads && inLinear:
+			res.RemoveFromLinear = append(res.RemoveFromLinear, snapEntry.ID)
+		case inSnap && inBeads && !inLinear:
+			res.RemoveFromBeads = append(res.RemoveFromBeads, n)
+		case inSnap && !inBeads && !inLinear:
+			// agreement — nothing
+		}
+	}
+	return res
+}
+
 // applyExclusionFilter returns the three input sets with excluded labels removed.
 // Matching is case-insensitive on the label name.
 func applyExclusionFilter(in LabelReconcileInput) (beads []string, linear []LinearLabel, snap []SnapshotEntry) {

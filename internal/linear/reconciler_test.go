@@ -122,3 +122,99 @@ func TestClassifyRenames_CaseMismatchWithRenameDoesNotDelete(t *testing.T) {
 		t.Errorf("expected consumedBeadsName[bug]=true (bead's actual spelling)")
 	}
 }
+
+func TestApplyTruthTable_AllSevenRows(t *testing.T) {
+	cases := []struct {
+		name                string
+		snap, beads, linear []string
+		wantAddBeads        []string
+		wantRemoveBeads     []string
+		wantAddLinear       []string
+		wantRemoveLinearIDs []string
+	}{
+		{
+			name: "in_agreement_unchanged",
+			snap: []string{"x"}, beads: []string{"x"}, linear: []string{"x"},
+		},
+		{
+			name: "added_in_beads",
+			snap: []string{}, beads: []string{"x"}, linear: []string{},
+			wantAddLinear: []string{"x"},
+		},
+		{
+			name: "added_in_linear",
+			snap: []string{}, beads: []string{}, linear: []string{"x"},
+			wantAddBeads: []string{"x"},
+		},
+		{
+			name: "added_both_sides_in_agreement",
+			snap: []string{}, beads: []string{"x"}, linear: []string{"x"},
+		},
+		{
+			name: "removed_in_beads",
+			snap: []string{"x"}, beads: []string{}, linear: []string{"x"},
+			wantRemoveLinearIDs: []string{"id-x"},
+		},
+		{
+			name: "removed_in_linear",
+			snap: []string{"x"}, beads: []string{"x"}, linear: []string{},
+			wantRemoveBeads: []string{"x"},
+		},
+		{
+			name: "removed_both_sides_in_agreement",
+			snap: []string{"x"}, beads: []string{}, linear: []string{},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			beads := c.beads
+			linear := make([]LinearLabel, len(c.linear))
+			for i, n := range c.linear {
+				linear[i] = LinearLabel{Name: n, ID: "id-" + n}
+			}
+			snap := make([]SnapshotEntry, len(c.snap))
+			for i, n := range c.snap {
+				snap[i] = SnapshotEntry{Name: n, ID: "id-" + n}
+			}
+
+			res := applyTruthTable(beads, linear, snap, renameClass{
+				consumedSnapshotID: map[string]bool{},
+				consumedLinearID:   map[string]bool{},
+				consumedBeadsName:  map[string]bool{},
+			})
+
+			if !reflect.DeepEqual(sortedNames(res.AddToBeads), sortedNames(c.wantAddBeads)) {
+				t.Errorf("AddToBeads: got %v, want %v", res.AddToBeads, c.wantAddBeads)
+			}
+			if !reflect.DeepEqual(sortedNames(res.RemoveFromBeads), sortedNames(c.wantRemoveBeads)) {
+				t.Errorf("RemoveFromBeads: got %v, want %v", res.RemoveFromBeads, c.wantRemoveBeads)
+			}
+			if !reflect.DeepEqual(sortedNames(res.AddToLinear), sortedNames(c.wantAddLinear)) {
+				t.Errorf("AddToLinear: got %v, want %v", res.AddToLinear, c.wantAddLinear)
+			}
+			if !reflect.DeepEqual(sortedNames(res.RemoveFromLinear), sortedNames(c.wantRemoveLinearIDs)) {
+				t.Errorf("RemoveFromLinear: got %v, want %v", res.RemoveFromLinear, c.wantRemoveLinearIDs)
+			}
+		})
+	}
+}
+
+func TestApplyTruthTable_RespectsConsumption(t *testing.T) {
+	// Snapshot has X (consumed by pass-2), beads has X, linear has X — would
+	// normally be "in agreement" but consumption removes it from consideration.
+	res := applyTruthTable(
+		[]string{"x"},
+		[]LinearLabel{{Name: "x", ID: "id-x"}},
+		[]SnapshotEntry{{Name: "x", ID: "id-x"}},
+		renameClass{
+			consumedSnapshotID: map[string]bool{"id-x": true},
+			consumedLinearID:   map[string]bool{"id-x": true},
+			consumedBeadsName:  map[string]bool{},
+		},
+	)
+	// Both Linear and snapshot rows are consumed; beads row remains and looks
+	// like "added in beads, not in snapshot, not in linear" — which would push.
+	if len(res.AddToLinear) != 1 || res.AddToLinear[0] != "x" {
+		t.Errorf("expected AddToLinear=[x] after Linear+snapshot consumed, got %+v", res.AddToLinear)
+	}
+}
