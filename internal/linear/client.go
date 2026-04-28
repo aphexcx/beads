@@ -760,6 +760,60 @@ func (c *Client) LabelsByName(ctx context.Context, names []string) (map[string]L
 	return out, nil
 }
 
+// LabelScope controls where auto-created Linear labels live.
+type LabelScope int
+
+const (
+	LabelScopeTeam LabelScope = iota
+	LabelScopeWorkspace
+)
+
+// CreateLabel creates a new label in Linear. With LabelScopeTeam, the label
+// is scoped to the client's TeamID. With LabelScopeWorkspace, no teamId is
+// passed and the label becomes a workspace-level (organization-wide) label.
+//
+// Returns the created label with its server-assigned ID.
+func (c *Client) CreateLabel(ctx context.Context, name string, scope LabelScope) (LinearLabel, error) {
+	query := `
+		mutation CreateLabel($input: IssueLabelCreateInput!) {
+			issueLabelCreate(input: $input) {
+				success
+				issueLabel { id name }
+			}
+		}
+	`
+	input := map[string]interface{}{"name": name}
+	if scope == LabelScopeTeam {
+		input["teamId"] = c.TeamID
+	}
+
+	req := &GraphQLRequest{
+		Query:     query,
+		Variables: map[string]interface{}{"input": input},
+	}
+	data, err := c.Execute(ctx, req)
+	if err != nil {
+		return LinearLabel{}, fmt.Errorf("CreateLabel %q: %w", name, err)
+	}
+
+	var resp struct {
+		IssueLabelCreate struct {
+			Success    bool
+			IssueLabel struct{ ID, Name string }
+		}
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return LinearLabel{}, fmt.Errorf("CreateLabel %q: parse: %w", name, err)
+	}
+	if !resp.IssueLabelCreate.Success {
+		return LinearLabel{}, fmt.Errorf("CreateLabel %q: server reported failure", name)
+	}
+	return LinearLabel{
+		ID:   resp.IssueLabelCreate.IssueLabel.ID,
+		Name: resp.IssueLabelCreate.IssueLabel.Name,
+	}, nil
+}
+
 // BuildStateCache fetches and caches team states.
 func BuildStateCache(ctx context.Context, client *Client) (*StateCache, error) {
 	states, err := client.GetTeamStates(ctx)

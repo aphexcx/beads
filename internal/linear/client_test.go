@@ -243,3 +243,42 @@ func TestLabelsByName_DuplicateNamesFailLoudly(t *testing.T) {
 		t.Errorf("error should mention ambiguity, got: %v", err)
 	}
 }
+
+func TestCreateLabel_TeamScoped(t *testing.T) {
+	var captured string
+	server := mockGraphQLServer(t, func(req string) string {
+		captured = req
+		return `{"issueLabelCreate":{"success":true,"issueLabel":{"id":"new-id","name":"flaky-test"}}}`
+	})
+	defer server.Close()
+
+	c := newTestClient(server.URL)
+	got, err := c.CreateLabel(context.Background(), "flaky-test", LabelScopeTeam)
+	if err != nil {
+		t.Fatalf("CreateLabel: %v", err)
+	}
+	if got.ID != "new-id" || got.Name != "flaky-test" {
+		t.Errorf("got %+v, want {ID: new-id, Name: flaky-test}", got)
+	}
+	if !strings.Contains(captured, "team-1") {
+		t.Errorf("expected teamId in payload, got: %s", captured)
+	}
+}
+
+func TestCreateLabel_WorkspaceScoped(t *testing.T) {
+	var captured string
+	server := mockGraphQLServer(t, func(req string) string {
+		captured = req
+		return `{"issueLabelCreate":{"success":true,"issueLabel":{"id":"new-id","name":"flaky-test"}}}`
+	})
+	defer server.Close()
+
+	c := newTestClient(server.URL)
+	_, err := c.CreateLabel(context.Background(), "flaky-test", LabelScopeWorkspace)
+	if err != nil {
+		t.Fatalf("CreateLabel: %v", err)
+	}
+	if strings.Contains(captured, `"teamId":"team-1"`) {
+		t.Errorf("workspace scope must omit teamId, got: %s", captured)
+	}
+}
