@@ -535,7 +535,37 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 			if !ok || remoteIssue == nil {
 				return nil
 			}
-			return linear.PushFieldsDiff(local, remoteIssue, config)
+			diffs := linear.PushFieldsDiff(local, remoteIssue, config)
+
+			// Append label diff when label sync is enabled.
+			if lt.LabelSyncEnabled() {
+				linearLabels := make([]linear.LinearLabel, 0)
+				if remoteIssue.Labels != nil {
+					for _, l := range remoteIssue.Labels.Nodes {
+						linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
+					}
+				}
+				snap, _ := lt.LoadSnapshot(ctx, local.ID)
+				res := linear.ReconcileLabels(linear.LabelReconcileInput{
+					Beads:    local.Labels,
+					Linear:   linearLabels,
+					Snapshot: snap,
+					Exclude:  lt.LabelExclude(),
+				})
+				if len(res.AddToLinear) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels +%v (push to Linear)", res.AddToLinear))
+				}
+				if len(res.RemoveFromLinear) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from Linear)", res.RemoveFromLinear))
+				}
+				if len(res.AddToBeads) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels +%v (add to bead)", res.AddToBeads))
+				}
+				if len(res.RemoveFromBeads) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from bead)", res.RemoveFromBeads))
+				}
+			}
+			return diffs
 		},
 		BuildStateCache: func(ctx context.Context) (interface{}, error) {
 			return linear.BuildStateCacheFromTracker(ctx, lt)
