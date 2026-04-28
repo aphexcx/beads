@@ -282,3 +282,26 @@ func TestCreateLabel_WorkspaceScoped(t *testing.T) {
 		t.Errorf("workspace scope must omit teamId, got: %s", captured)
 	}
 }
+
+func TestUpdateIssue_LabelIdsReplaceSemantics(t *testing.T) {
+	// Asserts the wire format. The behavioral assertion that Linear's API
+	// actually replaces (not merges) lives in cmd/bd/linear_roundtrip_test.go
+	// Task G5, where the mock server is configured to replace.
+	var captured string
+	server := mockGraphQLServer(t, func(req string) string {
+		captured = req
+		return `{"issueUpdate":{"success":true,"issue":{"id":"I1","identifier":"TEST-1"}}}`
+	})
+	defer server.Close()
+
+	c := newTestClient(server.URL)
+	_, err := c.UpdateIssue(context.Background(), "I1", map[string]interface{}{
+		"labelIds": []string{"L-NEW"},
+	})
+	if err != nil {
+		t.Fatalf("UpdateIssue: %v", err)
+	}
+	if !strings.Contains(captured, `"labelIds":["L-NEW"]`) {
+		t.Errorf("expected labelIds:[L-NEW] in payload, got: %s", captured)
+	}
+}

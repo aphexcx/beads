@@ -522,6 +522,12 @@ func (c *Client) CreateIssue(ctx context.Context, title, description string, pri
 }
 
 // UpdateIssue updates an existing issue in Linear.
+//
+// NOTE: The "labelIds" input field is documented by Linear as REPLACING the
+// issue's label set, not merging. This is what we rely on for label-removal
+// pushes. If Linear ever changes this to merge semantics, the
+// linear_roundtrip_test will catch it (TestRoundtrip_LabelIdsReplaceSemantics
+// in cmd/bd/linear_roundtrip_test.go).
 func (c *Client) UpdateIssue(ctx context.Context, issueID string, updates map[string]interface{}) (*Issue, error) {
 	query := `
 		mutation UpdateIssue($id: String!, $input: IssueUpdateInput!) {
