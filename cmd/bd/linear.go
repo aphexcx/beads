@@ -569,11 +569,34 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 					Snapshot: snap,
 					Exclude:  lt.LabelExclude(),
 				})
+
+				// Build an ID→name lookup so RemoveFromLinear (which is []ID per
+				// the reconciler design) displays as names. Snapshot is the
+				// canonical source — every removed ID came from there. Linear's
+				// current labels are a fallback for IDs still present remotely.
+				nameByID := make(map[string]string, len(snap)+len(linearLabels))
+				for _, s := range snap {
+					nameByID[s.ID] = s.Name
+				}
+				for _, l := range linearLabels {
+					if _, ok := nameByID[l.ID]; !ok {
+						nameByID[l.ID] = l.Name
+					}
+				}
+				removeNames := make([]string, len(res.RemoveFromLinear))
+				for i, id := range res.RemoveFromLinear {
+					if name, ok := nameByID[id]; ok {
+						removeNames[i] = name
+					} else {
+						removeNames[i] = id // fallback — shouldn't happen for ids sourced from snapshot
+					}
+				}
+
 				if len(res.AddToLinear) > 0 {
 					diffs = append(diffs, fmt.Sprintf("labels +%v (push to Linear)", res.AddToLinear))
 				}
-				if len(res.RemoveFromLinear) > 0 {
-					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from Linear)", res.RemoveFromLinear))
+				if len(removeNames) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from Linear)", removeNames))
 				}
 				if len(res.AddToBeads) > 0 {
 					diffs = append(diffs, fmt.Sprintf("labels +%v (add to bead)", res.AddToBeads))
