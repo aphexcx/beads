@@ -44,11 +44,11 @@ func TestResolveLabelIDs_AutoCreatesMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveLabelIDs: %v", err)
 	}
-	if got["bug"] != "L-bug" {
-		t.Errorf("bug: got %q, want L-bug", got["bug"])
+	if got["bug"].ID != "L-bug" {
+		t.Errorf("bug: got %+v, want ID=L-bug", got["bug"])
 	}
-	if got["flaky-test"] != "auto-flaky-test" {
-		t.Errorf("flaky-test: got %q, want auto-flaky-test", got["flaky-test"])
+	if got["flaky-test"].ID != "auto-flaky-test" {
+		t.Errorf("flaky-test: got %+v, want ID=auto-flaky-test", got["flaky-test"])
 	}
 	if !reflect.DeepEqual(fc.created, []string{"flaky-test"}) {
 		t.Errorf("created: got %v, want [flaky-test]", fc.created)

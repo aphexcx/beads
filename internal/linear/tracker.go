@@ -239,26 +239,18 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 		// and snapshot rows in lockstep.
 		labelIDSet := make(map[string]bool)
 		for _, n := range toResolve {
-			id, ok := resolved[n]
+			label, ok := resolved[n]
 			if !ok {
 				continue // CreateLabel failed for this name; skip and let next sync retry
 			}
-			if labelIDSet[id] {
+			if labelIDSet[label.ID] {
 				continue // dedupe
 			}
-			labelIDSet[id] = true
-			labelIDs = append(labelIDs, id)
-			// For CreateIssue, the bead's spelling IS Linear's spelling
-			// (CreateLabel just stored it verbatim) for any auto-created label.
-			// For pre-existing labels matched case-insensitively, n is the bead's
-			// spelling — Linear's display case may differ. The snapshot ideally
-			// would store Linear's case, but here we don't have it (resolveLabelIDs
-			// returns just IDs). This is acceptable: the next pull will overwrite
-			// the snapshot with Linear's display case via the reconciler. The
-			// Linear-update path persists Linear's case correctly via the helper.
+			labelIDSet[label.ID] = true
+			labelIDs = append(labelIDs, label.ID)
 			snapshotToWrite = append(snapshotToWrite, storage.LinearLabelSnapshotEntry{
-				LabelID:   id,
-				LabelName: n,
+				LabelID:   label.ID,
+				LabelName: label.Name, // Linear's display case (preserved via LabelsByName)
 			})
 		}
 	}
@@ -412,9 +404,9 @@ func (t *Tracker) reconcileAndBuildLabelUpdate(
 		}
 	}
 	for _, n := range res.AddToLinear {
-		if id, ok := resolved[n]; ok && !labelIDSet[id] {
-			labelIDs = append(labelIDs, id)
-			labelIDSet[id] = true
+		if l, ok := resolved[n]; ok && !labelIDSet[l.ID] {
+			labelIDs = append(labelIDs, l.ID)
+			labelIDSet[l.ID] = true
 		}
 	}
 
@@ -436,9 +428,9 @@ func (t *Tracker) reconcileAndBuildLabelUpdate(
 	for _, l := range linearLabels {
 		nameByID[l.ID] = l.Name // Linear's display case wins for known IDs
 	}
-	for n, id := range resolved {
-		if _, alreadyKnown := nameByID[id]; !alreadyKnown {
-			nameByID[id] = n // freshly-created via CreateLabel; n is Linear's name now
+	for _, label := range resolved {
+		if _, alreadyKnown := nameByID[label.ID]; !alreadyKnown {
+			nameByID[label.ID] = label.Name // For freshly-created, Name == bead's spelling, which is now Linear's spelling too.
 		}
 	}
 	snapshotToWrite = make([]storage.LinearLabelSnapshotEntry, 0, len(labelIDs))
@@ -901,18 +893,18 @@ type labelClient interface {
 // (Linear matches that way; beads label casing may differ from Linear's).
 // Output keys preserve the bead's original spelling so callers can use the
 // map with their original list.
-func resolveLabelIDs(ctx context.Context, c labelClient, names []string, scope LabelScope, warn func(format string, args ...interface{})) (map[string]string, error) {
+func resolveLabelIDs(ctx context.Context, c labelClient, names []string, scope LabelScope, warn func(format string, args ...interface{})) (map[string]LinearLabel, error) {
 	if len(names) == 0 {
-		return map[string]string{}, nil
+		return map[string]LinearLabel{}, nil
 	}
 	existing, err := c.LabelsByName(ctx, names)
 	if err != nil {
 		return nil, err // LabelsByName failure (incl. ambiguity) is fatal for this push
 	}
-	out := make(map[string]string, len(names))
+	out := make(map[string]LinearLabel, len(names))
 	for _, n := range names {
 		if l, ok := existing[strings.ToLower(n)]; ok {
-			out[n] = l.ID
+			out[n] = l // l is LinearLabel{Name: <Linear display case>, ID: <id>}
 			continue
 		}
 		l, err := c.CreateLabel(ctx, n, scope)
@@ -922,7 +914,7 @@ func resolveLabelIDs(ctx context.Context, c labelClient, names []string, scope L
 			}
 			continue // skip this label; do NOT abort the whole push
 		}
-		out[n] = l.ID
+		out[n] = l // l.Name == n (CreateLabel just stored it with this name)
 	}
 	return out, nil
 }
