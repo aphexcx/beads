@@ -298,8 +298,12 @@ func TestReconcileLabels_DroppedRenameDeleteWins(t *testing.T) {
 	if len(res.AddToBeads) != 0 {
 		t.Errorf("AddToBeads should be empty (delete wins), got %v", res.AddToBeads)
 	}
-	if len(res.NewSnapshot) != 0 {
-		t.Errorf("NewSnapshot: got %+v, want empty", res.NewSnapshot)
+	// Snapshot stays at [{old, X}] until push completes the RemoveFromLinear.
+	// This preserves the user's delete intent across sync cycles even if push
+	// fails or is skipped. Once push removes Linear's label and writes its own
+	// snapshot, the [{old, X}] entry will be cleared.
+	if len(res.NewSnapshot) != 1 || res.NewSnapshot[0].Name != "old" || res.NewSnapshot[0].ID != "X" {
+		t.Errorf("NewSnapshot: got %+v, want [{old, X}] (preserved until push removes from Linear)", res.NewSnapshot)
 	}
 }
 

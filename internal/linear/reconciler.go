@@ -243,52 +243,71 @@ func ReconcileLabels(in LabelReconcileInput) LabelReconcileResult {
 	}
 	for _, r := range rc.dropped {
 		if beadsLower[strings.ToLower(r.NewName)] {
+			// Local re-add absorbs the rename: don't touch Linear, but DO record
+			// it in RenamesApplied so the snapshot updates to the new name.
+			res.RenamesApplied = append(res.RenamesApplied, r)
 			continue
 		}
 		res.RemoveFromLinear = append(res.RemoveFromLinear, r.ID)
 	}
 
-	res.NewSnapshot = computeNewSnapshot(beads, linear, res)
+	res.NewSnapshot = computeNewSnapshot(snap, linear, res)
 	return res
 }
 
-// computeNewSnapshot builds the post-sync snapshot. It contains an entry for
-// every label that exists on BOTH sides after the reconciler's mutations would
-// be applied. Labels added to Linear via auto-create are NOT included here —
-// the caller adds them after resolving/creating IDs.
-func computeNewSnapshot(beads []string, linear []LinearLabel, res LabelReconcileResult) []SnapshotEntry {
-	// Project end-state on each side.
-	beadsEnd := make(map[string]bool, len(beads))
-	for _, b := range beads {
-		beadsEnd[b] = true
+// computeNewSnapshot builds the snapshot to persist after the pull-side
+// reconciler runs. It represents "last-known agreement between beads and
+// Linear", preserved until push completes its own snapshot write.
+//
+// Algorithm: start from the input snapshot, then:
+//   - Apply renames (RenamesApplied): change OldName to NewName, ID stays.
+//   - Apply RemoveFromBeads: drop from snapshot.
+//   - Apply AddToBeads: add with Linear's ID/Name.
+//   - LEAVE entries for pending push-side mutations (RemoveFromLinear,
+//     AddToLinear) untouched. Push computes its own snapshot after the
+//     Linear API call succeeds; if push fails or is skipped, the snapshot
+//     correctly reflects what we last agreed on, so the next sync's
+//     reconciler sees the same delta and retries.
+func computeNewSnapshot(snapshot []SnapshotEntry, linear []LinearLabel, res LabelReconcileResult) []SnapshotEntry {
+	out := make(map[string]SnapshotEntry, len(snapshot))
+	for _, s := range snapshot {
+		out[s.Name] = s
 	}
+
+	// Apply renames: replace OldName entry with NewName (same ID).
+	for _, r := range res.RenamesApplied {
+		if entry, ok := out[r.OldName]; ok {
+			delete(out, r.OldName)
+			out[r.NewName] = SnapshotEntry{Name: r.NewName, ID: entry.ID}
+		}
+	}
+
+	// Apply RemoveFromBeads: drop from snapshot.
 	for _, n := range res.RemoveFromBeads {
-		delete(beadsEnd, n)
+		delete(out, n)
+	}
+
+	// Apply AddToBeads: add with Linear's ID/Name (preserves Linear's display case).
+	linearByName := make(map[string]LinearLabel, len(linear))
+	for _, l := range linear {
+		linearByName[l.Name] = l
 	}
 	for _, n := range res.AddToBeads {
-		beadsEnd[n] = true
-	}
-
-	linearEnd := make(map[string]LinearLabel, len(linear))
-	for _, l := range linear {
-		linearEnd[l.Name] = l
-	}
-	for _, id := range res.RemoveFromLinear {
-		for name, l := range linearEnd {
-			if l.ID == id {
-				delete(linearEnd, name)
-			}
+		if l, ok := linearByName[n]; ok {
+			out[n] = SnapshotEntry{Name: n, ID: l.ID}
 		}
 	}
-	// AddToLinear has no IDs yet; caller resolves and re-snapshot writes after push.
 
-	out := make([]SnapshotEntry, 0)
-	for name, l := range linearEnd {
-		if beadsEnd[name] {
-			out = append(out, SnapshotEntry{Name: name, ID: l.ID})
-		}
+	// RemoveFromLinear / AddToLinear are push-side concerns — NOT applied here.
+	// Push computes its own snapshot after the Linear API call. If push fails or
+	// is skipped, snapshot entries for those pending actions stay, so next
+	// sync's reconciler sees the same delta and retries.
+
+	result := make([]SnapshotEntry, 0, len(out))
+	for _, v := range out {
+		result = append(result, v)
 	}
-	return out
+	return result
 }
 
 // applyExclusionFilter returns the three input sets with excluded labels removed.
