@@ -879,29 +879,30 @@ func hasLabelDeltaTest(ctx context.Context, lt *linear.Tracker, local *types.Iss
 }
 
 // pullHasLabelDeltaTest mirrors pullHasLabelDelta from cmd/bd/linear.go.
+// Case-insensitive comparison so bead/Linear casing differences don't trigger false deltas.
 func pullHasLabelDeltaTest(lt *linear.Tracker, local, remote *types.Issue) bool {
-	localSet := make(map[string]bool, len(local.Labels))
+	localLower := make(map[string]bool, len(local.Labels))
 	for _, n := range local.Labels {
-		localSet[n] = true
+		localLower[strings.ToLower(n)] = true
 	}
-	remoteSet := make(map[string]bool, len(remote.Labels))
+	remoteLower := make(map[string]bool, len(remote.Labels))
 	for _, n := range remote.Labels {
-		remoteSet[n] = true
+		remoteLower[strings.ToLower(n)] = true
 	}
 	excluded := lt.LabelExclude()
-	for n := range remoteSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range remoteLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !localSet[n] {
+		if !localLower[k] {
 			return true
 		}
 	}
-	for n := range localSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range localLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !remoteSet[n] {
+		if !remoteLower[k] {
 			return true
 		}
 	}

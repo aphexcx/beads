@@ -374,3 +374,85 @@ func TestReconcileLabels_EmptyInputs(t *testing.T) {
 		t.Errorf("NewSnapshot: got %+v, want empty", res.NewSnapshot)
 	}
 }
+
+// TestApplyTruthTable_CaseInsensitive verifies that pass 3 treats labels
+// matching case-insensitively as the same logical label. Bead "bug" + Linear
+// "Bug" with no snapshot collapse to "in agreement" rather than producing a
+// spurious AddToLinear/AddToBeads pair.
+func TestApplyTruthTable_CaseInsensitive(t *testing.T) {
+	res := applyTruthTable(
+		[]string{"bug"},
+		[]LinearLabel{{Name: "Bug", ID: "L1"}},
+		[]SnapshotEntry{},
+		renameClass{
+			consumedSnapshotID: map[string]bool{},
+			consumedLinearID:   map[string]bool{},
+			consumedBeadsName:  map[string]bool{},
+		},
+	)
+	if len(res.AddToLinear) != 0 || len(res.AddToBeads) != 0 ||
+		len(res.RemoveFromLinear) != 0 || len(res.RemoveFromBeads) != 0 {
+		t.Errorf("case-fold agreement should produce no deltas, got %+v", res)
+	}
+}
+
+// TestApplyTruthTable_PreservesOriginalCase verifies that outputs use the
+// case from the side they're being applied to: AddToLinear uses bead's case,
+// AddToBeads uses Linear's display case, RemoveFromBeads uses bead's case.
+func TestApplyTruthTable_PreservesOriginalCase(t *testing.T) {
+	res := applyTruthTable(
+		[]string{"OldThing", "BeadOnly"},                   // bead's casing
+		[]LinearLabel{{Name: "NewThing", ID: "LIN-NEW"}},   // Linear's casing
+		[]SnapshotEntry{{Name: "OldThing", ID: "LIN-OLD"}}, // snapshot of prior agreement
+		renameClass{
+			consumedSnapshotID: map[string]bool{},
+			consumedLinearID:   map[string]bool{},
+			consumedBeadsName:  map[string]bool{},
+		},
+	)
+	// OldThing: snap ✓, beads ✓, linear ✗ → RemoveFromBeads with bead's case "OldThing"
+	if !reflect.DeepEqual(sortedNames(res.RemoveFromBeads), []string{"OldThing"}) {
+		t.Errorf("RemoveFromBeads: got %v, want [OldThing]", res.RemoveFromBeads)
+	}
+	// NewThing: snap ✗, beads ✗, linear ✓ → AddToBeads with Linear's case "NewThing"
+	if !reflect.DeepEqual(sortedNames(res.AddToBeads), []string{"NewThing"}) {
+		t.Errorf("AddToBeads: got %v, want [NewThing]", res.AddToBeads)
+	}
+	// BeadOnly: snap ✗, beads ✓, linear ✗ → AddToLinear with bead's case "BeadOnly"
+	if !reflect.DeepEqual(sortedNames(res.AddToLinear), []string{"BeadOnly"}) {
+		t.Errorf("AddToLinear: got %v, want [BeadOnly]", res.AddToLinear)
+	}
+}
+
+// TestSynthesizeFirstSyncSnapshot_CaseInsensitive verifies that the first-sync
+// intersection treats case-mismatched names as the same label.
+func TestSynthesizeFirstSyncSnapshot_CaseInsensitive(t *testing.T) {
+	got := synthesizeFirstSyncSnapshot(
+		[]string{"bug", "OnlyBead"},
+		[]LinearLabel{{Name: "Bug", ID: "L1"}, {Name: "OnlyLinear", ID: "L2"}},
+	)
+	// Intersection by case-fold = {"bug" ↔ "Bug"}. Snapshot uses Linear's display case.
+	if len(got) != 1 || got[0].Name != "Bug" || got[0].ID != "L1" {
+		t.Errorf("intersection: got %+v, want [{Bug, L1}]", got)
+	}
+}
+
+// TestReconcileLabels_CaseMismatchTreatedAsAgreement is the end-to-end test
+// for the mayor's hw-gxrq scenario: bead has "bug" lowercase, Linear has "Bug"
+// titlecase. Expected behavior after fix: no thrash, no spurious adds, no
+// duplicate labels. Snapshot persists Linear's display case as canonical.
+func TestReconcileLabels_CaseMismatchTreatedAsAgreement(t *testing.T) {
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"bug"},
+		Linear:   []LinearLabel{{Name: "Bug", ID: "L1"}},
+		Snapshot: nil,
+	})
+	if len(res.AddToBeads) != 0 || len(res.RemoveFromBeads) != 0 ||
+		len(res.AddToLinear) != 0 || len(res.RemoveFromLinear) != 0 {
+		t.Errorf("case-mismatch should be in agreement, got %+v", res)
+	}
+	// Snapshot synthesized via first-sync rule contains Linear's "Bug" entry.
+	if len(res.NewSnapshot) != 1 || res.NewSnapshot[0].Name != "Bug" || res.NewSnapshot[0].ID != "L1" {
+		t.Errorf("NewSnapshot: got %+v, want [{Bug, L1}]", res.NewSnapshot)
+	}
+}

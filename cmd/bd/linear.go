@@ -1171,29 +1171,31 @@ func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, 
 // reconciler runs inside the transaction with full IDs.
 //
 // Excluded labels are ignored on both sides (case-insensitive).
+// Name comparison is case-insensitive — Linear treats labels case-insensitively,
+// and bead casing may diverge from Linear's display casing.
 func pullHasLabelDelta(lt *linear.Tracker, local *types.Issue, remote *types.Issue) bool {
-	localSet := make(map[string]bool, len(local.Labels))
+	localLower := make(map[string]bool, len(local.Labels))
 	for _, n := range local.Labels {
-		localSet[n] = true
+		localLower[strings.ToLower(n)] = true
 	}
-	remoteSet := make(map[string]bool, len(remote.Labels))
+	remoteLower := make(map[string]bool, len(remote.Labels))
 	for _, n := range remote.Labels {
-		remoteSet[n] = true
+		remoteLower[strings.ToLower(n)] = true
 	}
 	excluded := lt.LabelExclude()
-	for n := range remoteSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range remoteLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !localSet[n] {
+		if !localLower[k] {
 			return true // Linear has a label beads doesn't
 		}
 	}
-	for n := range localSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range localLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !remoteSet[n] {
+		if !remoteLower[k] {
 			return true // beads has a label Linear doesn't
 		}
 	}
