@@ -903,6 +903,46 @@ func TestNormalizeLinearMarkdown(t *testing.T) {
 			in:   "",
 			want: "",
 		},
+		{
+			name: "escaped quotes stripped",
+			in:   `Set the \"YOU CONTROL\" label to keep card height stable`,
+			want: `Set the "YOU CONTROL" label to keep card height stable`,
+		},
+		{
+			name: "numbered-list digit-width padding stripped",
+			in:   "Steps:\n 1. First\n 2. Second\n10. Tenth",
+			want: "Steps:\n1. First\n2. Second\n10. Tenth",
+		},
+		{
+			name: "continuation paragraph indent stripped",
+			in:   "* item one (does X)\n  Known limitation (documented in spec)",
+			want: "* item one (does X)\nKnown limitation (documented in spec)",
+		},
+		{
+			name: "nested bullet indent preserved",
+			in:   "* outer\n  * inner one\n  * inner two",
+			want: "* outer\n  * inner one\n  * inner two",
+		},
+		{
+			name: "4+ space indent preserved (potential code block)",
+			in:   "Example:\n    code line one\n    code line two",
+			want: "Example:\n    code line one\n    code line two",
+		},
+		{
+			name: "nested dash bullet preserved through bullet+indent",
+			in:   "* outer\n  - inner",
+			want: "* outer\n  * inner",
+		},
+		{
+			name: "nested ordered list (3-space indent) preserved",
+			in:   "1. outer\n   1. inner one\n   2. inner two",
+			want: "1. outer\n   1. inner one\n   2. inner two",
+		},
+		{
+			name: "nested ordered list (2-space indent) preserved",
+			in:   "1. outer\n  1. inner",
+			want: "1. outer\n  1. inner",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -922,6 +962,11 @@ func TestNormalizeLinearMarkdownIdempotent(t *testing.T) {
 		"[https://x.com](<https://x.com>)",
 		"|---|---|\n|x|y|",
 		"a\n\n\nb",
+		`\"quoted\"`,
+		" 1. first\n 2. second",
+		"* outer\n  * inner",
+		"* item\n  continuation paragraph",
+		"1. outer\n   1. inner",
 	}
 	for _, in := range inputs {
 		once := NormalizeLinearMarkdown(in)

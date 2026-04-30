@@ -16,10 +16,10 @@ import (
 // that only differs in rendering-equivalent markdown syntax.
 var (
 	// Backslash escapes before punctuation Linear's editor emits verbatim
-	// (e.g. `1\. WiFi`, `\~880`, `\[5,5,5\]`). Strip escape to match
-	// human-authored form. Includes `[` and `]` because Linear escapes
-	// brackets in plain text to disambiguate markdown links.
-	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]` + "`" + `])`)
+	// (e.g. `1\. WiFi`, `\~880`, `\[5,5,5\]`, `\"x\"`). Strip escape to match
+	// human-authored form. Includes `[`/`]` (bracket disambiguation) and `"`
+	// (Linear round-trips quotes through JSON-encoded ProseMirror state).
+	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]"` + "`" + `])`)
 	// Bold marker style: `__text__` and `**text**` render identically; Linear
 	// canonicalizes to `**text**`. Match local's underscore form and rewrite.
 	// Inner content excludes underscores and newlines so this doesn't munge
@@ -27,6 +27,21 @@ var (
 	reMarkdownBoldUnderscore = regexp.MustCompile(`__([^_\n]+?)__`)
 	// Bullet marker at line start: normalize `- ` / `+ ` to `* ` (Linear's form).
 	reMarkdownBullet = regexp.MustCompile(`(?m)^(\s*)[-+] `)
+	// Leading whitespace Linear inserts on round-trip but the bead lacks.
+	// Two narrow rules to avoid flattening intentionally-nested lists:
+	//
+	// reLeadingDigitPad strips exactly ONE leading space before a digit —
+	// Linear's digit-width padding for numbered lists (` 1. foo` aligned
+	// with `10. bar`). Nested ordered lists conventionally use 2+ space
+	// indents, so requiring exactly 1 protects them.
+	//
+	// reLeadingIndent strips 1-3 leading spaces/tabs before non-list,
+	// non-digit characters — Linear's continuation-paragraph indent after
+	// list items. 4+ spaces preserved (potential indented code block).
+	// Bullet markers (`-`, `+`, `*`) and digits excluded so nested lists
+	// keep their semantic indentation.
+	reLeadingDigitPad = regexp.MustCompile(`(?m)^ (\d)`)
+	reLeadingIndent   = regexp.MustCompile(`(?m)^[ \t]{1,3}([^ \t\-+*0-9\n])`)
 	// GFM table separator: collapse any run of dashes within a cell to `---`
 	// so widths don't churn on every sync.
 	reMarkdownTableSep = regexp.MustCompile(`\|\s*:?-{2,}:?\s*`)
@@ -51,6 +66,8 @@ func NormalizeLinearMarkdown(s string) string {
 	s = reMarkdownEscape.ReplaceAllString(s, "$1")
 	s = reMarkdownBoldUnderscore.ReplaceAllString(s, "**$1**")
 	s = reMarkdownBullet.ReplaceAllString(s, "$1* ")
+	s = reLeadingDigitPad.ReplaceAllString(s, "$1")
+	s = reLeadingIndent.ReplaceAllString(s, "$1")
 	s = reMarkdownTableSep.ReplaceAllString(s, "| --- ")
 	s = reTableCellPad.ReplaceAllString(s, "| ")
 	s = reTableCellPadEnd.ReplaceAllString(s, " |")
