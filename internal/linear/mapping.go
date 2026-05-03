@@ -353,27 +353,40 @@ func PriorityToLinear(beadsPriority int, config *MappingConfig) int {
 	return 3 // Default to Medium
 }
 
-// StateToBeadsStatus maps Linear state type to Beads status.
-// Checks both state type (backlog, unstarted, etc.) and state name for custom workflows.
-// Uses configurable mapping from linear.state_map.* config.
+// StateToBeadsStatus maps a Linear state to a Beads status.
+//
+// Resolution order (most specific → least):
+//  1. Explicit name match — if the user has set `linear.state_map.<state-name>`,
+//     that wins. This lets a Linear state literally named "Deferred" map to
+//     `deferred` even though Linear's backlog state type defaults to `open`.
+//     Only ExplicitStateMap entries (user-configured) win here; defaults are
+//     intentionally excluded so they can't shadow type-level mappings.
+//  2. Type match — fall back to the state's Linear category type (backlog,
+//     unstarted, started, completed, canceled) using StateMap, which combines
+//     defaults + explicit. Preserves prior behavior for teams without explicit
+//     name mappings.
+//  3. Default — StatusOpen.
+//
+// Pull direction only. Push uses ResolveStateIDForBeadsStatus which is
+// already explicit-only.
 func StateToBeadsStatus(state *State, config *MappingConfig) types.Status {
 	if state == nil {
 		return types.StatusOpen
 	}
 
-	// First, try to match by state type (preferred)
+	// 1. Explicit user-configured name match wins (e.g. linear.state_map.deferred = deferred).
+	stateName := strings.ToLower(state.Name)
+	if statusStr, ok := config.ExplicitStateMap[stateName]; ok {
+		return ParseBeadsStatus(statusStr)
+	}
+
+	// 2. Type fallback (defaults + explicit type entries).
 	stateType := strings.ToLower(state.Type)
 	if statusStr, ok := config.StateMap[stateType]; ok {
 		return ParseBeadsStatus(statusStr)
 	}
 
-	// Then try to match by state name (for custom workflow states)
-	stateName := strings.ToLower(state.Name)
-	if statusStr, ok := config.StateMap[stateName]; ok {
-		return ParseBeadsStatus(statusStr)
-	}
-
-	// Default fallback
+	// 3. Default.
 	return types.StatusOpen
 }
 
@@ -606,6 +619,8 @@ func ParseBeadsStatus(s string) types.Status {
 		return types.StatusInProgress
 	case "blocked":
 		return types.StatusBlocked
+	case "deferred":
+		return types.StatusDeferred
 	case "closed":
 		return types.StatusClosed
 	default:
@@ -623,6 +638,8 @@ func StatusToLinearStateType(status types.Status) string {
 		return "started"
 	case types.StatusBlocked:
 		return "started" // Linear doesn't have blocked state type
+	case types.StatusDeferred:
+		return "backlog" // Deferred lives in Linear's backlog category
 	case types.StatusClosed:
 		return "completed"
 	default:

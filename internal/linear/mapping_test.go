@@ -265,6 +265,8 @@ func TestParseBeadsStatus(t *testing.T) {
 		{"in-progress", types.StatusInProgress},
 		{"inprogress", types.StatusInProgress},
 		{"blocked", types.StatusBlocked},
+		{"deferred", types.StatusDeferred},
+		{"DEFERRED", types.StatusDeferred},
 		{"closed", types.StatusClosed},
 		{"CLOSED", types.StatusClosed},
 		{"unknown", types.StatusOpen}, // Default
@@ -278,6 +280,16 @@ func TestParseBeadsStatus(t *testing.T) {
 	}
 }
 
+// TestParseBeadsStatus_Deferred is a focused regression test for the round
+// of fixes that landed `deferred` round-trippable through ParseBeadsStatus
+// (A1 of the bd-47l plan). Adjacent code already accepted the StatusDeferred
+// constant; this just confirms the string-form parser accepts it too.
+func TestParseBeadsStatus_Deferred(t *testing.T) {
+	if got := ParseBeadsStatus("deferred"); got != types.StatusDeferred {
+		t.Errorf("ParseBeadsStatus(\"deferred\") = %v, want StatusDeferred", got)
+	}
+}
+
 func TestStatusToLinearStateType(t *testing.T) {
 	tests := []struct {
 		status types.Status
@@ -286,6 +298,7 @@ func TestStatusToLinearStateType(t *testing.T) {
 		{types.StatusOpen, "unstarted"},
 		{types.StatusInProgress, "started"},
 		{types.StatusBlocked, "started"},
+		{types.StatusDeferred, "backlog"}, // A2: deferred maps to Linear's backlog category
 		{types.StatusClosed, "completed"},
 		{types.Status("unknown"), "unstarted"}, // Unknown -> default
 	}
@@ -295,6 +308,38 @@ func TestStatusToLinearStateType(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("StatusToLinearStateType(%v) = %q, want %q", tt.status, got, tt.want)
 		}
+	}
+}
+
+// TestStateToBeadsStatus_ExplicitNameWinsOverTypeFallback verifies the A3
+// precedence inversion: when the user has explicitly mapped a Linear state
+// name (e.g., `linear.state_map.deferred = deferred`), that mapping wins
+// over the default type-based fallback (`backlog → open`).
+//
+// The test also exercises the regression case (a) from the plan: a team
+// with NO explicit name mapping still gets the old type-only behavior.
+func TestStateToBeadsStatus_ExplicitNameWinsOverTypeFallback(t *testing.T) {
+	deferredState := &State{Type: "backlog", Name: "Deferred"}
+
+	// Case (a) — no explicit name mapping. Should fall back to type → open.
+	configWithoutExplicit := DefaultMappingConfig()
+	if got := StateToBeadsStatus(deferredState, configWithoutExplicit); got != types.StatusOpen {
+		t.Errorf("no explicit map: got %v, want StatusOpen (type-fallback for backlog)", got)
+	}
+
+	// Case (b) — explicit name mapping wins.
+	configWithExplicit := DefaultMappingConfig()
+	configWithExplicit.StateMap["deferred"] = "deferred"
+	configWithExplicit.ExplicitStateMap["deferred"] = "deferred"
+	if got := StateToBeadsStatus(deferredState, configWithExplicit); got != types.StatusDeferred {
+		t.Errorf("explicit map: got %v, want StatusDeferred (name-match wins over type-fallback)", got)
+	}
+
+	// Bonus: no regression on the other 5 default state types when the
+	// explicit map only covers `deferred`. Spot-check started → in_progress.
+	startedState := &State{Type: "started", Name: "In Progress"}
+	if got := StateToBeadsStatus(startedState, configWithExplicit); got != types.StatusInProgress {
+		t.Errorf("started type-fallback: got %v, want StatusInProgress", got)
 	}
 }
 
