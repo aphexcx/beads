@@ -611,6 +611,12 @@ func ResolveStateIDForIssue(cache *StateCache, issue *types.Issue, config *Mappi
 }
 
 // ParseBeadsStatus converts a status string to types.Status.
+//
+// Covers every value defined in types.go's Status enum (open, in_progress,
+// blocked, deferred, closed, pinned, hooked) so callers that need to reason
+// about user-supplied status strings — including the pre-flight push validator
+// — can correctly classify all valid statuses. Unknown strings still default
+// to StatusOpen for backward compatibility.
 func ParseBeadsStatus(s string) types.Status {
 	switch strings.ToLower(s) {
 	case "open":
@@ -621,6 +627,10 @@ func ParseBeadsStatus(s string) types.Status {
 		return types.StatusBlocked
 	case "deferred":
 		return types.StatusDeferred
+	case "pinned":
+		return types.StatusPinned
+	case "hooked":
+		return types.StatusHooked
 	case "closed":
 		return types.StatusClosed
 	default:

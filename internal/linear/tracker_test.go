@@ -258,89 +258,133 @@ func TestRemoteStatusMatchesLocal(t *testing.T) {
 	withExplicitDeferred.ExplicitStateMap["deferred"] = "deferred"
 
 	cases := []struct {
-		name        string
-		config      *MappingConfig
-		remote      *tracker.TrackerIssue
-		localStatus types.Status
-		want        bool
+		name   string
+		config *MappingConfig
+		remote *tracker.TrackerIssue
+		issue  *types.Issue
+		want   bool
 	}{
 		{
-			name:        "nil_remote",
-			config:      defaultConfig,
-			remote:      nil,
-			localStatus: types.StatusInProgress,
-			want:        false,
+			name:   "nil_remote",
+			config: defaultConfig,
+			remote: nil,
+			issue:  &types.Issue{Status: types.StatusInProgress},
+			want:   false,
 		},
 		{
-			name:        "nil_state_field",
-			config:      defaultConfig,
-			remote:      &tracker.TrackerIssue{State: nil},
-			localStatus: types.StatusInProgress,
-			want:        false,
+			name:   "nil_issue",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "started", Name: "In Progress"}},
+			issue:  nil,
+			want:   false,
 		},
 		{
-			name:        "wrong_state_type",
-			config:      defaultConfig,
-			remote:      &tracker.TrackerIssue{State: "not a *State"},
-			localStatus: types.StatusInProgress,
-			want:        false,
+			name:   "nil_state_field",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: nil},
+			issue:  &types.Issue{Status: types.StatusInProgress},
+			want:   false,
+		},
+		{
+			name:   "wrong_state_type",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: "not a *State"},
+			issue:  &types.Issue{Status: types.StatusInProgress},
+			want:   false,
 		},
 		{
 			// Mayor's hw-gxrq scenario: GitHub PR moves issue to "In Review",
 			// bead is still in_progress. Both map to in_progress through default
 			// config (started type → in_progress). Helper returns true → engine
 			// skips stateId → "In Review" preserved.
-			name:        "in_review_preserves_in_progress",
-			config:      defaultConfig,
-			remote:      &tracker.TrackerIssue{State: &State{Type: "started", Name: "In Review"}},
-			localStatus: types.StatusInProgress,
-			want:        true,
+			name:   "in_review_preserves_in_progress",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "started", Name: "In Review"}},
+			issue:  &types.Issue{Status: types.StatusInProgress},
+			want:   true,
 		},
 		{
 			// Real transition: bead just got closed locally, Linear is still
 			// "In Progress". Helper returns false → engine pushes stateId.
-			name:        "closed_does_not_match_in_progress",
-			config:      defaultConfig,
-			remote:      &tracker.TrackerIssue{State: &State{Type: "started", Name: "In Progress"}},
-			localStatus: types.StatusClosed,
-			want:        false,
+			name:   "closed_does_not_match_in_progress",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "started", Name: "In Progress"}},
+			issue:  &types.Issue{Status: types.StatusClosed},
+			want:   false,
 		},
 		{
 			// Reverse: Linear marked done by GitHub merge automation, bead is
 			// still in_progress locally. Helper returns false → engine will
 			// push stateId for "In Progress" (the user's actual transition,
 			// e.g., a manual reopen) — preserves user intent.
-			name:        "done_does_not_match_in_progress",
-			config:      defaultConfig,
-			remote:      &tracker.TrackerIssue{State: &State{Type: "completed", Name: "Done"}},
-			localStatus: types.StatusInProgress,
-			want:        false,
+			name:   "done_does_not_match_in_progress",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "completed", Name: "Done"}},
+			issue:  &types.Issue{Status: types.StatusInProgress},
+			want:   false,
 		},
 		{
 			// With default config (no explicit name map), Linear "Deferred"
 			// state-typed-backlog falls back to type → open. Local status
 			// is deferred. They don't match → don't skip stateId.
-			name:        "default_config_no_explicit_deferred_map",
-			config:      defaultConfig,
-			remote:      &tracker.TrackerIssue{State: &State{Type: "backlog", Name: "Deferred"}},
-			localStatus: types.StatusDeferred,
-			want:        false,
+			name:   "default_config_no_explicit_deferred_map",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "backlog", Name: "Deferred"}},
+			issue:  &types.Issue{Status: types.StatusDeferred},
+			want:   false,
 		},
 		{
 			// With explicit name map, Linear "Deferred" pulls as deferred.
 			// Local status deferred. Match → skip stateId.
-			name:        "explicit_deferred_map_matches",
-			config:      withExplicitDeferred,
-			remote:      &tracker.TrackerIssue{State: &State{Type: "backlog", Name: "Deferred"}},
-			localStatus: types.StatusDeferred,
-			want:        true,
+			name:   "explicit_deferred_map_matches",
+			config: withExplicitDeferred,
+			remote: &tracker.TrackerIssue{State: &State{Type: "backlog", Name: "Deferred"}},
+			issue:  &types.Issue{Status: types.StatusDeferred},
+			want:   true,
+		},
+		{
+			// Closed-bead exception (regression for codex MAJOR #1):
+			// Both Linear "Done" (completed) and "Canceled" (canceled) map
+			// to the coarse Beads `closed`. A bead intending Done (no cancel
+			// close_reason) being pushed when remote is Canceled MUST push
+			// stateId — otherwise the cancel state silently sticks.
+			name:   "closed_done_intent_does_not_match_canceled_remote",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "canceled", Name: "Canceled"}},
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: ""},
+			want:   false,
+		},
+		{
+			// Reverse: bead intending Canceled (close_reason=stale:) being
+			// pushed when remote is Done MUST also push stateId.
+			name:   "closed_cancel_intent_does_not_match_done_remote",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "completed", Name: "Done"}},
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "stale: no activity"},
+			want:   false,
+		},
+		{
+			// Agreement: bead intending Done + remote Done → preserve.
+			name:   "closed_done_intent_matches_done_remote",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "completed", Name: "Done"}},
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: ""},
+			want:   true,
+		},
+		{
+			// Agreement: bead intending Canceled + remote Canceled → preserve.
+			name:   "closed_cancel_intent_matches_canceled_remote",
+			config: defaultConfig,
+			remote: &tracker.TrackerIssue{State: &State{Type: "canceled", Name: "Canceled"}},
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "duplicate"},
+			want:   true,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := &Tracker{config: tc.config}
-			got := tr.remoteStatusMatchesLocal(tc.remote, tc.localStatus)
+			got := tr.remoteStatusMatchesLocal(tc.remote, tc.issue)
 			if got != tc.want {
 				t.Errorf("remoteStatusMatchesLocal: got %v, want %v", got, tc.want)
 			}

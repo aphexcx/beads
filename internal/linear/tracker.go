@@ -321,7 +321,7 @@ func (t *Tracker) UpdateIssueWithRemote(ctx context.Context, externalID string, 
 	// Linear-owned states like "In Review" driven by GitHub PR automation.
 	// Falls through to the legacy explicit-resolve path when remote is nil
 	// or when its state genuinely differs from local.
-	if !t.remoteStatusMatchesLocal(remote, issue.Status) {
+	if !t.remoteStatusMatchesLocal(remote, issue) {
 		stateID, err := t.findStateIDForIssue(ctx, client, issue)
 		if err != nil {
 			return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
@@ -372,7 +372,9 @@ func (t *Tracker) UpdateIssueWithRemote(ctx context.Context, externalID string, 
 // than the generic "Would update".
 //
 // Mirrors the state-skip decision in UpdateIssueWithRemote: when remote's
-// mapped status equals local, state is preserved; otherwise it changes.
+// mapped status equals local AND (for closed beads) the close-reason
+// classification agrees with the remote state-type, state is preserved;
+// otherwise it changes.
 //
 // Does NOT call Linear's API — pure local computation against the already-
 // fetched remote.
@@ -383,7 +385,7 @@ func (t *Tracker) PreviewUpdate(_ context.Context, _ string, issue *types.Issue,
 		// dry-run accuracy.
 		return tracker.DryRunStateChange
 	}
-	if t.remoteStatusMatchesLocal(remote, issue.Status) {
+	if t.remoteStatusMatchesLocal(remote, issue) {
 		return tracker.DryRunStatePreserved
 	}
 	return tracker.DryRunStateChange
@@ -399,15 +401,35 @@ func (t *Tracker) PreviewUpdate(_ context.Context, _ string, issue *types.Issue,
 // Returns false when remote is nil, when remote.State isn't a *State (lossy
 // conversion path — shouldn't happen for Linear, but defensive), or when
 // the mapped status genuinely differs from local.
-func (t *Tracker) remoteStatusMatchesLocal(remote *tracker.TrackerIssue, localStatus types.Status) bool {
-	if remote == nil || remote.State == nil {
+//
+// Closed-bead exception: both Linear "Done" (type=completed) and "Canceled"
+// (type=canceled) map through StateToBeadsStatus to the coarse Beads
+// `closed`. To prevent silently bypassing a Done↔Canceled transition driven
+// by close_reason, this helper additionally requires that the remote state's
+// type agree with what the local close_reason would route to. Mirrors the
+// same check in PushFieldsEqual (mapping.go:633+).
+func (t *Tracker) remoteStatusMatchesLocal(remote *tracker.TrackerIssue, issue *types.Issue) bool {
+	if remote == nil || remote.State == nil || issue == nil {
 		return false
 	}
 	state, ok := remote.State.(*State)
 	if !ok || state == nil {
 		return false
 	}
-	return StateToBeadsStatus(state, t.config) == localStatus
+	if StateToBeadsStatus(state, t.config) != issue.Status {
+		return false
+	}
+	// For closed beads, require close-reason agreement with the remote
+	// state-type so Done↔Canceled transitions still push stateId even
+	// though both terminal states map to the same coarse Beads status.
+	if issue.Status == types.StatusClosed {
+		localIsCanceled := ClassifyCloseReason(issue.CloseReason) == CloseIntentCanceled
+		remoteIsCanceled := strings.EqualFold(strings.TrimSpace(state.Type), "canceled")
+		if localIsCanceled != remoteIsCanceled {
+			return false
+		}
+	}
+	return true
 }
 
 // reconcileAndBuildLabelUpdate fetches fresh Linear labels (or reuses the

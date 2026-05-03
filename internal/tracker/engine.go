@@ -962,7 +962,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 						// Should usually be filtered by ContentEqual upstream,
 						// but if we reach here, the tracker's own preview says
 						// nothing would happen.
-						label = "Would skip (no diff per tracker)"
+						label = "Would skip (no diff)"
 					}
 				}
 				e.msg("[dry-run] %s in %s: %s — %s", label, e.Tracker.DisplayName(), issue.ID, ui.SanitizeForTerminal(issue.Title))
