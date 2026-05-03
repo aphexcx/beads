@@ -2,7 +2,9 @@ package linear
 
 import (
 	"context"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/tracker"
@@ -246,3 +248,411 @@ func TestLinearToTrackerIssue(t *testing.T) {
 		t.Error("Raw should reference original linear.Issue")
 	}
 }
+
+// TestRemoteStatusMatchesLocal covers the helper that lets UpdateIssueWithRemote
+// decide whether to skip stateId in the GraphQL update. Pure logic — no network.
+func TestRemoteStatusMatchesLocal(t *testing.T) {
+	defaultConfig := DefaultMappingConfig()
+	withExplicitDeferred := DefaultMappingConfig()
+	withExplicitDeferred.StateMap["deferred"] = "deferred"
+	withExplicitDeferred.ExplicitStateMap["deferred"] = "deferred"
+
+	cases := []struct {
+		name        string
+		config      *MappingConfig
+		remote      *tracker.TrackerIssue
+		localStatus types.Status
+		want        bool
+	}{
+		{
+			name:        "nil_remote",
+			config:      defaultConfig,
+			remote:      nil,
+			localStatus: types.StatusInProgress,
+			want:        false,
+		},
+		{
+			name:        "nil_state_field",
+			config:      defaultConfig,
+			remote:      &tracker.TrackerIssue{State: nil},
+			localStatus: types.StatusInProgress,
+			want:        false,
+		},
+		{
+			name:        "wrong_state_type",
+			config:      defaultConfig,
+			remote:      &tracker.TrackerIssue{State: "not a *State"},
+			localStatus: types.StatusInProgress,
+			want:        false,
+		},
+		{
+			// Mayor's hw-gxrq scenario: GitHub PR moves issue to "In Review",
+			// bead is still in_progress. Both map to in_progress through default
+			// config (started type → in_progress). Helper returns true → engine
+			// skips stateId → "In Review" preserved.
+			name:        "in_review_preserves_in_progress",
+			config:      defaultConfig,
+			remote:      &tracker.TrackerIssue{State: &State{Type: "started", Name: "In Review"}},
+			localStatus: types.StatusInProgress,
+			want:        true,
+		},
+		{
+			// Real transition: bead just got closed locally, Linear is still
+			// "In Progress". Helper returns false → engine pushes stateId.
+			name:        "closed_does_not_match_in_progress",
+			config:      defaultConfig,
+			remote:      &tracker.TrackerIssue{State: &State{Type: "started", Name: "In Progress"}},
+			localStatus: types.StatusClosed,
+			want:        false,
+		},
+		{
+			// Reverse: Linear marked done by GitHub merge automation, bead is
+			// still in_progress locally. Helper returns false → engine will
+			// push stateId for "In Progress" (the user's actual transition,
+			// e.g., a manual reopen) — preserves user intent.
+			name:        "done_does_not_match_in_progress",
+			config:      defaultConfig,
+			remote:      &tracker.TrackerIssue{State: &State{Type: "completed", Name: "Done"}},
+			localStatus: types.StatusInProgress,
+			want:        false,
+		},
+		{
+			// With default config (no explicit name map), Linear "Deferred"
+			// state-typed-backlog falls back to type → open. Local status
+			// is deferred. They don't match → don't skip stateId.
+			name:        "default_config_no_explicit_deferred_map",
+			config:      defaultConfig,
+			remote:      &tracker.TrackerIssue{State: &State{Type: "backlog", Name: "Deferred"}},
+			localStatus: types.StatusDeferred,
+			want:        false,
+		},
+		{
+			// With explicit name map, Linear "Deferred" pulls as deferred.
+			// Local status deferred. Match → skip stateId.
+			name:        "explicit_deferred_map_matches",
+			config:      withExplicitDeferred,
+			remote:      &tracker.TrackerIssue{State: &State{Type: "backlog", Name: "Deferred"}},
+			localStatus: types.StatusDeferred,
+			want:        true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &Tracker{config: tc.config}
+			got := tr.remoteStatusMatchesLocal(tc.remote, tc.localStatus)
+			if got != tc.want {
+				t.Errorf("remoteStatusMatchesLocal: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestUpdateIssueWithRemote_PreservesInReviewOnTitleEdit verifies that when
+// the remote's mapped status matches the local bead's status, the GraphQL
+// update payload omits stateId — so Linear's "In Review" survives a metadata
+// edit even though bead's status is still in_progress.
+func TestUpdateIssueWithRemote_PreservesInReviewOnTitleEdit(t *testing.T) {
+	var captured []string
+	server := mockGraphQLServer(t, func(req string) string {
+		captured = append(captured, req)
+		if strings.Contains(req, "issueUpdate") {
+			return `{"issueUpdate":{"success":true,"issue":{"id":"L-1","identifier":"TEST-1","title":"new title"}}}`
+		}
+		return `{}`
+	})
+	defer server.Close()
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{"team-1": NewClient("key", "team-1").WithEndpoint(server.URL)},
+		config:  DefaultMappingConfig(),
+	}
+
+	// Remote is "In Review" (started type → in_progress); bead is in_progress.
+	// They match → skip stateId.
+	remote := &tracker.TrackerIssue{
+		State: &State{Type: "started", Name: "In Review"},
+		Raw:   &Issue{ID: "L-1", Identifier: "TEST-1"},
+	}
+	issue := &types.Issue{
+		ID:     "bd-1",
+		Title:  "new title",
+		Status: types.StatusInProgress,
+	}
+
+	if _, err := tr.UpdateIssueWithRemote(context.Background(), "TEST-1", issue, remote); err != nil {
+		t.Fatalf("UpdateIssueWithRemote: %v", err)
+	}
+
+	var updateReq string
+	for _, r := range captured {
+		if strings.Contains(r, "issueUpdate") {
+			updateReq = r
+			break
+		}
+	}
+	if updateReq == "" {
+		t.Fatal("no issueUpdate request captured")
+	}
+	if strings.Contains(updateReq, "stateId") {
+		t.Errorf("expected NO stateId in payload (state preserved), got: %s", updateReq)
+	}
+	// Sanity: title should be in the payload (the actual change being pushed).
+	if !strings.Contains(updateReq, "new title") {
+		t.Errorf("expected title in payload, got: %s", updateReq)
+	}
+}
+
+// TestUpdateIssueWithRemote_PushesStateOnRealTransition verifies that when
+// the remote's mapped status does NOT match the local bead's status, the
+// GraphQL update includes stateId — so a real transition (e.g., user closed
+// the bead locally) propagates to Linear.
+func TestUpdateIssueWithRemote_PushesStateOnRealTransition(t *testing.T) {
+	var captured []string
+	server := mockGraphQLServer(t, func(req string) string {
+		captured = append(captured, req)
+		// findStateIDForIssue calls BuildStateCache which queries TeamStates.
+		if strings.Contains(req, "team(id:") || strings.Contains(req, "states") {
+			return `{"team":{"id":"team-1","states":{"nodes":[
+				{"id":"state-done","name":"Done","type":"completed"},
+				{"id":"state-canceled","name":"Canceled","type":"canceled"}
+			]}}}`
+		}
+		if strings.Contains(req, "issueUpdate") {
+			return `{"issueUpdate":{"success":true,"issue":{"id":"L-1","identifier":"TEST-1"}}}`
+		}
+		return `{}`
+	})
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap["done"] = "closed" // resolve closed → "Done" by name
+	cfg.StateMap["done"] = "closed"
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{"team-1": NewClient("key", "team-1").WithEndpoint(server.URL)},
+		config:  cfg,
+	}
+
+	// Remote is "In Progress"; bead just got closed locally. They differ →
+	// engine should push stateId.
+	remote := &tracker.TrackerIssue{
+		State: &State{Type: "started", Name: "In Progress"},
+		Raw:   &Issue{ID: "L-1", Identifier: "TEST-1"},
+	}
+	issue := &types.Issue{
+		ID:     "bd-1",
+		Title:  "shipped",
+		Status: types.StatusClosed,
+	}
+
+	if _, err := tr.UpdateIssueWithRemote(context.Background(), "TEST-1", issue, remote); err != nil {
+		t.Fatalf("UpdateIssueWithRemote: %v", err)
+	}
+
+	var updateReq string
+	for _, r := range captured {
+		if strings.Contains(r, "issueUpdate") {
+			updateReq = r
+			break
+		}
+	}
+	if updateReq == "" {
+		t.Fatal("no issueUpdate request captured")
+	}
+	if !strings.Contains(updateReq, "stateId") {
+		t.Errorf("expected stateId in payload (real transition), got: %s", updateReq)
+	}
+}
+
+// TestUpdateIssueWithRemote_NilRemote_FallsBack verifies that when no remote
+// is provided (callers without a fresh fetch), the behavior matches the
+// legacy UpdateIssue — stateId is always resolved and included.
+func TestUpdateIssueWithRemote_NilRemote_FallsBack(t *testing.T) {
+	var captured []string
+	server := mockGraphQLServer(t, func(req string) string {
+		captured = append(captured, req)
+		if strings.Contains(req, "team(id:") || strings.Contains(req, "states") {
+			return `{"team":{"id":"team-1","states":{"nodes":[
+				{"id":"state-progress","name":"In Progress","type":"started"}
+			]}}}`
+		}
+		if strings.Contains(req, "issueUpdate") {
+			return `{"issueUpdate":{"success":true,"issue":{"id":"L-1","identifier":"TEST-1"}}}`
+		}
+		return `{}`
+	})
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap["in progress"] = "in_progress"
+	cfg.StateMap["in progress"] = "in_progress"
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{"team-1": NewClient("key", "team-1").WithEndpoint(server.URL)},
+		config:  cfg,
+	}
+
+	issue := &types.Issue{
+		ID:     "bd-1",
+		Title:  "x",
+		Status: types.StatusInProgress,
+	}
+
+	// remote == nil → must NOT skip stateId.
+	if _, err := tr.UpdateIssueWithRemote(context.Background(), "TEST-1", issue, nil); err != nil {
+		t.Fatalf("UpdateIssueWithRemote: %v", err)
+	}
+
+	var updateReq string
+	for _, r := range captured {
+		if strings.Contains(r, "issueUpdate") {
+			updateReq = r
+			break
+		}
+	}
+	if updateReq == "" {
+		t.Fatal("no issueUpdate request captured")
+	}
+	if !strings.Contains(updateReq, "stateId") {
+		t.Errorf("nil remote: expected stateId in payload (legacy behavior), got: %s", updateReq)
+	}
+}
+
+// TestValidatePushStateMappings_FailsOnMissingDeferredState verifies that
+// when the rig config explicitly maps `linear.state_map.deferred = deferred`
+// but the Linear team has no state named "Deferred" (and no backlog-type
+// state to match by type), validation fails with a clear error before any
+// push runs. This is the "Phase 2 deployed before Phase 1" guard.
+func TestValidatePushStateMappings_FailsOnMissingDeferredState(t *testing.T) {
+	server := mockGraphQLServer(t, func(req string) string {
+		// Team workflow query — no Deferred state, no backlog type.
+		if strings.Contains(req, "team(id:") || strings.Contains(req, "states") {
+			return `{"team":{"id":"team-1","states":{"nodes":[
+				{"id":"state-todo","name":"Todo","type":"unstarted"},
+				{"id":"state-progress","name":"In Progress","type":"started"},
+				{"id":"state-done","name":"Done","type":"completed"}
+			]}}}`
+		}
+		return `{}`
+	})
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	// Explicitly map the standard 4 + deferred. Validator must check deferred too.
+	for k, v := range map[string]string{
+		"todo":        "open",
+		"in progress": "in_progress",
+		"done":        "closed",
+		"deferred":    "deferred",
+	} {
+		cfg.StateMap[k] = v
+		cfg.ExplicitStateMap[k] = v
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{"team-1": NewClient("key", "team-1").WithEndpoint(server.URL)},
+		config:  cfg,
+	}
+
+	err := tr.ValidatePushStateMappings(context.Background())
+	if err == nil {
+		t.Fatal("expected validation to fail (no Deferred state on team), got nil")
+	}
+	if !strings.Contains(err.Error(), "deferred") {
+		t.Errorf("expected error to mention 'deferred', got: %v", err)
+	}
+}
+
+// TestValidatePushStateMappings_PassesWhenDeferredStateExists is the success
+// counterpart — verifies the new validator branch doesn't false-fail when
+// the Linear team DOES have a matching state.
+func TestValidatePushStateMappings_PassesWhenDeferredStateExists(t *testing.T) {
+	server := mockGraphQLServer(t, func(req string) string {
+		if strings.Contains(req, "team(id:") || strings.Contains(req, "states") {
+			return `{"team":{"id":"team-1","states":{"nodes":[
+				{"id":"state-deferred","name":"Deferred","type":"backlog"},
+				{"id":"state-todo","name":"Todo","type":"unstarted"},
+				{"id":"state-progress","name":"In Progress","type":"started"},
+				{"id":"state-done","name":"Done","type":"completed"}
+			]}}}`
+		}
+		return `{}`
+	})
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	for k, v := range map[string]string{
+		"todo":        "open",
+		"in progress": "in_progress",
+		"done":        "closed",
+		"deferred":    "deferred",
+	} {
+		cfg.StateMap[k] = v
+		cfg.ExplicitStateMap[k] = v
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{"team-1": NewClient("key", "team-1").WithEndpoint(server.URL)},
+		config:  cfg,
+	}
+
+	if err := tr.ValidatePushStateMappings(context.Background()); err != nil {
+		t.Errorf("expected validation to pass when Deferred state exists, got: %v", err)
+	}
+}
+
+// TestPreviewUpdate exercises the DryRunPreviewer implementation —
+// dry-run categorization that mirrors UpdateIssueWithRemote's state-skip
+// decision. Pure local computation; no network.
+func TestPreviewUpdate(t *testing.T) {
+	tr := &Tracker{config: DefaultMappingConfig()}
+
+	cases := []struct {
+		name        string
+		remote      *tracker.TrackerIssue
+		localStatus types.Status
+		want        tracker.DryRunDecision
+	}{
+		{
+			name:        "nil_remote_treated_as_state_change",
+			remote:      nil,
+			localStatus: types.StatusInProgress,
+			want:        tracker.DryRunStateChange,
+		},
+		{
+			name: "in_review_remote_in_progress_local_state_preserved",
+			remote: &tracker.TrackerIssue{
+				State: &State{Type: "started", Name: "In Review"},
+			},
+			localStatus: types.StatusInProgress,
+			want:        tracker.DryRunStatePreserved,
+		},
+		{
+			name: "real_transition_state_change",
+			remote: &tracker.TrackerIssue{
+				State: &State{Type: "started", Name: "In Progress"},
+			},
+			localStatus: types.StatusClosed,
+			want:        tracker.DryRunStateChange,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			issue := &types.Issue{Status: tc.localStatus}
+			got := tr.PreviewUpdate(context.Background(), "TEST-1", issue, tc.remote)
+			if got != tc.want {
+				t.Errorf("PreviewUpdate: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// keep linker happy if httptest is otherwise unused
+var _ = httptest.NewServer

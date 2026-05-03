@@ -65,6 +65,48 @@ type BatchPushTracker interface {
 	BatchPush(ctx context.Context, issues []*types.Issue, forceIDs map[string]bool) (*BatchPushResult, error)
 }
 
+// RemoteAwareUpdater is an optional capability. Trackers that implement it
+// receive the already-fetched remote payload so they can decide which fields
+// are safe to omit from the update — e.g., preserving states owned by external
+// automation (Linear's "In Review" driven by a GitHub PR integration).
+//
+// The engine type-asserts this interface and prefers it over the base
+// UpdateIssue when both the tracker implements it AND a remote payload is
+// available. When remote is nil (rare — happens only if the engine couldn't
+// fetch), implementations should fall back to the same logic as UpdateIssue.
+type RemoteAwareUpdater interface {
+	UpdateIssueWithRemote(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue) (*TrackerIssue, error)
+}
+
+// DryRunDecision categorizes what UpdateIssueWithRemote would do without
+// actually issuing the API call. Used by the engine's dry-run path to print
+// accurate "Would push X" labels rather than the generic "Would update".
+type DryRunDecision int
+
+const (
+	// DryRunUnknown means the tracker doesn't have a strong opinion — engine
+	// should fall back to the generic "Would update" label.
+	DryRunUnknown DryRunDecision = iota
+	// DryRunStateChange means the update will mutate the remote's state field.
+	DryRunStateChange
+	// DryRunStatePreserved means non-state fields will be pushed but the
+	// remote's state will be left intact (e.g., Linear's "In Review" preserved
+	// while title/description/labels update).
+	DryRunStatePreserved
+	// DryRunNoDiff means the update would be a no-op. Should rarely surface
+	// since the engine's ContentEqual check usually filters these earlier.
+	DryRunNoDiff
+)
+
+// DryRunPreviewer is an optional capability paired with RemoteAwareUpdater.
+// Trackers that implement it can categorize what an UpdateIssueWithRemote
+// call would do, so dry-run output reflects the same decisions wet-run would
+// make — including the new "state preserved" path that RemoteAwareUpdater
+// enables.
+type DryRunPreviewer interface {
+	PreviewUpdate(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue) DryRunDecision
+}
+
 // BatchPushDryRunner is an optional capability for trackers that can preview
 // batch push decisions without mutating the remote system.
 type BatchPushDryRunner interface {

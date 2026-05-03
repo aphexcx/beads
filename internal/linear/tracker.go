@@ -281,7 +281,34 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 // reflecting only beads-side mutations. When push runs after pull in the same
 // sync cycle, push's later snapshot write replaces pull's — they don't conflict
 // because they cover the same set of labels with consistent IDs.
+// UpdateIssue is the standard tracker.IssueTracker entry point. Delegates to
+// UpdateIssueWithRemote with no pre-fetched remote — the implementation will
+// fall back to fetching what it needs (or pushing stateId unconditionally
+// when no remote is available).
+//
+// Engines that fetch the remote upfront should prefer UpdateIssueWithRemote
+// (via the RemoteAwareUpdater capability) so this tracker can preserve
+// remote-owned states like "In Review" driven by Linear's GitHub PR
+// automation.
 func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *types.Issue) (*tracker.TrackerIssue, error) {
+	return t.UpdateIssueWithRemote(ctx, externalID, issue, nil)
+}
+
+// UpdateIssueWithRemote is the RemoteAwareUpdater entry point. When `remote`
+// is non-nil and its mapped status matches the local bead's status, the
+// stateId field is omitted from the GraphQL update — preserving the Linear
+// state exactly as it is on the remote (e.g., "In Review" set by a GitHub
+// PR opening). This stops bd from collapsing automation-owned states into
+// the bead's coarser status when only metadata fields (title, description,
+// priority, labels) actually changed.
+//
+// When `remote` is nil, the legacy behavior is preserved: stateId is always
+// resolved and pushed. This is the conservative default for paths that
+// don't have a fresh remote on hand.
+//
+// The caller's pre-fetched remote is also threaded into the label-sync
+// reconciler, avoiding a second round-trip when label sync is enabled.
+func (t *Tracker) UpdateIssueWithRemote(ctx context.Context, externalID string, issue *types.Issue, remote *tracker.TrackerIssue) (*tracker.TrackerIssue, error) {
 	client := t.clientForExternalID(ctx, externalID)
 	if client == nil {
 		return nil, fmt.Errorf("cannot determine Linear team for issue %s", externalID)
@@ -290,21 +317,26 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	mapper := t.FieldMapper()
 	updates := mapper.IssueToTracker(issue)
 
-	// Resolve and include state so status changes are pushed to Linear.
-	// Uses the issue-aware resolver so close_reason distinguishes
-	// Done vs. Canceled for closed beads.
-	stateID, err := t.findStateIDForIssue(ctx, client, issue)
-	if err != nil {
-		return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
-	}
-	if stateID != "" {
-		updates["stateId"] = stateID
+	// Skip stateId when the remote already maps to local status — preserves
+	// Linear-owned states like "In Review" driven by GitHub PR automation.
+	// Falls through to the legacy explicit-resolve path when remote is nil
+	// or when its state genuinely differs from local.
+	if !t.remoteStatusMatchesLocal(remote, issue.Status) {
+		stateID, err := t.findStateIDForIssue(ctx, client, issue)
+		if err != nil {
+			return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
+		}
+		if stateID != "" {
+			updates["stateId"] = stateID
+		}
 	}
 
 	// Label sync (decision #12: independent path, runs even when other fields are equal).
+	// Threads the engine's pre-fetched remote into reconcileAndBuildLabelUpdate
+	// to avoid a second FetchIssueByIdentifier round-trip.
 	var snapshotToWrite []storage.LinearLabelSnapshotEntry
 	if t.labelSyncEnabled {
-		ids, snap, err := t.reconcileAndBuildLabelUpdate(ctx, client, externalID, issue)
+		ids, snap, err := t.reconcileAndBuildLabelUpdate(ctx, client, externalID, issue, remote)
 		if err != nil {
 			return nil, err
 		}
@@ -334,28 +366,82 @@ func (t *Tracker) UpdateIssue(ctx context.Context, externalID string, issue *typ
 	return &ti, nil
 }
 
-// reconcileAndBuildLabelUpdate fetches fresh Linear labels, runs the reconciler,
-// resolves new label IDs (with auto-create), deduplicates, and returns the
-// labelIds slice to send to Linear AND the snapshot rows to persist after a
-// successful push. Caller is responsible for actually persisting after push.
+// PreviewUpdate implements tracker.DryRunPreviewer. Returns the categorization
+// of what UpdateIssueWithRemote would do, so the engine's dry-run path prints
+// accurate output (distinguishing "state preserved" from "state change") rather
+// than the generic "Would update".
+//
+// Mirrors the state-skip decision in UpdateIssueWithRemote: when remote's
+// mapped status equals local, state is preserved; otherwise it changes.
+//
+// Does NOT call Linear's API — pure local computation against the already-
+// fetched remote.
+func (t *Tracker) PreviewUpdate(_ context.Context, _ string, issue *types.Issue, remote *tracker.TrackerIssue) tracker.DryRunDecision {
+	if remote == nil {
+		// Engine couldn't fetch — UpdateIssueWithRemote will fall through to
+		// legacy behavior (always push stateId). Treat as a state change for
+		// dry-run accuracy.
+		return tracker.DryRunStateChange
+	}
+	if t.remoteStatusMatchesLocal(remote, issue.Status) {
+		return tracker.DryRunStatePreserved
+	}
+	return tracker.DryRunStateChange
+}
+
+// remoteStatusMatchesLocal returns true when the remote Linear state, after
+// being mapped through the tracker's state config, matches the local beads
+// status. Lets UpdateIssueWithRemote skip pushing stateId when the remote
+// already represents the same logical status — preserving Linear-owned
+// states like "In Review" (driven by GitHub PR automation) when local
+// metadata changes don't actually transition the issue.
+//
+// Returns false when remote is nil, when remote.State isn't a *State (lossy
+// conversion path — shouldn't happen for Linear, but defensive), or when
+// the mapped status genuinely differs from local.
+func (t *Tracker) remoteStatusMatchesLocal(remote *tracker.TrackerIssue, localStatus types.Status) bool {
+	if remote == nil || remote.State == nil {
+		return false
+	}
+	state, ok := remote.State.(*State)
+	if !ok || state == nil {
+		return false
+	}
+	return StateToBeadsStatus(state, t.config) == localStatus
+}
+
+// reconcileAndBuildLabelUpdate fetches fresh Linear labels (or reuses the
+// engine's pre-fetched remote when available), runs the reconciler, resolves
+// new label IDs (with auto-create), deduplicates, and returns the labelIds
+// slice to send to Linear AND the snapshot rows to persist after a successful
+// push. Caller is responsible for actually persisting after push.
 //
 // Returns (nil, nil, nil) when label sync is disabled (caller should not call
 // in that case, but defensive fallthrough is harmless).
+//
+// V1 behavior: if no pre-fetched remote is available AND FetchIssueByIdentifier
+// fails (rate limit, network, missing issue), the entire UpdateIssue aborts —
+// including non-label fields like status/title/description. We can't safely
+// send labelIds without knowing the current Linear state. Future: degrade to
+// "push other fields, skip labels, reconcile labels next sync" when the fetch
+// fails for transient reasons.
 func (t *Tracker) reconcileAndBuildLabelUpdate(
-	ctx context.Context, client *Client, externalID string, issue *types.Issue,
+	ctx context.Context, client *Client, externalID string, issue *types.Issue, prefetched *tracker.TrackerIssue,
 ) (labelIDs []string, snapshotToWrite []storage.LinearLabelSnapshotEntry, err error) {
-	// Fetch current Linear labels for this issue so the reconciler has fresh state.
-	// Note: the engine already fetched the issue once for ContentEqual; this is an
-	// extra round-trip. Acceptable for v1.
-	//
-	// V1 behavior: if FetchIssueByIdentifier fails (rate limit, network, missing
-	// issue), the entire UpdateIssue aborts — including non-label fields like
-	// status/title/description. We can't safely send labelIds without knowing the
-	// current Linear state. Future: degrade to "push other fields, skip labels,
-	// reconcile labels next sync" when the fetch fails for transient reasons.
-	fresh, err := client.FetchIssueByIdentifier(ctx, externalID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("fetch for label reconciliation: %w", err)
+	// Prefer the engine's pre-fetched remote (raw type-asserted) to avoid an
+	// extra API round-trip. Falls back to fetching when the engine didn't
+	// provide one or the type assertion fails.
+	var fresh *Issue
+	if prefetched != nil {
+		if linearIssue, ok := prefetched.Raw.(*Issue); ok && linearIssue != nil {
+			fresh = linearIssue
+		}
+	}
+	if fresh == nil {
+		fresh, err = client.FetchIssueByIdentifier(ctx, externalID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("fetch for label reconciliation: %w", err)
+		}
 	}
 	if fresh == nil {
 		return nil, nil, fmt.Errorf("label reconcile: issue %s not found in Linear", externalID)
@@ -483,10 +569,45 @@ func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {
 
 // ValidatePushStateMappings ensures push has explicit, non-ambiguous status
 // mappings for every configured team before any mutation occurs.
+//
+// Validates two sets of statuses:
+//  1. The core 4 (Open, InProgress, Blocked, Closed) — always checked, since
+//     beads can produce any of these and push needs to know how to translate.
+//  2. Every status referenced as a value in ExplicitStateMap — catches the
+//     "Phase 2 deployed before Phase 1" failure mode where the rig config
+//     references a Linear state name that doesn't exist on the team yet
+//     (e.g., `linear.state_map.deferred = deferred` set before the team
+//     gained a "Deferred" state). One clean validation error beats per-issue
+//     push failures spread across a sync run.
+//
+// Blocked exception: missing-state errors for blocked are allowed when blocked
+// is NOT explicitly mapped (legacy behavior — blocked issues fail at push time
+// instead). When the user has opted in via `linear.state_map.blocked`, the
+// exception lifts and validation is strict.
 func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 	if t.config == nil || len(t.config.ExplicitStateMap) == 0 {
 		return fmt.Errorf("%s", missingExplicitStateMapMessage)
 	}
+
+	// Compute the set of statuses to validate: core 4 ∪ every status referenced
+	// as an explicit-map value.
+	explicitlyMapped := make(map[types.Status]bool)
+	for _, value := range t.config.ExplicitStateMap {
+		explicitlyMapped[ParseBeadsStatus(value)] = true
+	}
+	statusesToCheck := []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked, types.StatusClosed}
+	core := map[types.Status]bool{
+		types.StatusOpen:       true,
+		types.StatusInProgress: true,
+		types.StatusBlocked:    true,
+		types.StatusClosed:     true,
+	}
+	for s := range explicitlyMapped {
+		if !core[s] {
+			statusesToCheck = append(statusesToCheck, s)
+		}
+	}
+
 	for _, teamID := range t.teamIDs {
 		client := t.clients[teamID]
 		if client == nil {
@@ -496,9 +617,10 @@ func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("fetching workflow states for team %s: %w", teamID, err)
 		}
-		for _, status := range []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked, types.StatusClosed} {
+		for _, status := range statusesToCheck {
 			var resolveErr error
-			if status == types.StatusClosed {
+			switch {
+			case status == types.StatusClosed:
 				// Closed uses close_reason-aware routing at push time, not
 				// state_map. Validate both terminal paths (completed + canceled)
 				// resolve to a state — a team missing a Done-type or
@@ -510,14 +632,22 @@ func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 				} else if _, err := ResolveStateIDForIssue(cache, synthCancel, t.config); err != nil {
 					resolveErr = err
 				}
-			} else {
+			case explicitlyMapped[status] && !core[status]:
+				// Strict: the user opted into mapping a non-core status (e.g.,
+				// linear.state_map.deferred = deferred). Require a direct state
+				// match — NO canonical fallback. Catches Phase-2-before-Phase-1
+				// rig migrations where the rig config references a Linear state
+				// that doesn't exist on the team yet.
+				_, resolveErr = resolveStateIDExact(cache, status, t.config)
+			default:
 				_, resolveErr = ResolveStateIDForBeadsStatus(cache, status, t.config)
 			}
 			if resolveErr != nil {
-				// Only fail for statuses the config explicitly tries to map or when
-				// mappings are entirely absent. Missing blocked mappings are allowed
-				// until a blocked issue is actually pushed.
-				if status == types.StatusBlocked && strings.Contains(resolveErr.Error(), "has no configured Linear state") {
+				// Blocked exception: missing-state allowed when blocked is NOT
+				// explicitly mapped. With explicit opt-in via linear.state_map.blocked,
+				// fail loudly here instead of waiting for the first blocked-issue push.
+				if status == types.StatusBlocked && !explicitlyMapped[status] &&
+					strings.Contains(resolveErr.Error(), "has no configured Linear state") {
 					continue
 				}
 				return resolveErr

@@ -914,25 +914,58 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 
 			// Check if update is needed
 			var fetchedExt *TrackerIssue
-			if !forceIDs[issue.ID] {
+			// Force-pushed issues normally skip the remote fetch (the user has
+			// already decided to overwrite). But when the tracker implements
+			// RemoteAwareUpdater, we still want the remote payload so the
+			// implementation can preserve remote-owned state (e.g., Linear's
+			// "In Review" driven by GitHub PR automation). One extra API call
+			// per forced issue, bounded by conflict count — not amplified for
+			// bulk syncs.
+			_, trackerIsRemoteAware := e.Tracker.(RemoteAwareUpdater)
+			fetchForForce := forceIDs[issue.ID] && trackerIsRemoteAware
+			if !forceIDs[issue.ID] || fetchForForce {
 				extIssue, err := e.Tracker.FetchIssue(ctx, extID)
 				if err == nil && extIssue != nil {
 					fetchedExt = extIssue
-					// ContentEqual hook: content-hash dedup to skip unnecessary API calls
-					if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
-						if e.PushHooks.ContentEqual(issue, extIssue) {
-							stats.Skipped++
+					// ContentEqual hook: content-hash dedup to skip unnecessary API calls.
+					// Only applied on the non-forced path — a forced push intentionally
+					// bypasses content equality.
+					if !forceIDs[issue.ID] {
+						if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
+							if e.PushHooks.ContentEqual(issue, extIssue) {
+								stats.Skipped++
+								continue
+							}
+						} else if !extIssue.UpdatedAt.Before(issue.UpdatedAt) {
+							stats.Skipped++ // Default: external is same or newer
 							continue
 						}
-					} else if !extIssue.UpdatedAt.Before(issue.UpdatedAt) {
-						stats.Skipped++ // Default: external is same or newer
-						continue
 					}
 				}
 			}
 
 			if opts.DryRun {
-				e.msg("[dry-run] Would update in %s: %s — %s", e.Tracker.DisplayName(), issue.ID, ui.SanitizeForTerminal(issue.Title))
+				// Categorize what wet-run would do — distinguishes "state
+				// preserved" (Linear's "In Review" survives a metadata edit
+				// because the bead's status maps to the remote's current state)
+				// from "state change" (real status transition). Falls back to
+				// generic "Would update" for trackers that don't implement
+				// DryRunPreviewer or when no remote was fetched.
+				label := "Would update"
+				if dp, ok := e.Tracker.(DryRunPreviewer); ok && fetchedExt != nil {
+					switch dp.PreviewUpdate(ctx, extID, pushIssue, fetchedExt) {
+					case DryRunStatePreserved:
+						label = "Would push field change (state preserved)"
+					case DryRunStateChange:
+						label = "Would push state change"
+					case DryRunNoDiff:
+						// Should usually be filtered by ContentEqual upstream,
+						// but if we reach here, the tracker's own preview says
+						// nothing would happen.
+						label = "Would skip (no diff per tracker)"
+					}
+				}
+				e.msg("[dry-run] %s in %s: %s — %s", label, e.Tracker.DisplayName(), issue.ID, ui.SanitizeForTerminal(issue.Title))
 				if opts.VerboseDiff && e.PushHooks != nil && e.PushHooks.DescribeDiff != nil && fetchedExt != nil {
 					for _, d := range e.PushHooks.DescribeDiff(issue, fetchedExt) {
 						e.msg("    · %s", d)
@@ -942,8 +975,16 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				continue
 			}
 
-			if _, err := e.Tracker.UpdateIssue(ctx, extID, pushIssue); err != nil {
-				e.warn("Failed to update %s in %s: %v", issue.ID, e.Tracker.DisplayName(), err)
+			// Prefer RemoteAwareUpdater when available — passes the fetched remote
+			// so the tracker can preserve remote-owned state.
+			var updateErr error
+			if rau, ok := e.Tracker.(RemoteAwareUpdater); ok {
+				_, updateErr = rau.UpdateIssueWithRemote(ctx, extID, pushIssue, fetchedExt)
+			} else {
+				_, updateErr = e.Tracker.UpdateIssue(ctx, extID, pushIssue)
+			}
+			if updateErr != nil {
+				e.warn("Failed to update %s in %s: %v", issue.ID, e.Tracker.DisplayName(), updateErr)
 				stats.Errors++
 				continue
 			}
