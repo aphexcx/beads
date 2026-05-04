@@ -861,6 +861,9 @@ func patchTestHooksForLabelSync(ctx context.Context, lt *linear.Tracker, push *t
 }
 
 // hasLabelDeltaTest mirrors hasLabelDelta from cmd/bd/linear.go — push direction only.
+// On LoadSnapshot error, falls through with nil snap (matches production behavior:
+// the reconciler's first-sync synthesis treats nil as "use intersection" which
+// produces no false delta when label sets agree).
 func hasLabelDeltaTest(ctx context.Context, lt *linear.Tracker, local *types.Issue, remoteIssue *linear.Issue) bool {
 	linearLabels := make([]linear.LinearLabel, 0)
 	if remoteIssue.Labels != nil {
@@ -868,10 +871,7 @@ func hasLabelDeltaTest(ctx context.Context, lt *linear.Tracker, local *types.Iss
 			linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
 		}
 	}
-	snap, err := lt.LoadSnapshot(ctx, local.ID)
-	if err != nil {
-		return true
-	}
+	snap, _ := lt.LoadSnapshot(ctx, local.ID)
 	res := linear.ReconcileLabels(linear.LabelReconcileInput{
 		Beads: local.Labels, Linear: linearLabels, Snapshot: snap, Exclude: lt.LabelExclude(),
 	})

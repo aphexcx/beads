@@ -456,3 +456,66 @@ func TestReconcileLabels_CaseMismatchTreatedAsAgreement(t *testing.T) {
 		t.Errorf("NewSnapshot: got %+v, want [{Bug, L1}]", res.NewSnapshot)
 	}
 }
+
+// TestReconcileLabels_NilSnapAgreementProducesNoPushDelta is the regression
+// for bd-joz: when local labels and Linear labels agree by name (any case),
+// passing a nil snapshot must not produce push-direction deltas
+// (AddToLinear / RemoveFromLinear). Without this property, hasLabelDelta
+// returning true on snapshot-load failure would cause a spurious push loop
+// because DescribeDiff (which ignores the same error) computes the agreement
+// correctly and emits no diff lines.
+func TestReconcileLabels_NilSnapAgreementProducesNoPushDelta(t *testing.T) {
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"houdini", "m20", "teleop"},
+		Linear:   []LinearLabel{{Name: "houdini", ID: "L1"}, {Name: "m20", ID: "L2"}, {Name: "teleop", ID: "L3"}},
+		Snapshot: nil,
+	})
+	if len(res.AddToLinear) != 0 || len(res.RemoveFromLinear) != 0 {
+		t.Errorf("agreement with nil snap must produce no push deltas, got AddToLinear=%v RemoveFromLinear=%v",
+			res.AddToLinear, res.RemoveFromLinear)
+	}
+	if len(res.AddToBeads) != 0 || len(res.RemoveFromBeads) != 0 {
+		t.Errorf("agreement with nil snap must produce no pull deltas, got AddToBeads=%v RemoveFromBeads=%v",
+			res.AddToBeads, res.RemoveFromBeads)
+	}
+}
+
+// TestReconcileLabels_NilSnapBeadOnlyStillEmitsPush locks in that hasLabelDelta's
+// fall-through-on-error behavior still detects a real push need: if a bead has a
+// label Linear doesn't, AddToLinear must fire even with nil snap.
+func TestReconcileLabels_NilSnapBeadOnlyStillEmitsPush(t *testing.T) {
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"shared", "bead-only"},
+		Linear:   []LinearLabel{{Name: "shared", ID: "L1"}},
+		Snapshot: nil,
+	})
+	if !reflect.DeepEqual(sortedNames(res.AddToLinear), []string{"bead-only"}) {
+		t.Errorf("AddToLinear: got %v, want [bead-only]", res.AddToLinear)
+	}
+	if len(res.RemoveFromLinear) != 0 || len(res.RemoveFromBeads) != 0 {
+		t.Errorf("no removes expected with nil snap, got removeLinear=%v removeBeads=%v",
+			res.RemoveFromLinear, res.RemoveFromBeads)
+	}
+}
+
+// TestReconcileLabels_NilSnapLinearOnlyEmitsPullOnly verifies the symmetric
+// case: a label only on Linear surfaces as AddToBeads (pull direction) but
+// NOT RemoveFromLinear or AddToLinear. With nil snap, the reconciler can't
+// distinguish "bead deleted it" from "bead never had it", so it conservatively
+// pulls rather than pushes a destructive remove. This is the documented
+// limitation of first-sync synthesis on transient snap errors — accepted as
+// the tradeoff vs the spurious push loop bd-joz fixed.
+func TestReconcileLabels_NilSnapLinearOnlyEmitsPullOnly(t *testing.T) {
+	res := ReconcileLabels(LabelReconcileInput{
+		Beads:    []string{"shared"},
+		Linear:   []LinearLabel{{Name: "shared", ID: "L1"}, {Name: "linear-only", ID: "L2"}},
+		Snapshot: nil,
+	})
+	if !reflect.DeepEqual(sortedNames(res.AddToBeads), []string{"linear-only"}) {
+		t.Errorf("AddToBeads: got %v, want [linear-only]", res.AddToBeads)
+	}
+	if len(res.AddToLinear) != 0 || len(res.RemoveFromLinear) != 0 {
+		t.Errorf("no push deltas expected with nil snap, got AddToLinear=%v RemoveFromLinear=%v",
+			res.AddToLinear, res.RemoveFromLinear)
+	}
+}

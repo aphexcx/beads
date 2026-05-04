@@ -562,7 +562,10 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 						linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
 					}
 				}
-				snap, _ := lt.LoadSnapshot(ctx, local.ID)
+				snap, snapErr := lt.LoadSnapshot(ctx, local.ID)
+				if snapErr != nil {
+					debug.Logf("DescribeDiff: LoadSnapshot(%s) failed: %v — proceeding with nil snap", local.ID, snapErr)
+				}
 				res := linear.ReconcileLabels(linear.LabelReconcileInput{
 					Beads:    local.Labels,
 					Linear:   linearLabels,
@@ -1139,8 +1142,13 @@ func getLinearHashLength(ctx context.Context) int {
 // current state (a wasted API call) just because the bead is missing labels
 // Linear has.
 //
-// Fail-safe: if the snapshot read errors, return true to force a push;
-// worse to silently swallow a label change than to issue a no-op mutation.
+// On LoadSnapshot error: log loudly and fall through with a nil snap rather
+// than short-circuiting to true. The reconciler's first-sync synthesis treats
+// nil snap as "use intersection of beads and Linear" — labels that genuinely
+// agree produce no delta, and labels that disagree still surface as adds.
+// Returning true here would force a push that DescribeDiff (which ignores
+// the same error) would then describe as having no diff — a UX inconsistency
+// that masks the true cause and produces no-op API calls in a loop.
 func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, remoteIssue *linear.Issue) bool {
 	linearLabels := make([]linear.LinearLabel, 0)
 	if remoteIssue.Labels != nil {
@@ -1150,7 +1158,7 @@ func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, 
 	}
 	snap, err := lt.LoadSnapshot(ctx, local.ID)
 	if err != nil {
-		return true
+		debug.Logf("hasLabelDelta: LoadSnapshot(%s) failed: %v — proceeding with nil snap", local.ID, err)
 	}
 	res := linear.ReconcileLabels(linear.LabelReconcileInput{
 		Beads:    local.Labels,
