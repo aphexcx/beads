@@ -928,8 +928,6 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				if err == nil && extIssue != nil {
 					fetchedExt = extIssue
 					// ContentEqual hook: content-hash dedup to skip unnecessary API calls.
-					// Only applied on the non-forced path — a forced push intentionally
-					// bypasses content equality.
 					if !forceIDs[issue.ID] {
 						if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
 							if e.PushHooks.ContentEqual(issue, extIssue) {
@@ -938,6 +936,22 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 							}
 						} else if !extIssue.UpdatedAt.Before(issue.UpdatedAt) {
 							stats.Skipped++ // Default: external is same or newer
+							continue
+						}
+					} else if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
+						// Forced path: the conflict resolver flagged this bead as
+						// "local newer" based on timestamps, but timestamps drift
+						// (a status bulk-update bumps UpdatedAt without changing
+						// any field Linear would store). When we have the fetched
+						// remote AND ContentEqual reports they're truly equal,
+						// skip the no-op push so the wet-run doesn't spam the
+						// tracker with unchanged-payload mutations and the dry-
+						// run doesn't print "Would push field change" with no
+						// surfacing diff. Only runs when fetchForForce is true
+						// (i.e., RemoteAwareUpdater trackers); other forced paths
+						// preserve the existing intentional-overwrite semantics.
+						if e.PushHooks.ContentEqual(issue, extIssue) {
+							stats.Skipped++
 							continue
 						}
 					}
