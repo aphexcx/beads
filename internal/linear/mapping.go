@@ -17,9 +17,18 @@ import (
 var (
 	// Backslash escapes before punctuation Linear's editor emits verbatim
 	// (e.g. `1\. WiFi`, `\~880`, `\[5,5,5\]`, `\"x\"`). Strip escape to match
-	// human-authored form. Includes `[`/`]` (bracket disambiguation) and `"`
-	// (Linear round-trips quotes through JSON-encoded ProseMirror state).
-	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]"` + "`" + `])`)
+	// human-authored form.
+	//
+	// Character class covers every GFM-significant char Linear's renderer is
+	// observed to emit-escaped on round-trip: `.`, `-`, `*`, `_`, `~` (struck),
+	// `[`/`]` (link disambiguation), `(`/`)` (link disambiguation), `<`/`>`
+	// (autolink/HTML), `"` (Linear round-trips quotes through JSON-encoded
+	// ProseMirror state), backtick (inline code), `!` (image syntax), `+`
+	// (list marker), `#` (heading), `=` (heading underline), `|` (table cell),
+	// `{`/`}` (extension syntax). Errs on the side of including chars that are
+	// GFM-significant — adding a char to strip is always safe (the unescape
+	// canonicalizes both sides), but missing a char produces silent push loops.
+	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]()<>!+#=|{}"` + "`" + `])`)
 	// Bold marker style: `__text__` and `**text**` render identically; Linear
 	// canonicalizes to `**text**`. Match local's underscore form and rewrite.
 	// Inner content excludes underscores and newlines so this doesn't munge
@@ -56,13 +65,47 @@ var (
 	// `https://x` → `[https://x](<https://x>)`. Strip back to the bare URL
 	// for drift comparison.
 	reMarkdownAutoLink = regexp.MustCompile(`\[(https?://[^\]]+)\]\(<[^>]*>\)`)
+	// Linear wraps the URL portion of any markdown link in `<...>` when the
+	// URL contains characters that would otherwise need escaping (parens,
+	// spaces, etc.). `[text](<url>)` is semantically identical to
+	// `[text](url)` per CommonMark; collapse to the unwrapped form so a bead
+	// authored with the bare form doesn't drift against Linear's stored form.
+	// Applied AFTER reMarkdownAutoLink so the bare-URL collapse still wins
+	// for the `[url](<url>)` case. URL portion bounded to a single line so a
+	// pathological `>` later in the document can't extend the match.
+	reMarkdownLinkAngleURL = regexp.MustCompile(`\]\(<([^>\n]+)>\)`)
+	// Code-span shielding: fenced ```...``` blocks and inline `...` spans are
+	// extracted before normalization runs and restored after, so the escape
+	// stripper / bullet rewriter / etc. don't mangle content whose backslashes
+	// and markers are intentional. Order matters at apply time: fenced blocks
+	// must match first (they contain backticks).
+	reMarkdownFenced     = regexp.MustCompile("(?s)```.*?```")
+	reMarkdownInlineCode = regexp.MustCompile("`[^`\n]+`")
 )
 
 // NormalizeLinearMarkdown returns a form of s that collapses rendering-
 // equivalent markdown differences Linear's editor and our local authoring
 // produce. Used only for drift detection — does not mutate stored content.
+//
+// Code spans (fenced ```...``` and inline `...`) are shielded before the
+// transform passes run and restored after. Without this, the escape stripper
+// would unescape intentional backslashes inside code (e.g. `\(` inside a
+// regex example), causing drift detection to falsely treat a real edit as
+// a no-op when one side has the escape and the other doesn't.
 func NormalizeLinearMarkdown(s string) string {
+	const sentinelPrefix = "\x00BDCODE"
+	const sentinelSuffix = "\x00"
+	shielded := make([]string, 0, 8)
+	shield := func(m string) string {
+		idx := len(shielded)
+		shielded = append(shielded, m)
+		return fmt.Sprintf("%s%d%s", sentinelPrefix, idx, sentinelSuffix)
+	}
+	s = reMarkdownFenced.ReplaceAllStringFunc(s, shield)
+	s = reMarkdownInlineCode.ReplaceAllStringFunc(s, shield)
+
 	s = reMarkdownAutoLink.ReplaceAllString(s, "$1")
+	s = reMarkdownLinkAngleURL.ReplaceAllString(s, "]($1)")
 	s = reMarkdownEscape.ReplaceAllString(s, "$1")
 	s = reMarkdownBoldUnderscore.ReplaceAllString(s, "**$1**")
 	s = reMarkdownBullet.ReplaceAllString(s, "$1* ")
@@ -73,6 +116,10 @@ func NormalizeLinearMarkdown(s string) string {
 	s = reTableCellPadEnd.ReplaceAllString(s, " |")
 	s = reTrailingSpace.ReplaceAllString(s, "")
 	s = reNewlineRun.ReplaceAllString(s, "\n")
+
+	for i, original := range shielded {
+		s = strings.ReplaceAll(s, fmt.Sprintf("%s%d%s", sentinelPrefix, i, sentinelSuffix), original)
+	}
 	return strings.TrimSpace(s)
 }
 

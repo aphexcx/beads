@@ -1263,3 +1263,139 @@ func TestNormalizeLinearMarkdownBoldUnderscore(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeLinearMarkdownHwBwkaSample reproduces the exact drift sample
+// reported on the houmanoids_www rig (bd-joz): bd stores `-` bullets and bare
+// `~`, Linear stores `*` bullets and `\~`. After normalization, both forms
+// must compare equal so the dry-run push loop terminates.
+func TestNormalizeLinearMarkdownHwBwkaSample(t *testing.T) {
+	local := `- Send ModeCommand with action="motion_state" to switch robot from RL (17) → Stand (1)
+- Now Z/Roll/Pitch commands ...
+
+app/houdini/lib/robotCommunication/MovementController.ts — posture mode toggle lives here (~line 60-74).`
+
+	remote := `* Send ModeCommand with action="motion_state" to switch robot from RL (17) → Stand (1)
+* Now Z/Roll/Pitch commands ...
+
+app/houdini/lib/robotCommunication/MovementController.ts — posture mode toggle lives here (\~line 60-74).`
+
+	nl := NormalizeLinearMarkdown(local)
+	nr := NormalizeLinearMarkdown(remote)
+	if nl != nr {
+		t.Errorf("hw-bwka sample: normalizers diverged\nlocal-norm:  %q\nremote-norm: %q", nl, nr)
+	}
+}
+
+// TestNormalizeLinearMarkdownLinkAngleURL covers Linear's habit of wrapping
+// the URL portion of any markdown link in `<...>` (CommonMark allows it for
+// URLs that would otherwise need escaping). The bare form `[text](url)` and
+// the wrapped form `[text](<url>)` must normalize equally.
+func TestNormalizeLinearMarkdownLinkAngleURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		local  string
+		remote string
+	}{
+		{"plain link with custom text", "see [the doc](https://example.com)", "see [the doc](<https://example.com>)"},
+		{"link with parens in URL", "see [details](https://example.com/path(1))", "see [details](<https://example.com/path(1)>)"},
+		{"bare URL collapse still wins for [url](url)", "https://x.com", "[https://x.com](<https://x.com>)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nl := NormalizeLinearMarkdown(tt.local)
+			nr := NormalizeLinearMarkdown(tt.remote)
+			if nl != nr {
+				t.Errorf("local %q and remote %q diverged after normalize:\nlocal-norm:  %q\nremote-norm: %q", tt.local, tt.remote, nl, nr)
+			}
+		})
+	}
+}
+
+// TestNormalizeLinearMarkdownPreservesCodeSpans verifies that backslash
+// escapes and bullet markers inside code spans (inline `...` and fenced
+// ```...```) survive normalization untouched. Without code-span shielding,
+// the escape stripper would unescape intentional sequences inside code
+// (e.g. a regex example using `\(`), causing real edits to be misclassified
+// as no-op drift.
+func TestNormalizeLinearMarkdownPreservesCodeSpans(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "inline code preserves backslash escapes",
+			in:   "Use `\\(foo\\)` to match parens",
+			want: "Use `\\(foo\\)` to match parens",
+		},
+		{
+			name: "inline code preserves bullet-looking content",
+			in:   "Run `- item` first",
+			want: "Run `- item` first",
+		},
+		{
+			name: "fenced block preserves everything",
+			in:   "```\n- item\n\\(escaped\\)\n```",
+			want: "```\n- item\n\\(escaped\\)\n```",
+		},
+		{
+			name: "normalization runs around code spans",
+			in:   "- bullet\n`\\(code\\)`\n- next",
+			want: "* bullet\n`\\(code\\)`\n* next",
+		},
+		{
+			name: "multiple inline spans on one line",
+			in:   "`\\.a\\.` and `\\-b\\-`",
+			want: "`\\.a\\.` and `\\-b\\-`",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeLinearMarkdown(tt.in)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeLinearMarkdownEscapeCoverage locks in the broadened escape
+// regex character class. Each entry asserts that the escaped form (Linear's
+// round-trip) and the bare form (bead's authored form) normalize identically.
+// Adding a new entry here is the right way to extend escape coverage.
+func TestNormalizeLinearMarkdownEscapeCoverage(t *testing.T) {
+	pairs := []struct {
+		name   string
+		local  string
+		remote string
+	}{
+		{"period", `v1.0`, `v1\.0`},
+		{"hyphen", `a-b`, `a\-b`},
+		{"asterisk", `a*b`, `a\*b`},
+		{"underscore", `foo_bar`, `foo\_bar`},
+		{"tilde", `~80 chars`, `\~80 chars`},
+		{"open bracket", `see [here]`, `see \[here]`},
+		{"close bracket", `see [here]`, `see [here\]`},
+		{"open paren", `(call this)`, `\(call this)`},
+		{"close paren", `(call this)`, `(call this\)`},
+		{"angle open", `<x>`, `\<x>`},
+		{"angle close", `<x>`, `<x\>`},
+		{"bang", `!important`, `\!important`},
+		{"plus", `1 + 2`, `1 \+ 2`},
+		{"hash", `# heading`, `\# heading`},
+		{"equals", `key=value`, `key\=value`},
+		{"pipe", `a | b`, `a \| b`},
+		{"open brace", `{x}`, `\{x}`},
+		{"close brace", `{x}`, `{x\}`},
+		{"double quote", `"quoted"`, `\"quoted\"`},
+	}
+	for _, tt := range pairs {
+		t.Run(tt.name, func(t *testing.T) {
+			nl := NormalizeLinearMarkdown(tt.local)
+			nr := NormalizeLinearMarkdown(tt.remote)
+			if nl != nr {
+				t.Errorf("escape coverage %s diverged: local-norm=%q remote-norm=%q", tt.name, nl, nr)
+			}
+		})
+	}
+}
