@@ -87,22 +87,44 @@ var (
 // equivalent markdown differences Linear's editor and our local authoring
 // produce. Used only for drift detection — does not mutate stored content.
 //
-// Code spans (fenced ```...``` and inline `...`) are shielded before the
-// transform passes run and restored after. Without this, the escape stripper
-// would unescape intentional backslashes inside code (e.g. `\(` inside a
-// regex example), causing drift detection to falsely treat a real edit as
-// a no-op when one side has the escape and the other doesn't.
+// Code spans are shielded before the transform passes run so the bullet
+// rewriter and other line-level passes don't mangle code content. Restoration
+// behavior differs by span type:
+//
+//   - Fenced ```...``` blocks: restored verbatim. Inside a fenced block,
+//     escapes like `\(` are literal text (a backslash followed by a paren),
+//     not markdown escapes — stripping them would mask real edits.
+//   - Inline `...` spans: re-apply the escape stripper on restore. Per
+//     CommonMark, backslash escapes have no semantic effect inside an inline
+//     code span, but Linear's editor emits them anyway (e.g. “\[X\]“
+//     inside backticks for what bd authors as `[X]`). Without stripping,
+//     this drifts forever.
+//
+// Tradeoff for inline spans: a literal `\[` written inside an inline code
+// span to display a backslash-bracket sequence will be normalized to `[`
+// for drift purposes only (the source content is unchanged). Niche use case;
+// one false-no-op is preferable to a permanent drift loop on the common
+// case (any inline code span containing brackets/parens).
 func NormalizeLinearMarkdown(s string) string {
 	const sentinelPrefix = "\x00BDCODE"
 	const sentinelSuffix = "\x00"
 	shielded := make([]string, 0, 8)
-	shield := func(m string) string {
-		idx := len(shielded)
-		shielded = append(shielded, m)
-		return fmt.Sprintf("%s%d%s", sentinelPrefix, idx, sentinelSuffix)
+	stripEscapes := make([]bool, 0, 8)
+	shield := func(stripOnRestore bool) func(string) string {
+		return func(m string) string {
+			idx := len(shielded)
+			shielded = append(shielded, m)
+			stripEscapes = append(stripEscapes, stripOnRestore)
+			return fmt.Sprintf("%s%d%s", sentinelPrefix, idx, sentinelSuffix)
+		}
 	}
-	s = reMarkdownFenced.ReplaceAllStringFunc(s, shield)
-	s = reMarkdownInlineCode.ReplaceAllStringFunc(s, shield)
+	// Fenced blocks first (multi-backtick) so they aren't shredded by the
+	// inline pattern. Restored verbatim — escapes inside a fenced block are
+	// literal characters.
+	s = reMarkdownFenced.ReplaceAllStringFunc(s, shield(false))
+	// Inline spans: escapes are noise inside backticks per CommonMark; strip
+	// on restore so Linear's emit-form equates to bd's bare form.
+	s = reMarkdownInlineCode.ReplaceAllStringFunc(s, shield(true))
 
 	s = reMarkdownAutoLink.ReplaceAllString(s, "$1")
 	s = reMarkdownLinkAngleURL.ReplaceAllString(s, "]($1)")
@@ -118,7 +140,11 @@ func NormalizeLinearMarkdown(s string) string {
 	s = reNewlineRun.ReplaceAllString(s, "\n")
 
 	for i, original := range shielded {
-		s = strings.ReplaceAll(s, fmt.Sprintf("%s%d%s", sentinelPrefix, i, sentinelSuffix), original)
+		restored := original
+		if stripEscapes[i] {
+			restored = reMarkdownEscape.ReplaceAllString(original, "$1")
+		}
+		s = strings.ReplaceAll(s, fmt.Sprintf("%s%d%s", sentinelPrefix, i, sentinelSuffix), restored)
 	}
 	return strings.TrimSpace(s)
 }

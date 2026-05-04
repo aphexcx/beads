@@ -1311,22 +1311,30 @@ func TestNormalizeLinearMarkdownLinkAngleURL(t *testing.T) {
 	}
 }
 
-// TestNormalizeLinearMarkdownPreservesCodeSpans verifies that backslash
-// escapes and bullet markers inside code spans (inline `...` and fenced
-// ```...```) survive normalization untouched. Without code-span shielding,
-// the escape stripper would unescape intentional sequences inside code
-// (e.g. a regex example using `\(`), causing real edits to be misclassified
-// as no-op drift.
-func TestNormalizeLinearMarkdownPreservesCodeSpans(t *testing.T) {
+// TestNormalizeLinearMarkdownCodeSpanShielding verifies the bd-joz contract
+// for code spans:
+//
+//   - Line-level transforms (bullet rewriter, etc.) MUST NOT mangle code
+//     content. `- item` inside a code span stays as `- item`, not rewritten
+//     to `* item`.
+//   - Escape sequences INSIDE code spans get stripped on restore so Linear's
+//     emit-form (`\[X\]` inside backticks) and bd's bare form (`[X]`) equate.
+//     Per CommonMark, backslash before bracket has no semantic meaning inside
+//     a code span, but Linear's editor emits the escape anyway.
+//
+// The accepted tradeoff: a literal `\[` written inside a code span to display
+// a backslash-bracket sequence will be normalized to `[` for drift purposes.
+// Niche use case; one false-no-op is preferable to a permanent drift loop.
+func TestNormalizeLinearMarkdownCodeSpanShielding(t *testing.T) {
 	tests := []struct {
 		name string
 		in   string
 		want string
 	}{
 		{
-			name: "inline code preserves backslash escapes",
+			name: "inline code: backslash escapes equated to bare form",
 			in:   "Use `\\(foo\\)` to match parens",
-			want: "Use `\\(foo\\)` to match parens",
+			want: "Use `(foo)` to match parens",
 		},
 		{
 			name: "inline code preserves bullet-looking content",
@@ -1334,19 +1342,29 @@ func TestNormalizeLinearMarkdownPreservesCodeSpans(t *testing.T) {
 			want: "Run `- item` first",
 		},
 		{
-			name: "fenced block preserves everything",
+			name: "fenced block: escapes preserved verbatim (literal in code blocks)",
 			in:   "```\n- item\n\\(escaped\\)\n```",
 			want: "```\n- item\n\\(escaped\\)\n```",
 		},
 		{
-			name: "normalization runs around code spans",
+			name: "outer normalization runs around code spans",
 			in:   "- bullet\n`\\(code\\)`\n- next",
-			want: "* bullet\n`\\(code\\)`\n* next",
+			want: "* bullet\n`(code)`\n* next",
 		},
 		{
-			name: "multiple inline spans on one line",
+			name: "multiple inline spans: escapes stripped per span",
 			in:   "`\\.a\\.` and `\\-b\\-`",
-			want: "`\\.a\\.` and `\\-b\\-`",
+			want: "`.a.` and `-b-`",
+		},
+		{
+			name: "hw-1oxe sample: escaped brackets inside code span",
+			in:   "Result: synced (`[SimulationSync] Mission`)",
+			want: "Result: synced (`[SimulationSync] Mission`)",
+		},
+		{
+			name: "hw-1oxe sample remote form normalizes equally",
+			in:   "Result: synced (`\\[SimulationSync\\] Mission`)",
+			want: "Result: synced (`[SimulationSync] Mission`)",
 		},
 	}
 	for _, tt := range tests {
@@ -1356,6 +1374,22 @@ func TestNormalizeLinearMarkdownPreservesCodeSpans(t *testing.T) {
 				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestNormalizeLinearMarkdownHwOxeSample is the regression test for hw-1oxe
+// — the last residual after bd-joz #3. Local stores `[SimulationSync]`
+// inside a backtick-bounded code span; Linear stores `\[SimulationSync\]`
+// (Linear's editor adds a no-op escape inside the code span). After
+// normalization, both forms must produce identical output.
+func TestNormalizeLinearMarkdownHwOxeSample(t *testing.T) {
+	local := "Result: ... synced (`[SimulationSync] Mission ... robot-...`), ..."
+	remote := "Result: ... synced (`\\[SimulationSync\\] Mission ... robot-...`), ..."
+
+	nl := NormalizeLinearMarkdown(local)
+	nr := NormalizeLinearMarkdown(remote)
+	if nl != nr {
+		t.Errorf("hw-1oxe sample: normalizers diverged\nlocal-norm:  %q\nremote-norm: %q", nl, nr)
 	}
 }
 
