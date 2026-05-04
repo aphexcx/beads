@@ -1281,31 +1281,33 @@ func runPrepareCommitMsgHook(args []string) int {
 	if actor == "" {
 		return 0 // Not in agent context, nothing to add
 	}
-
-	// Read current message
-	content, err := os.ReadFile(msgFile) // #nosec G304 -- path from git
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not read commit message: %v\n", err)
+	// Reject newlines in actor to prevent trailer/message injection. argv
+	// passing already prevents shell injection, but a `\n` would create
+	// extra trailer lines or escape into the message body.
+	if strings.ContainsAny(actor, "\r\n") {
+		fmt.Fprintln(os.Stderr, "Warning: BD_ACTOR contains newline; refusing to add Executed-By trailer")
 		return 0
 	}
 
-	// Check if trailer already present (avoid duplicates on amend)
-	for _, line := range strings.Split(string(content), "\n") {
-		if strings.HasPrefix(line, "Executed-By:") {
-			return 0
-		}
-	}
-
-	// Append Executed-By trailer
-	msg := strings.TrimRight(string(content), "\n\r\t ")
-	var sb strings.Builder
-	sb.WriteString(msg)
-	sb.WriteString("\n\n")
-	sb.WriteString(fmt.Sprintf("Executed-By: %s\n", actor))
-
-	// Write back
-	if err := os.WriteFile(msgFile, []byte(sb.String()), 0600); err != nil { // Restrict permissions per gosec G306
-		fmt.Fprintf(os.Stderr, "Warning: could not write commit message: %v\n", err)
+	// Append Executed-By via `git interpret-trailers --in-place`. Three reasons:
+	//   1. Echoing the trailer after a blank line of our own would create a
+	//      separate one-line trailer block. `git interpret-trailers --parse`
+	//      only recognizes the FINAL contiguous block — any preceding trailers
+	//      (Codex-Reviewed-By, Co-Authored-By, Signed-off-by) become invisible
+	//      to CI gates that check via `--parse`.
+	//   2. `--if-exists=doNothing` is git's own dup-guard, more precise than
+	//      a line-prefix scan (which false-positives on body text that starts
+	//      with "Executed-By:" or false-negatives on `executed-by:`).
+	//   3. interpret-trailers handles placement rules correctly: appends into
+	//      the existing trailer block when present, starts a new one when not.
+	// #nosec G702 -- argv passing (no shell), actor is sanitized above to
+	// reject \r/\n which are the only chars that could create extra trailer
+	// lines; msgFile comes from git itself.
+	cmd := exec.Command("git", "interpret-trailers", "--in-place",
+		"--if-exists=doNothing",
+		"--trailer", fmt.Sprintf("Executed-By: %s", actor), msgFile)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: git interpret-trailers failed: %v: %s\n", err, strings.TrimSpace(string(out)))
 	}
 
 	return 0
