@@ -502,11 +502,15 @@ func runGitLabSync(cmd *cobra.Command, args []string) error {
 	// Output results
 	if !gitlabSyncDryRun {
 		if result.Stats.Pulled > 0 {
-			_, _ = fmt.Fprintf(out, "✓ Pulled %d issues (%d created, %d updated)\n",
-				result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+			_, _ = fmt.Fprintf(out, "✓ Pulled %d issues from GitLab (%d created, %d updated locally)\n",
+				result.Stats.Pulled, result.PullStats.Created, result.PullStats.Updated)
 		}
 		if result.Stats.Pushed > 0 {
-			_, _ = fmt.Fprintf(out, "✓ Pushed %d issues\n", result.Stats.Pushed)
+			_, _ = fmt.Fprintf(out, "✓ Pushed %d issues to GitLab (%d created, %d updated)\n",
+				result.Stats.Pushed, result.PushStats.Created, result.PushStats.Updated)
+		}
+		if result.Stats.Skipped > 0 {
+			_, _ = fmt.Fprintf(out, "  Skipped %d (no changes needed)\n", result.Stats.Skipped)
 		}
 		if result.Stats.Conflicts > 0 {
 			_, _ = fmt.Fprintf(out, "→ Resolved %d conflicts\n", result.Stats.Conflicts)

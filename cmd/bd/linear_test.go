@@ -203,20 +203,27 @@ func TestLinearStateToBeadsStatus(t *testing.T) {
 }
 
 func TestLinearStateToBeadsStatusCustomConfig(t *testing.T) {
-	// Test with custom state name mapping for custom workflow states
+	// Test with custom state name mapping for custom workflow states.
 	// Note: State names are converted to lowercase with spaces preserved
-	// So "In Review" -> "in review", "On Hold" -> "on hold"
+	// So "In Review" -> "in review", "On Hold" -> "on hold".
+	// Per the post-bd-47l A3 precedence change, name-keyed entries must live
+	// EXCLUSIVELY in ExplicitStateMap (user-configured); StateMap holds only
+	// type-keyed defaults. Putting custom names in StateMap too would create a
+	// false safety net — the test would still pass even if name lookup
+	// regressed to the legacy StateMap path.
 	config := &linear.MappingConfig{
 		StateMap: map[string]string{
-			"backlog":    "open",
-			"unstarted":  "open",
-			"started":    "in_progress",
-			"completed":  "closed",
-			"canceled":   "closed",
-			"in review":  "in_progress", // Custom state name (lowercase with space)
-			"on hold":    "blocked",     // Custom state name (lowercase with space)
-			"blocked":    "blocked",     // Custom state name
-			"validating": "in_progress", // Custom state name
+			"backlog":   "open",
+			"unstarted": "open",
+			"started":   "in_progress",
+			"completed": "closed",
+			"canceled":  "closed",
+		},
+		ExplicitStateMap: map[string]string{
+			"in review":  "in_progress",
+			"on hold":    "blocked",
+			"blocked":    "blocked",
+			"validating": "in_progress",
 		},
 	}
 
@@ -1777,5 +1784,35 @@ func TestIsValidUUID(t *testing.T) {
 				t.Errorf("isValidUUID(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLinearConfig_LabelSyncDefaults(t *testing.T) {
+	cfg := loadLinearLabelSyncConfig(map[string]string{})
+	if cfg.Enabled {
+		t.Errorf("Enabled: got true, want false (default)")
+	}
+	if len(cfg.Exclude) != 0 {
+		t.Errorf("Exclude: got %v, want empty", cfg.Exclude)
+	}
+	if cfg.CreateScope != linear.LabelScopeTeam {
+		t.Errorf("CreateScope: got %v, want team", cfg.CreateScope)
+	}
+}
+
+func TestLinearConfig_LabelSyncOverrides(t *testing.T) {
+	cfg := loadLinearLabelSyncConfig(map[string]string{
+		"linear.label_sync_enabled": "true",
+		"linear.label_sync_exclude": "bug, defect , Internal",
+		"linear.label_create_scope": "workspace",
+	})
+	if !cfg.Enabled {
+		t.Errorf("Enabled: got false, want true")
+	}
+	if !cfg.Exclude["bug"] || !cfg.Exclude["defect"] || !cfg.Exclude["internal"] {
+		t.Errorf("Exclude should contain bug, defect, internal (lowercased): got %v", cfg.Exclude)
+	}
+	if cfg.CreateScope != linear.LabelScopeWorkspace {
+		t.Errorf("CreateScope: got %v, want workspace", cfg.CreateScope)
 	}
 }

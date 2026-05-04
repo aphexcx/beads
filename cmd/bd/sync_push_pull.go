@@ -202,11 +202,15 @@ func outputSyncResult(result *tracker.SyncResult, dryRun bool) {
 		fmt.Println("Dry run mode - no changes will be made")
 	}
 	if result.Stats.Pulled > 0 {
-		fmt.Printf("✓ Pulled %d issues (%d created, %d updated)\n",
-			result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+		fmt.Printf("✓ Pulled %d issues (%d created, %d updated locally)\n",
+			result.Stats.Pulled, result.PullStats.Created, result.PullStats.Updated)
 	}
 	if result.Stats.Pushed > 0 {
-		fmt.Printf("✓ Pushed %d issues\n", result.Stats.Pushed)
+		fmt.Printf("✓ Pushed %d issues (%d created, %d updated)\n",
+			result.Stats.Pushed, result.PushStats.Created, result.PushStats.Updated)
+	}
+	if result.Stats.Skipped > 0 {
+		fmt.Printf("  Skipped %d (no changes needed)\n", result.Stats.Skipped)
 	}
 	if dryRun {
 		fmt.Println("\nRun without --dry-run to apply changes")
@@ -454,7 +458,7 @@ func runLinearPull(cmd *cobra.Command, args []string) {
 	engine := tracker.NewEngine(lt, store, actor)
 	engine.OnMessage = func(msg string) { fmt.Println("  " + msg) }
 	engine.OnWarning = func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
-	engine.PullHooks = buildLinearPullHooks(ctx)
+	engine.PullHooks = buildLinearPullHooks(ctx, lt)
 
 	result, err := engine.Sync(ctx, tracker.SyncOptions{
 		Pull:     true,

@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"context"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -64,6 +65,48 @@ type BatchPushTracker interface {
 	BatchPush(ctx context.Context, issues []*types.Issue, forceIDs map[string]bool) (*BatchPushResult, error)
 }
 
+// RemoteAwareUpdater is an optional capability. Trackers that implement it
+// receive the already-fetched remote payload so they can decide which fields
+// are safe to omit from the update — e.g., preserving states owned by external
+// automation (Linear's "In Review" driven by a GitHub PR integration).
+//
+// The engine type-asserts this interface and prefers it over the base
+// UpdateIssue when both the tracker implements it AND a remote payload is
+// available. When remote is nil (rare — happens only if the engine couldn't
+// fetch), implementations should fall back to the same logic as UpdateIssue.
+type RemoteAwareUpdater interface {
+	UpdateIssueWithRemote(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue) (*TrackerIssue, error)
+}
+
+// DryRunDecision categorizes what UpdateIssueWithRemote would do without
+// actually issuing the API call. Used by the engine's dry-run path to print
+// accurate "Would push X" labels rather than the generic "Would update".
+type DryRunDecision int
+
+const (
+	// DryRunUnknown means the tracker doesn't have a strong opinion — engine
+	// should fall back to the generic "Would update" label.
+	DryRunUnknown DryRunDecision = iota
+	// DryRunStateChange means the update will mutate the remote's state field.
+	DryRunStateChange
+	// DryRunStatePreserved means non-state fields will be pushed but the
+	// remote's state will be left intact (e.g., Linear's "In Review" preserved
+	// while title/description/labels update).
+	DryRunStatePreserved
+	// DryRunNoDiff means the update would be a no-op. Should rarely surface
+	// since the engine's ContentEqual check usually filters these earlier.
+	DryRunNoDiff
+)
+
+// DryRunPreviewer is an optional capability paired with RemoteAwareUpdater.
+// Trackers that implement it can categorize what an UpdateIssueWithRemote
+// call would do, so dry-run output reflects the same decisions wet-run would
+// make — including the new "state preserved" path that RemoteAwareUpdater
+// enables.
+type DryRunPreviewer interface {
+	PreviewUpdate(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue) DryRunDecision
+}
+
 // BatchPushDryRunner is an optional capability for trackers that can preview
 // batch push decisions without mutating the remote system.
 type BatchPushDryRunner interface {
@@ -104,4 +147,85 @@ type FieldMapper interface {
 	// IssueToTracker builds update fields from a beads issue for the external tracker.
 	// Returns a map of field names to values in the tracker's format.
 	IssueToTracker(issue *types.Issue) map[string]interface{}
+}
+
+// CommentSyncer is an optional interface that tracker adapters can implement
+// to enable bidirectional comment synchronization. The sync engine checks for
+// this interface via type assertion — trackers that don't implement it simply
+// skip comment sync.
+type CommentSyncer interface {
+	// FetchComments retrieves comments for an issue from the external tracker.
+	// Only comments created/updated after `since` are returned (zero time = all).
+	FetchComments(ctx context.Context, externalIssueID string, since time.Time) ([]TrackerComment, error)
+
+	// CreateComment creates a new comment on an issue in the external tracker.
+	// Returns the external ID of the created comment.
+	CreateComment(ctx context.Context, externalIssueID, body string) (string, error)
+}
+
+// AttachmentFetcher is an optional interface that tracker adapters can implement
+// to enable pulling attachment metadata from the external tracker. This is
+// pull-only — beads does not push attachments to external trackers.
+type AttachmentFetcher interface {
+	// FetchAttachments retrieves attachment metadata for an issue from the external tracker.
+	FetchAttachments(ctx context.Context, externalIssueID string) ([]TrackerAttachment, error)
+}
+
+// ProjectSyncer is an optional interface that tracker adapters can implement
+// to enable bidirectional epic-to-project synchronization. When implemented,
+// beads epics are synced as tracker projects (not issues), and the parent-child
+// hierarchy is preserved via sub-issue nesting.
+type ProjectSyncer interface {
+	// CreateProject creates a new project in the external tracker from a beads epic.
+	// Returns the project URL and project ID.
+	CreateProject(ctx context.Context, epic *types.Issue) (projectURL string, projectID string, err error)
+
+	// UpdateProject updates an existing project in the external tracker.
+	UpdateProject(ctx context.Context, projectID string, epic *types.Issue) error
+
+	// FetchProjects retrieves projects from the external tracker.
+	// state can be: "all", or tracker-specific states.
+	FetchProjects(ctx context.Context, state string) ([]TrackerProject, error)
+
+	// AssignIssueToProject assigns an issue to a project in the external tracker.
+	AssignIssueToProject(ctx context.Context, issueExternalID, projectID string) error
+
+	// SetIssueParent sets the parent issue for a sub-issue in the external tracker.
+	SetIssueParent(ctx context.Context, issueExternalID, parentExternalID string) error
+
+	// IsProjectRef checks if an external_ref string refers to a project (not an issue).
+	IsProjectRef(ref string) bool
+
+	// ExtractProjectID extracts the project ID from a project URL or returns the ID directly.
+	ExtractProjectID(ref string) string
+}
+
+// TrackerProject represents a project from an external tracker.
+type TrackerProject struct {
+	ID          string
+	Name        string
+	Description string
+	URL         string
+	State       string
+	UpdatedAt   time.Time
+}
+
+// TrackerComment represents a comment from an external tracker.
+type TrackerComment struct {
+	ID        string    // External tracker's comment ID
+	Body      string    // Comment text/body
+	Author    string    // Author name or email
+	CreatedAt time.Time // When the comment was created
+	UpdatedAt time.Time // When the comment was last updated
+}
+
+// TrackerAttachment represents attachment metadata from an external tracker.
+type TrackerAttachment struct {
+	ID        string    // External tracker's attachment ID
+	Filename  string    // Original filename
+	URL       string    // Download or reference URL
+	MimeType  string    // MIME type (e.g., "image/png")
+	SizeBytes int64     // File size in bytes
+	Creator   string    // Who created/uploaded the attachment
+	CreatedAt time.Time // When the attachment was created
 }

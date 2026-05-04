@@ -38,6 +38,34 @@ type PullHooks struct {
 	// Called on the raw TrackerIssue before conversion to beads format.
 	// If nil, all issues are imported.
 	ShouldImport func(issue *TrackerIssue) bool
+
+	// SyncComments is called per-issue after import to sync comments from the external tracker.
+	// If nil, comment sync is skipped during pull.
+	SyncComments func(ctx context.Context, localIssueID string, externalIssueID string) error
+
+	// SyncAttachments is called per-issue after import to sync attachment metadata from the external tracker.
+	// If nil, attachment sync is skipped during pull.
+	SyncAttachments func(ctx context.Context, localIssueID string, externalIssueID string) error
+
+	// ContentEqual overrides the generic pullIssueEqual check when the
+	// tracker needs custom comparison logic (e.g. Linear builds its
+	// description by merging local.description with acceptance/notes fields,
+	// so a byte-exact compare between local.Description and remote.Description
+	// always fails even when the content is semantically identical).
+	// Returns true if local and the converted-remote are equal and the pull
+	// should skip. If nil, pullIssueEqual is used.
+	ContentEqual func(local, remote *types.Issue) bool
+
+	// ReconcileLabels overrides the legacy "Linear-authoritative" label sync
+	// at engine.go:496. When set, the hook owns reading current labels,
+	// running its own reconciliation logic, and writing back through tx
+	// (including any per-tracker snapshot tables).
+	//
+	// When nil, the engine falls back to legacySyncIssueLabels (the prior
+	// behavior, renamed in this commit). This keeps non-Linear trackers
+	// (GitHub/GitLab) unaffected — they have no opinion about label
+	// reconciliation and rely on the legacy flow.
+	ReconcileLabels func(ctx context.Context, tx storage.Transaction, issueID string, desired []string, extIssue *TrackerIssue, actor string) error
 }
 
 // PushHooks contains optional callbacks that customize push (export) behavior.
@@ -52,6 +80,13 @@ type PushHooks struct {
 	// Returns true if content is identical (skip update). If nil, uses timestamp comparison.
 	ContentEqual func(local *types.Issue, remote *TrackerIssue) bool
 
+	// DescribeDiff returns human-readable field-level differences between local
+	// and remote for dry-run verbose output. Each entry is a short description
+	// like "title: \"old\" → \"new\"". Return empty slice if no differences.
+	// Optional — if nil, dry-run output just reports that an update would happen
+	// without enumerating fields.
+	DescribeDiff func(local *types.Issue, remote *TrackerIssue) []string
+
 	// ShouldPush filters issues during push. Return false to skip.
 	// Called in addition to type/state/ephemeral filters. Use for prefix filtering, etc.
 	// If nil, all issues (matching other filters) are pushed.
@@ -65,6 +100,10 @@ type PushHooks struct {
 	// ResolveState maps a beads status to a tracker state ID using the cached state.
 	// Only called if BuildStateCache is set. Returns (stateID, ok).
 	ResolveState func(cache interface{}, status types.Status) (string, bool)
+
+	// SyncComments is called per-issue after push to sync local comments to the external tracker.
+	// If nil, comment sync is skipped during push.
+	SyncComments func(ctx context.Context, localIssueID string, externalIssueID string) error
 }
 
 // Engine orchestrates synchronization between beads and an external tracker.
@@ -409,7 +448,27 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 		}
 
-		if existing != nil && pullIssueEqual(existing, conv.Issue, ref) {
+		pullEqual := false
+		if existing != nil {
+			if e.PullHooks != nil && e.PullHooks.ContentEqual != nil {
+				pullEqual = e.PullHooks.ContentEqual(existing, conv.Issue) && referencesMatch(existing, ref)
+			} else {
+				pullEqual = pullIssueEqual(existing, conv.Issue, ref)
+			}
+		}
+		if pullEqual {
+			// Issue unchanged, but still sync comments/attachments
+			// (they may have been added externally since last sync).
+			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
+				if err := e.PullHooks.SyncComments(ctx, existing.ID, extIssue.ID); err != nil {
+					e.warn("Comment sync failed for %s: %v", existing.ID, err)
+				}
+			}
+			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
+				if err := e.PullHooks.SyncAttachments(ctx, existing.ID, extIssue.ID); err != nil {
+					e.warn("Attachment sync failed for %s: %v", existing.ID, err)
+				}
+			}
 			stats.Skipped++
 			continue
 		}
@@ -445,7 +504,10 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				if err := tx.UpdateIssue(ctx, existing.ID, updates, e.Actor); err != nil {
 					return err
 				}
-				return syncIssueLabels(ctx, tx, existing.ID, conv.Issue.Labels, e.Actor)
+				if e.PullHooks != nil && e.PullHooks.ReconcileLabels != nil {
+					return e.PullHooks.ReconcileLabels(ctx, tx, existing.ID, conv.Issue.Labels, &extIssue, e.Actor)
+				}
+				return legacySyncIssueLabels(ctx, tx, existing.ID, conv.Issue.Labels, e.Actor)
 			}); err != nil {
 				e.warn("Failed to update %s: %v", existing.ID, err)
 				continue
@@ -464,6 +526,22 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			stats.Created++
 		}
 
+		// Sync comments/attachments after import (new or updated).
+		localID := conv.Issue.ID
+		if existing != nil {
+			localID = existing.ID
+		}
+		if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
+			if err := e.PullHooks.SyncComments(ctx, localID, extIssue.ID); err != nil {
+				e.warn("Comment sync failed for %s: %v", localID, err)
+			}
+		}
+		if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
+			if err := e.PullHooks.SyncAttachments(ctx, localID, extIssue.ID); err != nil {
+				e.warn("Attachment sync failed for %s: %v", localID, err)
+			}
+		}
+
 		pendingDeps = append(pendingDeps, conv.Dependencies...)
 	}
 
@@ -479,6 +557,20 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 	return stats, nil
 }
 
+// referencesMatch reports whether the local external_ref matches the provided
+// ref string (after trimming). Used by the pull-equal fast-path to require
+// both content equality AND ref alignment before skipping an update.
+func referencesMatch(local *types.Issue, ref string) bool {
+	if local == nil {
+		return false
+	}
+	localRef := ""
+	if local.ExternalRef != nil {
+		localRef = strings.TrimSpace(*local.ExternalRef)
+	}
+	return localRef == strings.TrimSpace(ref)
+}
+
 func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
 	if local == nil || remote == nil {
 		return false
@@ -490,6 +582,23 @@ func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
 		local.IssueType != remote.IssueType ||
 		strings.TrimSpace(local.Assignee) != strings.TrimSpace(remote.Assignee) ||
 		!equalNormalizedStrings(local.Labels, remote.Labels) {
+		return false
+	}
+	// For closed beads also compare close_reason — the tracker's field
+	// mapper populates remote.CloseReason to reflect Linear's terminal
+	// state intent (Canceled → marker, Done → empty). Treating them as
+	// equal when close_reason drifts lets a bead remain marked
+	// cancel-intent locally after Linear flipped Canceled→Done, which
+	// then re-clobbers on the next push.
+	if local.Status == types.StatusClosed && local.CloseReason != remote.CloseReason {
+		return false
+	}
+	// Reopen case: Linear moved a closed issue back to open/in_progress.
+	// If local still carries a close_reason from the prior closure, a
+	// future re-close would re-fire that stale reason and route the push
+	// to the wrong terminal state. Force an update so close_reason gets
+	// cleared.
+	if remote.Status != types.StatusClosed && strings.TrimSpace(local.CloseReason) != "" {
 		return false
 	}
 	localRef := ""
@@ -507,6 +616,23 @@ func buildPullIssueUpdates(existing *types.Issue, remote *types.Issue, ref strin
 		"status":      string(remote.Status),
 		"issue_type":  string(remote.IssueType),
 		"assignee":    remote.Assignee,
+	}
+	// Sync close_reason on any closed pull so Linear's terminal-state
+	// intent (Done vs Canceled) survives round-trip. Without this, a
+	// bead that was reaper-auto-closed locally and then manually moved
+	// to Done in Linear would keep its "stale:" close_reason, and the
+	// next push would route it back to Canceled via close_reason-based
+	// state resolution. The tracker's field mapper is responsible for
+	// setting remote.CloseReason: non-empty for Canceled/Duplicate-type
+	// states, empty for Done. Overwriting free-form user close_reasons
+	// on closed beads is intentional — the same clobber model is
+	// already used for title/description/priority/status/assignee.
+	if remote.Status == types.StatusClosed {
+		updates["close_reason"] = remote.CloseReason
+	} else {
+		// Reopen: clear any stale close_reason so it can't mis-route a
+		// future push back to Canceled via close_reason resolution.
+		updates["close_reason"] = ""
 	}
 	trimmedRef := strings.TrimSpace(ref)
 	if trimmedRef == "" {
@@ -529,7 +655,7 @@ func marshalTrackerMetadata(metadata interface{}) (json.RawMessage, bool) {
 	return json.RawMessage(raw), true
 }
 
-func syncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
+func legacySyncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
 	current, err := tx.GetLabels(ctx, issueID)
 	if err != nil {
 		return err
@@ -729,14 +855,13 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		extRef := derefStr(issue.ExternalRef)
 		willCreate := extRef == "" || !e.Tracker.IsExternalRef(extRef)
 
-		if opts.DryRun {
-			if willCreate {
-				e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
-				stats.Created++
-			} else {
-				e.msg("[dry-run] Would update in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
-				stats.Updated++
-			}
+		// Skip tombstone creates: a bead that's already closed locally with no
+		// external ref was done without ever flowing through the external
+		// tracker. Creating a new terminal-state ticket for it just adds noise
+		// in Linear/Jira/GitHub. Opt back in with --create-closed for one-off
+		// historical backfills.
+		if willCreate && issue.Status == types.StatusClosed && !opts.CreateClosed {
+			stats.Skipped++
 			continue
 		}
 
@@ -749,6 +874,11 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 
 		if willCreate {
+			if opts.DryRun {
+				e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
+				stats.Created++
+				continue
+			}
 			// Create in external tracker
 			created, err := e.Tracker.CreateIssue(ctx, pushIssue)
 			if err != nil {
@@ -767,6 +897,13 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				// but also flag the error so the user knows the link is broken
 			}
 			stats.Created++
+
+			// Sync comments after create (push direction).
+			if e.PushHooks != nil && e.PushHooks.SyncComments != nil && created != nil && created.ID != "" {
+				if err := e.PushHooks.SyncComments(ctx, issue.ID, created.ID); err != nil {
+					e.warn("Comment push failed for %s: %v", issue.ID, err)
+				}
+			}
 		} else if !opts.CreateOnly || forceIDs[issue.ID] {
 			// Update existing external issue
 			extID := e.Tracker.ExtractIdentifier(extRef)
@@ -776,28 +913,103 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			}
 
 			// Check if update is needed
-			if !forceIDs[issue.ID] {
+			var fetchedExt *TrackerIssue
+			// Force-pushed issues normally skip the remote fetch (the user has
+			// already decided to overwrite). But when the tracker implements
+			// RemoteAwareUpdater, we still want the remote payload so the
+			// implementation can preserve remote-owned state (e.g., Linear's
+			// "In Review" driven by GitHub PR automation). One extra API call
+			// per forced issue, bounded by conflict count — not amplified for
+			// bulk syncs.
+			_, trackerIsRemoteAware := e.Tracker.(RemoteAwareUpdater)
+			fetchForForce := forceIDs[issue.ID] && trackerIsRemoteAware
+			if !forceIDs[issue.ID] || fetchForForce {
 				extIssue, err := e.Tracker.FetchIssue(ctx, extID)
 				if err == nil && extIssue != nil {
-					// ContentEqual hook: content-hash dedup to skip unnecessary API calls
-					if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
+					fetchedExt = extIssue
+					// ContentEqual hook: content-hash dedup to skip unnecessary API calls.
+					if !forceIDs[issue.ID] {
+						if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
+							if e.PushHooks.ContentEqual(issue, extIssue) {
+								stats.Skipped++
+								continue
+							}
+						} else if !extIssue.UpdatedAt.Before(issue.UpdatedAt) {
+							stats.Skipped++ // Default: external is same or newer
+							continue
+						}
+					} else if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
+						// Forced path: the conflict resolver flagged this bead as
+						// "local newer" based on timestamps, but timestamps drift
+						// (a status bulk-update bumps UpdatedAt without changing
+						// any field Linear would store). When we have the fetched
+						// remote AND ContentEqual reports they're truly equal,
+						// skip the no-op push so the wet-run doesn't spam the
+						// tracker with unchanged-payload mutations and the dry-
+						// run doesn't print "Would push field change" with no
+						// surfacing diff. Only runs when fetchForForce is true
+						// (i.e., RemoteAwareUpdater trackers); other forced paths
+						// preserve the existing intentional-overwrite semantics.
 						if e.PushHooks.ContentEqual(issue, extIssue) {
 							stats.Skipped++
 							continue
 						}
-					} else if !extIssue.UpdatedAt.Before(issue.UpdatedAt) {
-						stats.Skipped++ // Default: external is same or newer
-						continue
 					}
 				}
 			}
 
-			if _, err := e.Tracker.UpdateIssue(ctx, extID, pushIssue); err != nil {
-				e.warn("Failed to update %s in %s: %v", issue.ID, e.Tracker.DisplayName(), err)
+			if opts.DryRun {
+				// Categorize what wet-run would do — distinguishes "state
+				// preserved" (Linear's "In Review" survives a metadata edit
+				// because the bead's status maps to the remote's current state)
+				// from "state change" (real status transition). Falls back to
+				// generic "Would update" for trackers that don't implement
+				// DryRunPreviewer or when no remote was fetched.
+				label := "Would update"
+				if dp, ok := e.Tracker.(DryRunPreviewer); ok && fetchedExt != nil {
+					switch dp.PreviewUpdate(ctx, extID, pushIssue, fetchedExt) {
+					case DryRunStatePreserved:
+						label = "Would push field change (state preserved)"
+					case DryRunStateChange:
+						label = "Would push state change"
+					case DryRunNoDiff:
+						// Should usually be filtered by ContentEqual upstream,
+						// but if we reach here, the tracker's own preview says
+						// nothing would happen.
+						label = "Would skip (no diff)"
+					}
+				}
+				e.msg("[dry-run] %s in %s: %s — %s", label, e.Tracker.DisplayName(), issue.ID, ui.SanitizeForTerminal(issue.Title))
+				if opts.VerboseDiff && e.PushHooks != nil && e.PushHooks.DescribeDiff != nil && fetchedExt != nil {
+					for _, d := range e.PushHooks.DescribeDiff(issue, fetchedExt) {
+						e.msg("    · %s", d)
+					}
+				}
+				stats.Updated++
+				continue
+			}
+
+			// Prefer RemoteAwareUpdater when available — passes the fetched remote
+			// so the tracker can preserve remote-owned state.
+			var updateErr error
+			if rau, ok := e.Tracker.(RemoteAwareUpdater); ok {
+				_, updateErr = rau.UpdateIssueWithRemote(ctx, extID, pushIssue, fetchedExt)
+			} else {
+				_, updateErr = e.Tracker.UpdateIssue(ctx, extID, pushIssue)
+			}
+			if updateErr != nil {
+				e.warn("Failed to update %s in %s: %v", issue.ID, e.Tracker.DisplayName(), updateErr)
 				stats.Errors++
 				continue
 			}
 			stats.Updated++
+
+			// Sync comments after update (push direction).
+			if e.PushHooks != nil && e.PushHooks.SyncComments != nil {
+				if err := e.PushHooks.SyncComments(ctx, issue.ID, extID); err != nil {
+					e.warn("Comment push failed for %s: %v", issue.ID, err)
+				}
+			}
 		} else {
 			stats.Skipped++
 		}
@@ -1032,7 +1244,23 @@ func (e *Engine) shouldPushIssue(issue *types.Issue, opts SyncOptions) bool {
 		}
 	}
 
+	// Linear scan matches ExcludeTypes' style above. Both ExcludeLabels and
+	// issue.Labels are typically short (<=5), so the nested loop is faster
+	// than allocating a per-issue map.
+	for _, ex := range opts.ExcludeLabels {
+		for _, label := range issue.Labels {
+			if label == ex {
+				return false
+			}
+		}
+	}
+
 	if opts.State == "open" && issue.Status == types.StatusClosed {
+		return false
+	}
+
+	// Skip issues not updated since the --since cutoff.
+	if !opts.Since.IsZero() && !issue.UpdatedAt.After(opts.Since) {
 		return false
 	}
 

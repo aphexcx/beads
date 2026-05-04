@@ -1007,6 +1007,73 @@ func TestDoltStoreComments(t *testing.T) {
 	}
 }
 
+// TestDoltStoreGetIssueCommentsPopulatesExternalRef is a regression guard
+// for the geometric-duplication bug fixed alongside this test: the
+// non-transactional DoltStore.GetIssueComments SELECT was missing
+// external_ref, so the Linear push hook's external_ref-based dedupe read
+// empty strings for every comment and re-pushed them on every sync.
+func TestDoltStoreGetIssueCommentsPopulatesExternalRef(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		ID:          "extref-test-issue",
+		Title:       "ext-ref round trip",
+		Description: "populate external_ref on read",
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	native, err := store.AddIssueComment(ctx, issue.ID, "bob", "written locally")
+	if err != nil {
+		t.Fatalf("add native comment: %v", err)
+	}
+
+	// Simulate an externally-originated comment (the Linear pull side calls
+	// ImportCommentWithRef). Exercises the same write-side code the sync
+	// engine uses.
+	imported, err := store.ImportCommentWithRef(ctx, issue.ID, "alice", "from linear", "linear:comment:abc123", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("import comment with ref: %v", err)
+	}
+
+	got, err := store.GetIssueComments(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("get issue comments: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(got))
+	}
+
+	byID := map[string]*types.Comment{}
+	for _, c := range got {
+		byID[c.ID] = c
+	}
+	if c := byID[native.ID]; c == nil || c.ExternalRef != "" {
+		t.Errorf("native comment should have empty external_ref, got %q", func() string {
+			if c == nil {
+				return "<missing>"
+			}
+			return c.ExternalRef
+		}())
+	}
+	if c := byID[imported.ID]; c == nil || c.ExternalRef != "linear:comment:abc123" {
+		t.Errorf("imported comment should expose external_ref=linear:comment:abc123, got %q", func() string {
+			if c == nil {
+				return "<missing>"
+			}
+			return c.ExternalRef
+		}())
+	}
+}
+
 func TestDoltStoreEvents(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()

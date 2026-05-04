@@ -265,6 +265,8 @@ func TestParseBeadsStatus(t *testing.T) {
 		{"in-progress", types.StatusInProgress},
 		{"inprogress", types.StatusInProgress},
 		{"blocked", types.StatusBlocked},
+		{"deferred", types.StatusDeferred},
+		{"DEFERRED", types.StatusDeferred},
 		{"closed", types.StatusClosed},
 		{"CLOSED", types.StatusClosed},
 		{"unknown", types.StatusOpen}, // Default
@@ -278,6 +280,16 @@ func TestParseBeadsStatus(t *testing.T) {
 	}
 }
 
+// TestParseBeadsStatus_Deferred is a focused regression test for the round
+// of fixes that landed `deferred` round-trippable through ParseBeadsStatus
+// (A1 of the bd-47l plan). Adjacent code already accepted the StatusDeferred
+// constant; this just confirms the string-form parser accepts it too.
+func TestParseBeadsStatus_Deferred(t *testing.T) {
+	if got := ParseBeadsStatus("deferred"); got != types.StatusDeferred {
+		t.Errorf("ParseBeadsStatus(\"deferred\") = %v, want StatusDeferred", got)
+	}
+}
+
 func TestStatusToLinearStateType(t *testing.T) {
 	tests := []struct {
 		status types.Status
@@ -286,6 +298,7 @@ func TestStatusToLinearStateType(t *testing.T) {
 		{types.StatusOpen, "unstarted"},
 		{types.StatusInProgress, "started"},
 		{types.StatusBlocked, "started"},
+		{types.StatusDeferred, "backlog"}, // A2: deferred maps to Linear's backlog category
 		{types.StatusClosed, "completed"},
 		{types.Status("unknown"), "unstarted"}, // Unknown -> default
 	}
@@ -295,6 +308,38 @@ func TestStatusToLinearStateType(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("StatusToLinearStateType(%v) = %q, want %q", tt.status, got, tt.want)
 		}
+	}
+}
+
+// TestStateToBeadsStatus_ExplicitNameWinsOverTypeFallback verifies the A3
+// precedence inversion: when the user has explicitly mapped a Linear state
+// name (e.g., `linear.state_map.deferred = deferred`), that mapping wins
+// over the default type-based fallback (`backlog → open`).
+//
+// The test also exercises the regression case (a) from the plan: a team
+// with NO explicit name mapping still gets the old type-only behavior.
+func TestStateToBeadsStatus_ExplicitNameWinsOverTypeFallback(t *testing.T) {
+	deferredState := &State{Type: "backlog", Name: "Deferred"}
+
+	// Case (a) — no explicit name mapping. Should fall back to type → open.
+	configWithoutExplicit := DefaultMappingConfig()
+	if got := StateToBeadsStatus(deferredState, configWithoutExplicit); got != types.StatusOpen {
+		t.Errorf("no explicit map: got %v, want StatusOpen (type-fallback for backlog)", got)
+	}
+
+	// Case (b) — explicit name mapping wins.
+	configWithExplicit := DefaultMappingConfig()
+	configWithExplicit.StateMap["deferred"] = "deferred"
+	configWithExplicit.ExplicitStateMap["deferred"] = "deferred"
+	if got := StateToBeadsStatus(deferredState, configWithExplicit); got != types.StatusDeferred {
+		t.Errorf("explicit map: got %v, want StatusDeferred (name-match wins over type-fallback)", got)
+	}
+
+	// Bonus: no regression on the other 5 default state types when the
+	// explicit map only covers `deferred`. Spot-check started → in_progress.
+	startedState := &State{Type: "started", Name: "In Progress"}
+	if got := StateToBeadsStatus(startedState, configWithExplicit); got != types.StatusInProgress {
+		t.Errorf("started type-fallback: got %v, want StatusInProgress", got)
 	}
 }
 
@@ -408,6 +453,51 @@ func TestIssueToBeads(t *testing.T) {
 	}
 	if issue.ExternalRef == nil {
 		t.Error("ExternalRef should not be nil")
+	}
+}
+
+// TestIssueToBeadsSetsCancelCloseReason verifies that pulling a Linear
+// issue in a canceled-type state stamps a close_reason on the beads copy
+// so the subsequent push doesn't route it as Done. Issues pulled in
+// Done/other states get no auto close_reason so user-written reasons
+// survive on unrelated beads (buildPullIssueUpdates enforces that).
+func TestIssueToBeadsSetsCancelCloseReason(t *testing.T) {
+	config := DefaultMappingConfig()
+
+	base := func(state *State) *Issue {
+		return &Issue{
+			ID: "u-1", Identifier: "T-1", Title: "t", URL: "https://linear.app/t/issue/T-1",
+			State:     state,
+			CreatedAt: "2026-04-01T00:00:00Z", UpdatedAt: "2026-04-01T00:00:00Z",
+		}
+	}
+
+	closeReasonOf := func(conv *IssueConversion) string {
+		issue, ok := conv.Issue.(*types.Issue)
+		if !ok {
+			t.Fatalf("conv.Issue is not *types.Issue: %T", conv.Issue)
+		}
+		return issue.CloseReason
+	}
+
+	got := closeReasonOf(IssueToBeads(base(&State{Type: "canceled", Name: "Canceled"}), config))
+	if got == "" || !strings.Contains(got, "canceled") {
+		t.Errorf("canceled state should signal cancel intent, got %q", got)
+	}
+
+	got = closeReasonOf(IssueToBeads(base(&State{Type: "canceled", Name: "Duplicate"}), config))
+	if got == "" {
+		t.Errorf("duplicate (canceled-type) should set CloseReason, got empty")
+	}
+
+	got = closeReasonOf(IssueToBeads(base(&State{Type: "completed", Name: "Done"}), config))
+	if got != "" {
+		t.Errorf("completed state should leave CloseReason empty, got %q", got)
+	}
+
+	got = closeReasonOf(IssueToBeads(base(&State{Type: "started", Name: "In Progress"}), config))
+	if got != "" {
+		t.Errorf("non-closed state should leave CloseReason empty, got %q", got)
 	}
 }
 
@@ -702,5 +792,644 @@ func TestPushFieldsEqualToBeads(t *testing.T) {
 
 	if !PushFieldsEqualToBeads(local, remote) {
 		t.Fatal("expected beads-form fallback comparison to ignore local-only fields")
+	}
+}
+
+func TestClassifyCloseReason(t *testing.T) {
+	tests := []struct {
+		reason string
+		want   CloseIntent
+	}{
+		{"", CloseIntentCompleted},
+		{"Closed", CloseIntentCompleted},
+		{"Work completed and merged via PRs #115 and #124", CloseIntentCompleted},
+		{"Deleted /app/admin/ directory", CloseIntentCompleted},
+		{"stale:auto-closed by reaper", CloseIntentCanceled},
+		{"STALE: no activity for 30 days", CloseIntentCanceled},
+		{"canceled - not shipping this quarter", CloseIntentCanceled},
+		{"Cancelled (British spelling)", CloseIntentCanceled},
+		{"duplicate of hw-abc", CloseIntentCanceled},
+		{"superseded by hw-def", CloseIntentCanceled},
+		{"obsolete", CloseIntentCanceled},
+		{"wontfix: by design", CloseIntentCanceled},
+		{"won't fix — external dep", CloseIntentCanceled},
+		{"abandoned after spike", CloseIntentCanceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.reason, func(t *testing.T) {
+			got := ClassifyCloseReason(tt.reason)
+			if got != tt.want {
+				t.Errorf("ClassifyCloseReason(%q) = %v, want %v", tt.reason, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveStateIDForIssueUsesCloseReason verifies that closed beads with
+// done-ish close_reason land on a completed-type Linear state, while
+// cancellation-ish reasons land on a canceled-type state. Critically,
+// configuring state_map with both canceled and done → closed (the natural
+// config for a team with both terminal states) no longer triggers the
+// ambiguity error on push — close_reason is the disambiguator now.
+func TestResolveStateIDForIssueUsesCloseReason(t *testing.T) {
+	cache := &StateCache{
+		States: []State{
+			{ID: "done-id", Name: "Done", Type: "completed"},
+			{ID: "canceled-id", Name: "Canceled", Type: "canceled"},
+			{ID: "duplicate-id", Name: "Duplicate", Type: "canceled"},
+		},
+	}
+	config := DefaultMappingConfig()
+	// Matches the user-facing config we recommend: both terminal types map
+	// to the single beads closed status.
+	config.ExplicitStateMap["done"] = "closed"
+	config.ExplicitStateMap["canceled"] = "closed"
+
+	tests := []struct {
+		name    string
+		issue   *types.Issue
+		wantID  string
+		wantErr bool
+	}{
+		{
+			name:   "completed via empty close_reason",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: ""},
+			wantID: "done-id",
+		},
+		{
+			name:   "completed via done-ish close_reason",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "merged in PR #42"},
+			wantID: "done-id",
+		},
+		{
+			name:   "canceled via reaper stale prefix",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "stale:auto-closed by reaper"},
+			wantID: "canceled-id",
+		},
+		{
+			name:   "canceled via duplicate (prefers first canceled-type state by name)",
+			issue:  &types.Issue{Status: types.StatusClosed, CloseReason: "duplicate of hw-abc"},
+			wantID: "canceled-id", // "canceled" name match beats "duplicate"
+		},
+		{
+			name:    "open status delegates to state_map",
+			issue:   &types.Issue{Status: types.StatusOpen, CloseReason: ""},
+			wantErr: true, // open isn't mapped in this cache, state_map path errors
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ResolveStateIDForIssue(cache, tt.issue, config)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got state %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.wantID {
+				t.Errorf("ResolveStateIDForIssue() = %q, want %q", got, tt.wantID)
+			}
+		})
+	}
+}
+
+func TestNormalizeLinearMarkdown(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "bullet markers normalized to *",
+			in:   "First line\n- item one\n- item two\n+ item three",
+			want: "First line\n* item one\n* item two\n* item three",
+		},
+		{
+			name: "punctuation escapes stripped",
+			in:   `Step 1\. WiFi config\nUses \~880 lines\.`,
+			want: `Step 1. WiFi config\nUses ~880 lines.`,
+		},
+		{
+			name: "auto-linked URL collapsed",
+			in:   "PR opened: [https://github.com/x/y/pull/1](<https://github.com/x/y/pull/1>) — done",
+			want: "PR opened: https://github.com/x/y/pull/1 — done",
+		},
+		{
+			name: "table separator widths normalized",
+			in:   "| File | Lines |\n|------|-------|\n| `a` | 100 |",
+			want: "| File | Lines |\n| --- | --- |\n| `a` | 100 |",
+		},
+		{
+			name: "multiple newlines collapsed to single",
+			in:   "## Heading\n\n\nFirst para\n\n\n\nSecond para",
+			want: "## Heading\nFirst para\nSecond para",
+		},
+		{
+			name: "trailing whitespace stripped per line",
+			in:   "Line one  \nLine two\t\nLine three",
+			want: "Line one\nLine two\nLine three",
+		},
+		{
+			name: "round-trip: local form vs Linear form normalize equally",
+			in:   "Section:\n- item a\n- item b\nuses \\~5 chars",
+			want: "Section:\n* item a\n* item b\nuses ~5 chars",
+		},
+		{
+			name: "leading and trailing whitespace trimmed",
+			in:   "\n\n  body\n\n",
+			want: "body",
+		},
+		{
+			name: "empty input",
+			in:   "",
+			want: "",
+		},
+		{
+			name: "escaped quotes stripped",
+			in:   `Set the \"YOU CONTROL\" label to keep card height stable`,
+			want: `Set the "YOU CONTROL" label to keep card height stable`,
+		},
+		{
+			name: "numbered-list digit-width padding stripped",
+			in:   "Steps:\n 1. First\n 2. Second\n10. Tenth",
+			want: "Steps:\n1. First\n2. Second\n10. Tenth",
+		},
+		{
+			name: "continuation paragraph indent stripped",
+			in:   "* item one (does X)\n  Known limitation (documented in spec)",
+			want: "* item one (does X)\nKnown limitation (documented in spec)",
+		},
+		{
+			name: "nested bullet indent preserved",
+			in:   "* outer\n  * inner one\n  * inner two",
+			want: "* outer\n  * inner one\n  * inner two",
+		},
+		{
+			name: "4+ space indent preserved (potential code block)",
+			in:   "Example:\n    code line one\n    code line two",
+			want: "Example:\n    code line one\n    code line two",
+		},
+		{
+			name: "nested dash bullet preserved through bullet+indent",
+			in:   "* outer\n  - inner",
+			want: "* outer\n  * inner",
+		},
+		{
+			name: "nested ordered list (3-space indent) preserved",
+			in:   "1. outer\n   1. inner one\n   2. inner two",
+			want: "1. outer\n   1. inner one\n   2. inner two",
+		},
+		{
+			name: "nested ordered list (2-space indent) preserved",
+			in:   "1. outer\n  1. inner",
+			want: "1. outer\n  1. inner",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeLinearMarkdown(tt.in)
+			if got != tt.want {
+				t.Errorf("NormalizeLinearMarkdown() got:\n%q\nwant:\n%q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeLinearMarkdownIdempotent(t *testing.T) {
+	// Normalizing twice should equal normalizing once (steady state).
+	inputs := []string{
+		"- a\n- b",
+		"foo\\.bar",
+		"[https://x.com](<https://x.com>)",
+		"|---|---|\n|x|y|",
+		"a\n\n\nb",
+		`\"quoted\"`,
+		" 1. first\n 2. second",
+		"* outer\n  * inner",
+		"* item\n  continuation paragraph",
+		"1. outer\n   1. inner",
+	}
+	for _, in := range inputs {
+		once := NormalizeLinearMarkdown(in)
+		twice := NormalizeLinearMarkdown(once)
+		if once != twice {
+			t.Errorf("NormalizeLinearMarkdown not idempotent for %q: %q vs %q", in, once, twice)
+		}
+	}
+}
+
+func TestPushFieldsEqualUsesNormalization(t *testing.T) {
+	config := DefaultMappingConfig()
+	local := &types.Issue{
+		Title:       "title",
+		Description: "Body:\n- item one\n- item two",
+		Status:      types.StatusOpen,
+		Priority:    2,
+	}
+	remote := &Issue{
+		Title:       "title",
+		Description: "Body:\n* item one\n* item two", // bullet normalized
+		Priority:    1,                               // 2 (medium) → linear 1 via priority map default? validate
+		State:       &State{Type: "backlog", Name: "Backlog"},
+	}
+	// Use config's default priority map for medium → 3 (linear medium)
+	// We don't care about exact priority equivalence here — set both to 0
+	local.Priority = 4
+	remote.Priority = PriorityToLinear(local.Priority, config)
+	if !PushFieldsEqual(local, remote, config) {
+		t.Errorf("PushFieldsEqual should treat bullet markdown variants as equal")
+	}
+}
+
+func TestPushFieldsDiffReportsFields(t *testing.T) {
+	config := DefaultMappingConfig()
+	local := &types.Issue{
+		Title:       "new title",
+		Description: "new body",
+		Status:      types.StatusInProgress,
+		Priority:    1,
+	}
+	remote := &Issue{
+		Title:       "old title",
+		Description: "old body",
+		Priority:    PriorityToLinear(2, config),
+		State:       &State{Type: "backlog", Name: "Backlog"},
+	}
+	diffs := PushFieldsDiff(local, remote, config)
+	if len(diffs) == 0 {
+		t.Fatal("expected non-empty diff, got empty")
+	}
+	joined := strings.Join(diffs, "\n")
+	for _, want := range []string{"title:", "description:", "priority:", "status:"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("diff should mention %q, got: %s", want, joined)
+		}
+	}
+}
+
+func TestPushFieldsDiffEmptyForEqualIssues(t *testing.T) {
+	config := DefaultMappingConfig()
+	local := &types.Issue{
+		Title:       "same",
+		Description: "same body\n- a\n- b",
+		Status:      types.StatusOpen,
+		Priority:    2,
+	}
+	remote := &Issue{
+		Title:       "same",
+		Description: "same body\n* a\n* b", // bullet diff is normalized away
+		Priority:    PriorityToLinear(local.Priority, config),
+		State:       &State{Type: "backlog", Name: "Backlog"},
+	}
+	diffs := PushFieldsDiff(local, remote, config)
+	if len(diffs) != 0 {
+		t.Errorf("expected empty diff for equal issues (modulo normalization), got: %v", diffs)
+	}
+}
+
+func TestCanonicalPushStatus(t *testing.T) {
+	tests := []struct {
+		in   types.Status
+		want types.Status
+	}{
+		// CategoryActive
+		{types.StatusOpen, types.StatusOpen},
+		// CategoryWIP — secondary statuses canonicalize to in_progress
+		{types.StatusInProgress, types.StatusInProgress},
+		{types.StatusBlocked, types.StatusInProgress},
+		{types.StatusHooked, types.StatusInProgress},
+		// CategoryDone
+		{types.StatusClosed, types.StatusClosed},
+		// CategoryFrozen — pinned/deferred canonicalize to open
+		{types.StatusDeferred, types.StatusOpen},
+		{types.StatusPinned, types.StatusOpen},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.in), func(t *testing.T) {
+			got := canonicalPushStatus(tt.in)
+			if got != tt.want {
+				t.Errorf("canonicalPushStatus(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveStateIDForBeadsStatusFallsBackToCanonical(t *testing.T) {
+	// state_map only has explicit entry for in_progress; pushing a hooked bead
+	// must succeed via canonical fallback (hooked → in_progress).
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"in progress": "in_progress",
+		"backlog":     "open",
+		"done":        "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-wip", Name: "In Progress", Type: "started"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+
+	id, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err != nil {
+		t.Fatalf("expected hooked to resolve via canonical fallback, got error: %v", err)
+	}
+	if id != "state-wip" {
+		t.Errorf("hooked should map to state-wip (in progress), got %q", id)
+	}
+}
+
+func TestResolveStateIDForBeadsStatusOriginalAmbiguityNotMasked(t *testing.T) {
+	// User configured an ambiguous explicit map for the requested status —
+	// must surface the ambiguity error, NOT silently fall back to canonical.
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"in progress": "hooked", // explicit (and ambiguous when paired with below)
+		"working":     "hooked", // also maps to hooked
+		"backlog":     "open",
+		"done":        "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-wip1", Name: "In Progress", Type: "started"},
+			{ID: "state-wip2", Name: "Working", Type: "started"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+	_, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err == nil {
+		t.Fatal("expected ambiguity error, got nil")
+	}
+	if !strings.Contains(err.Error(), "multiple Linear states") {
+		t.Errorf("expected 'multiple Linear states' ambiguity error, got: %v", err)
+	}
+}
+
+func TestResolveStateIDForBeadsStatusCanonicalAmbiguitySurfaces(t *testing.T) {
+	// Original status has no match; canonical fallback hits an ambiguity.
+	// Must surface the canonical ambiguity error directly.
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"in progress": "in_progress",
+		"working":     "in_progress", // ambiguous in_progress
+		"backlog":     "open",
+		"done":        "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-wip1", Name: "In Progress", Type: "started"},
+			{ID: "state-wip2", Name: "Working", Type: "started"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+	// hooked has no explicit entry → canonical fallback to in_progress → ambiguous
+	_, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err == nil {
+		t.Fatal("expected ambiguity error from canonical fallback, got nil")
+	}
+	if !strings.Contains(err.Error(), "multiple Linear states") {
+		t.Errorf("expected canonical ambiguity to surface, got: %v", err)
+	}
+}
+
+func TestResolveStateIDForBeadsStatusNoMatchAnywhere(t *testing.T) {
+	// No explicit entry for the original status, no canonical-equivalent
+	// state in the workflow either — error message should mention both.
+	config := DefaultMappingConfig()
+	config.ExplicitStateMap = map[string]string{
+		"backlog": "open",
+		"done":    "closed",
+	}
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-todo", Name: "Backlog", Type: "backlog"},
+			{ID: "state-done", Name: "Done", Type: "completed"},
+		},
+	}
+	_, err := ResolveStateIDForBeadsStatus(cache, types.StatusHooked, config)
+	if err == nil {
+		t.Fatal("expected no-state error, got nil")
+	}
+	if !strings.Contains(err.Error(), "category-canonical") {
+		t.Errorf("expected error to mention canonical fallback was tried, got: %v", err)
+	}
+}
+
+func TestCanonicalPushStatusUnknownStatusPassesThrough(t *testing.T) {
+	// A custom status that BuiltInStatusCategory doesn't recognize stays
+	// unchanged — the function shouldn't claim a guess.
+	custom := types.Status("triage-pending")
+	got := canonicalPushStatus(custom)
+	if got != custom {
+		t.Errorf("canonicalPushStatus(%q) = %q, want unchanged %q", custom, got, custom)
+	}
+}
+
+func TestNormalizeLinearMarkdownEscapeBrackets(t *testing.T) {
+	// Linear escapes square brackets in plain text to avoid markdown-link
+	// parsing. Local sends bare brackets. Both must normalize to the bare form.
+	in := `default seed \[5,5,5\] confirmed`
+	want := `default seed [5,5,5] confirmed`
+	got := NormalizeLinearMarkdown(in)
+	if got != want {
+		t.Errorf("escape-brackets: got %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeLinearMarkdownBoldUnderscore(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"simple", `Run __tests__ first`, `Run **tests** first`},
+		{"file path", `lib/simulation/__tests__/foo.test.ts`, `lib/simulation/**tests**/foo.test.ts`},
+		{"already bold", `Run **tests** first`, `Run **tests** first`}, // no-op
+		{"single underscore not matched", `_emphasis_ stays`, `_emphasis_ stays`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeLinearMarkdown(tt.in)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeLinearMarkdownHwBwkaSample reproduces the exact drift sample
+// reported on the houmanoids_www rig (bd-joz): bd stores `-` bullets and bare
+// `~`, Linear stores `*` bullets and `\~`. After normalization, both forms
+// must compare equal so the dry-run push loop terminates.
+func TestNormalizeLinearMarkdownHwBwkaSample(t *testing.T) {
+	local := `- Send ModeCommand with action="motion_state" to switch robot from RL (17) → Stand (1)
+- Now Z/Roll/Pitch commands ...
+
+app/houdini/lib/robotCommunication/MovementController.ts — posture mode toggle lives here (~line 60-74).`
+
+	remote := `* Send ModeCommand with action="motion_state" to switch robot from RL (17) → Stand (1)
+* Now Z/Roll/Pitch commands ...
+
+app/houdini/lib/robotCommunication/MovementController.ts — posture mode toggle lives here (\~line 60-74).`
+
+	nl := NormalizeLinearMarkdown(local)
+	nr := NormalizeLinearMarkdown(remote)
+	if nl != nr {
+		t.Errorf("hw-bwka sample: normalizers diverged\nlocal-norm:  %q\nremote-norm: %q", nl, nr)
+	}
+}
+
+// TestNormalizeLinearMarkdownLinkAngleURL covers Linear's habit of wrapping
+// the URL portion of any markdown link in `<...>` (CommonMark allows it for
+// URLs that would otherwise need escaping). The bare form `[text](url)` and
+// the wrapped form `[text](<url>)` must normalize equally.
+func TestNormalizeLinearMarkdownLinkAngleURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		local  string
+		remote string
+	}{
+		{"plain link with custom text", "see [the doc](https://example.com)", "see [the doc](<https://example.com>)"},
+		{"link with parens in URL", "see [details](https://example.com/path(1))", "see [details](<https://example.com/path(1)>)"},
+		{"bare URL collapse still wins for [url](url)", "https://x.com", "[https://x.com](<https://x.com>)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nl := NormalizeLinearMarkdown(tt.local)
+			nr := NormalizeLinearMarkdown(tt.remote)
+			if nl != nr {
+				t.Errorf("local %q and remote %q diverged after normalize:\nlocal-norm:  %q\nremote-norm: %q", tt.local, tt.remote, nl, nr)
+			}
+		})
+	}
+}
+
+// TestNormalizeLinearMarkdownCodeSpanShielding verifies the bd-joz contract
+// for code spans:
+//
+//   - Line-level transforms (bullet rewriter, etc.) MUST NOT mangle code
+//     content. `- item` inside a code span stays as `- item`, not rewritten
+//     to `* item`.
+//   - Escape sequences INSIDE code spans get stripped on restore so Linear's
+//     emit-form (`\[X\]` inside backticks) and bd's bare form (`[X]`) equate.
+//     Per CommonMark, backslash before bracket has no semantic meaning inside
+//     a code span, but Linear's editor emits the escape anyway.
+//
+// The accepted tradeoff: a literal `\[` written inside a code span to display
+// a backslash-bracket sequence will be normalized to `[` for drift purposes.
+// Niche use case; one false-no-op is preferable to a permanent drift loop.
+func TestNormalizeLinearMarkdownCodeSpanShielding(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "inline code: backslash escapes equated to bare form",
+			in:   "Use `\\(foo\\)` to match parens",
+			want: "Use `(foo)` to match parens",
+		},
+		{
+			name: "inline code preserves bullet-looking content",
+			in:   "Run `- item` first",
+			want: "Run `- item` first",
+		},
+		{
+			name: "fenced block: escapes preserved verbatim (literal in code blocks)",
+			in:   "```\n- item\n\\(escaped\\)\n```",
+			want: "```\n- item\n\\(escaped\\)\n```",
+		},
+		{
+			name: "outer normalization runs around code spans",
+			in:   "- bullet\n`\\(code\\)`\n- next",
+			want: "* bullet\n`(code)`\n* next",
+		},
+		{
+			name: "multiple inline spans: escapes stripped per span",
+			in:   "`\\.a\\.` and `\\-b\\-`",
+			want: "`.a.` and `-b-`",
+		},
+		{
+			name: "hw-1oxe sample: escaped brackets inside code span",
+			in:   "Result: synced (`[SimulationSync] Mission`)",
+			want: "Result: synced (`[SimulationSync] Mission`)",
+		},
+		{
+			name: "hw-1oxe sample remote form normalizes equally",
+			in:   "Result: synced (`\\[SimulationSync\\] Mission`)",
+			want: "Result: synced (`[SimulationSync] Mission`)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NormalizeLinearMarkdown(tt.in)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNormalizeLinearMarkdownHwOxeSample is the regression test for hw-1oxe
+// — the last residual after bd-joz #3. Local stores `[SimulationSync]`
+// inside a backtick-bounded code span; Linear stores `\[SimulationSync\]`
+// (Linear's editor adds a no-op escape inside the code span). After
+// normalization, both forms must produce identical output.
+func TestNormalizeLinearMarkdownHwOxeSample(t *testing.T) {
+	local := "Result: ... synced (`[SimulationSync] Mission ... robot-...`), ..."
+	remote := "Result: ... synced (`\\[SimulationSync\\] Mission ... robot-...`), ..."
+
+	nl := NormalizeLinearMarkdown(local)
+	nr := NormalizeLinearMarkdown(remote)
+	if nl != nr {
+		t.Errorf("hw-1oxe sample: normalizers diverged\nlocal-norm:  %q\nremote-norm: %q", nl, nr)
+	}
+}
+
+// TestNormalizeLinearMarkdownEscapeCoverage locks in the broadened escape
+// regex character class. Each entry asserts that the escaped form (Linear's
+// round-trip) and the bare form (bead's authored form) normalize identically.
+// Adding a new entry here is the right way to extend escape coverage.
+func TestNormalizeLinearMarkdownEscapeCoverage(t *testing.T) {
+	pairs := []struct {
+		name   string
+		local  string
+		remote string
+	}{
+		{"period", `v1.0`, `v1\.0`},
+		{"hyphen", `a-b`, `a\-b`},
+		{"asterisk", `a*b`, `a\*b`},
+		{"underscore", `foo_bar`, `foo\_bar`},
+		{"tilde", `~80 chars`, `\~80 chars`},
+		{"open bracket", `see [here]`, `see \[here]`},
+		{"close bracket", `see [here]`, `see [here\]`},
+		{"open paren", `(call this)`, `\(call this)`},
+		{"close paren", `(call this)`, `(call this\)`},
+		{"angle open", `<x>`, `\<x>`},
+		{"angle close", `<x>`, `<x\>`},
+		{"bang", `!important`, `\!important`},
+		{"plus", `1 + 2`, `1 \+ 2`},
+		{"hash", `# heading`, `\# heading`},
+		{"equals", `key=value`, `key\=value`},
+		{"pipe", `a | b`, `a \| b`},
+		{"open brace", `{x}`, `\{x}`},
+		{"close brace", `{x}`, `{x\}`},
+		{"double quote", `"quoted"`, `\"quoted\"`},
+	}
+	for _, tt := range pairs {
+		t.Run(tt.name, func(t *testing.T) {
+			nl := NormalizeLinearMarkdown(tt.local)
+			nr := NormalizeLinearMarkdown(tt.remote)
+			if nl != nr {
+				t.Errorf("escape coverage %s diverged: local-norm=%q remote-norm=%q", tt.name, nl, nr)
+			}
+		})
 	}
 }

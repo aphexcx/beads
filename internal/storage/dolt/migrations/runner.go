@@ -30,6 +30,7 @@ var compatMigrationsList = []CompatMigration{
 	{"uuid_primary_keys", MigrateUUIDPrimaryKeys},
 	{"add_no_history_column", MigrateAddNoHistoryColumn},
 	{"add_started_at_column", MigrateAddStartedAtColumn},
+	{"create_linear_label_snapshots", MigrateCreateLinearLabelSnapshots},
 	{"drop_hop_columns", MigrateDropHOPColumns},
 	{"drop_child_counters_fk", MigrateDropChildCountersFK},
 	{"wisp_events_created_at_index", MigrateWispEventsCreatedAtIndex},
@@ -69,7 +70,7 @@ func RunCompatMigrations(db *sql.DB) error {
 		"issues", "wisps", "events", "wisp_events", "dependencies",
 		"wisp_dependencies", "labels", "wisp_labels", "comments",
 		"wisp_comments", "metadata", "child_counters", "issue_counter",
-		"issue_snapshots", "compaction_snapshots", "federation_peers",
+		"issue_snapshots", "compaction_snapshots", "linear_label_snapshots", "federation_peers",
 		"custom_statuses", "custom_types",
 		"dolt_ignore",
 	}

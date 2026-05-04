@@ -7,11 +7,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/linear"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -61,6 +63,23 @@ Data Mapping (optional, sensible defaults provided):
     bd config set linear.relation_map.duplicate duplicates
     bd config set linear.relation_map.related related
 
+  Bidirectional label sync (opt-in):
+    bd config set linear.label_sync_enabled true
+    bd config set linear.label_sync_exclude "internal-tag,gt:agent"
+    bd config set linear.label_create_scope team   # or workspace
+
+  When enabled, label changes propagate in both directions:
+  - Adding/removing a label in Linear flows to the bead on next sync.
+  - Adding/removing a label in beads flows to Linear on next sync.
+  - Renaming a label in Linear (same ID) flows as a name change.
+  - The first sync after enabling never removes labels on either side;
+    both sides' labels merge into a unified set.
+
+  Note: enabling this changes pull semantics for existing beads. Today the
+  pull-side already mirrors Linear labels destructively (beads labels not on
+  Linear are silently removed). With label sync enabled, removal becomes
+  intent-aware: a label is only removed when one side actively removes it.
+
   ID generation (optional, hash IDs to match bd/Jira hash mode):
     bd config set linear.id_mode "hash"      # hash (default)
     bd config set linear.hash_length "6"     # hash length 3-8 (default: 6)
@@ -95,6 +114,14 @@ Type Filtering (--push only):
   --exclude-type wisp       Exclude issues of these types
   --include-ephemeral       Include ephemeral issues (wisps, etc.); default is to exclude
   --parent TICKET           Only push this ticket and its descendants
+  --since 15d               Only push issues updated in the last 15 days
+  --since 2026-03-27        Only push issues updated after this date
+
+  Persistent exclude types (merged with --exclude-type):
+    bd config set linear.exclude_types "molecule,event"
+
+  Persistent exclude by label (comma-separated, matched against issue.Labels):
+    bd config set linear.exclude_labels "gt:agent"
 
 Conflict Resolution:
   By default, newer timestamp wins. Override with:
@@ -145,12 +172,15 @@ func init() {
 	linearSyncCmd.Flags().Bool("prefer-local", false, "Prefer local version on conflicts")
 	linearSyncCmd.Flags().Bool("prefer-linear", false, "Prefer Linear version on conflicts")
 	linearSyncCmd.Flags().Bool("create-only", false, "Only create new issues, don't update existing")
+	linearSyncCmd.Flags().Bool("create-closed", false, "Push closed local beads with no external ref as new Linear issues (for historical backfill; skipped by default)")
+	linearSyncCmd.Flags().Bool("verbose-diff", false, "In --dry-run, show per-field differences for each would-be update")
 	linearSyncCmd.Flags().Bool("update-refs", true, "Update external_ref after creating Linear issues")
 	linearSyncCmd.Flags().String("state", "all", "Issue state to sync: open, closed, all")
 	linearSyncCmd.Flags().StringSlice("type", nil, "Only sync issues of these types (can be repeated)")
 	linearSyncCmd.Flags().StringSlice("exclude-type", nil, "Exclude issues of these types (can be repeated)")
 	linearSyncCmd.Flags().Bool("include-ephemeral", false, "Include ephemeral issues (wisps, etc.) when pushing to Linear")
 	linearSyncCmd.Flags().String("parent", "", "Limit push to this beads ticket and its descendants")
+	linearSyncCmd.Flags().String("since", "", "Only push issues updated after this date (e.g. 2026-03-27, 15d for 15 days ago)")
 	linearSyncCmd.Flags().StringSlice("team", nil, "Team ID(s) to sync (overrides configured team_id/team_ids)")
 	registerSelectiveSyncFlags(linearSyncCmd)
 
@@ -167,10 +197,13 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	preferLocal, _ := cmd.Flags().GetBool("prefer-local")
 	preferLinear, _ := cmd.Flags().GetBool("prefer-linear")
 	createOnly, _ := cmd.Flags().GetBool("create-only")
+	createClosed, _ := cmd.Flags().GetBool("create-closed")
+	verboseDiff, _ := cmd.Flags().GetBool("verbose-diff")
 	state, _ := cmd.Flags().GetString("state")
 	typeFilters, _ := cmd.Flags().GetStringSlice("type")
 	excludeTypes, _ := cmd.Flags().GetStringSlice("exclude-type")
 	includeEphemeral, _ := cmd.Flags().GetBool("include-ephemeral")
+	sinceStr, _ := cmd.Flags().GetString("since")
 	cliTeams, _ := cmd.Flags().GetStringSlice("team")
 
 	if !dryRun {
@@ -205,6 +238,15 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	if err := lt.Init(ctx, store); err != nil {
 		FatalError("initializing Linear tracker: %v", err)
 	}
+
+	// Wire label-sync config so PushHooks/PullHooks builders see the right
+	// LabelSyncEnabled() value when they install the label-aware hooks below.
+	allCfg, _ := store.GetAllConfig(ctx)
+	lsCfg := loadLinearLabelSyncConfig(allCfg)
+	lt.SetLabelSyncConfig(lsCfg.Enabled, lsCfg.Exclude, lsCfg.CreateScope, func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, "Warning: linear label sync: "+format+"\n", args...)
+	})
+
 	if willPush {
 		if err := lt.ValidatePushStateMappings(ctx); err != nil {
 			FatalError("%v", err)
@@ -217,26 +259,58 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	engine.OnWarning = func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
 
 	// Set up Linear-specific pull hooks
-	engine.PullHooks = buildLinearPullHooks(ctx)
+	engine.PullHooks = buildLinearPullHooks(ctx, lt)
 
 	// Build sync options from CLI flags
 	opts := tracker.SyncOptions{
-		Pull:       pull,
-		Push:       push,
-		DryRun:     dryRun,
-		CreateOnly: createOnly,
-		State:      state,
+		Pull:         pull,
+		Push:         push,
+		DryRun:       dryRun,
+		CreateOnly:   createOnly,
+		CreateClosed: createClosed,
+		VerboseDiff:  verboseDiff,
+		State:        state,
 	}
 
 	// Convert type filters
 	for _, t := range typeFilters {
 		opts.TypeFilter = append(opts.TypeFilter, types.IssueType(strings.ToLower(t)))
 	}
+	// Merge CLI --exclude-type with config linear.exclude_types
+	configExclude, _ := store.GetConfig(ctx, "linear.exclude_types")
+	if configExclude != "" {
+		for _, t := range strings.Split(configExclude, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				opts.ExcludeTypes = append(opts.ExcludeTypes, types.IssueType(strings.ToLower(t)))
+			}
+		}
+	}
 	for _, t := range excludeTypes {
 		opts.ExcludeTypes = append(opts.ExcludeTypes, types.IssueType(strings.ToLower(t)))
 	}
+	// Read config linear.exclude_labels — comma-separated list of labels to
+	// skip from push (e.g. "gt:agent" filters out polecat agent beads).
+	configExcludeLabels, _ := store.GetConfig(ctx, "linear.exclude_labels")
+	if configExcludeLabels != "" {
+		for _, l := range strings.Split(configExcludeLabels, ",") {
+			l = strings.TrimSpace(l)
+			if l != "" {
+				opts.ExcludeLabels = append(opts.ExcludeLabels, l)
+			}
+		}
+	}
 	if !includeEphemeral {
 		opts.ExcludeEphemeral = true
+	}
+
+	// Parse --since flag
+	if sinceStr != "" {
+		sinceTime, err := parseSinceFlag(sinceStr)
+		if err != nil {
+			FatalError("invalid --since value %q: %v", sinceStr, err)
+		}
+		opts.Since = sinceTime
 	}
 
 	if err := applySelectiveSyncFlags(cmd, &opts, push); err != nil {
@@ -274,11 +348,15 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 		fmt.Println("\n✓ Dry run complete (no changes made)")
 	} else {
 		if result.Stats.Pulled > 0 {
-			fmt.Printf("✓ Pulled %d issues (%d created, %d updated)\n",
-				result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+			fmt.Printf("✓ Pulled %d issues from Linear (%d created, %d updated locally)\n",
+				result.Stats.Pulled, result.PullStats.Created, result.PullStats.Updated)
 		}
 		if result.Stats.Pushed > 0 {
-			fmt.Printf("✓ Pushed %d issues\n", result.Stats.Pushed)
+			fmt.Printf("✓ Pushed %d issues to Linear (%d created, %d updated)\n",
+				result.Stats.Pushed, result.PushStats.Created, result.PushStats.Updated)
+		}
+		if result.Stats.Skipped > 0 {
+			fmt.Printf("  Skipped %d (no changes needed)\n", result.Stats.Skipped)
 		}
 		if result.Stats.Conflicts > 0 {
 			fmt.Printf("→ Resolved %d conflicts\n", result.Stats.Conflicts)
@@ -294,11 +372,51 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 }
 
 // buildLinearPullHooks creates PullHooks for Linear-specific pull behavior.
-func buildLinearPullHooks(ctx context.Context) *tracker.PullHooks {
+func buildLinearPullHooks(ctx context.Context, lt *linear.Tracker) *tracker.PullHooks {
 	idMode := getLinearIDMode(ctx)
 	hashLength := getLinearHashLength(ctx)
 
 	hooks := &tracker.PullHooks{}
+
+	hooks.SyncComments = buildCommentPullHook(ctx, lt)
+	hooks.SyncAttachments = buildAttachmentPullHook(ctx, lt)
+
+	// ContentEqual: Linear builds its description by merging local's
+	// description with acceptance_criteria/design/notes. A byte compare
+	// between local.Description and remote.Description always fails when
+	// local has any of those fields populated. Compare the rebuilt local
+	// form (with markdown noise normalized) against the normalized remote.
+	hooks.ContentEqual = func(local, remote *types.Issue) bool {
+		if local == nil || remote == nil {
+			return false
+		}
+		if local.Title != remote.Title ||
+			local.Priority != remote.Priority ||
+			local.Status != remote.Status ||
+			local.IssueType != remote.IssueType {
+			return false
+		}
+		localDesc := linear.NormalizeLinearMarkdown(linear.BuildLinearDescription(local))
+		remoteDesc := linear.NormalizeLinearMarkdown(remote.Description)
+		if localDesc != remoteDesc {
+			return false
+		}
+		// Closed-beads close_reason logic mirrors pullIssueEqual:
+		if local.Status == types.StatusClosed && local.CloseReason != remote.CloseReason {
+			return false
+		}
+		if remote.Status != types.StatusClosed && strings.TrimSpace(local.CloseReason) != "" {
+			return false
+		}
+		// Decision #12 (pull-side mirror): when label sync is enabled, a label
+		// delta forces ContentEqual to false so the engine enters the update
+		// transaction at engine.go:492 and our ReconcileLabels callback runs.
+		// Without this, Linear-only label adds would be silently skipped.
+		if lt.LabelSyncEnabled() && pullHasLabelDelta(lt, local, remote) {
+			return false
+		}
+		return true
+	}
 
 	if idMode == "hash" {
 		// Pre-load existing IDs for collision avoidance
@@ -339,6 +457,66 @@ func buildLinearPullHooks(ctx context.Context) *tracker.PullHooks {
 		}
 	}
 
+	// Bidirectional label sync — Linear-specific reconciliation, gated on config.
+	if lt.LabelSyncEnabled() {
+		hooks.ReconcileLabels = func(ctx context.Context, tx storage.Transaction, issueID string, desired []string, extIssue *tracker.TrackerIssue, actor string) error {
+			remoteIssue, ok := extIssue.Raw.(*linear.Issue)
+			if !ok || remoteIssue == nil {
+				return fmt.Errorf("ReconcileLabels: unexpected raw type %T", extIssue.Raw)
+			}
+
+			linearLabels := make([]linear.LinearLabel, 0)
+			if remoteIssue.Labels != nil {
+				for _, l := range remoteIssue.Labels.Nodes {
+					linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
+				}
+			}
+
+			snap, err := tx.GetLinearLabelSnapshot(ctx, issueID)
+			if err != nil {
+				return fmt.Errorf("load snapshot: %w", err)
+			}
+			snapEntries := make([]linear.SnapshotEntry, len(snap))
+			for i, s := range snap {
+				snapEntries[i] = linear.SnapshotEntry{Name: s.LabelName, ID: s.LabelID}
+			}
+
+			currentLabels, err := tx.GetLabels(ctx, issueID)
+			if err != nil {
+				return fmt.Errorf("get current labels: %w", err)
+			}
+
+			res := linear.ReconcileLabels(linear.LabelReconcileInput{
+				Beads:    currentLabels,
+				Linear:   linearLabels,
+				Snapshot: snapEntries,
+				Exclude:  lt.LabelExclude(),
+			})
+
+			// Apply Beads-side mutations only — Linear-side mutations
+			// (RemoveFromLinear, AddToLinear) are owned by the push path
+			// (Tracker.UpdateIssue), which runs in a separate transaction
+			// and writes its own snapshot after a successful API call.
+			for _, n := range res.RemoveFromBeads {
+				if err := tx.RemoveLabel(ctx, issueID, n, actor); err != nil {
+					return fmt.Errorf("remove label %q: %w", n, err)
+				}
+			}
+			for _, n := range res.AddToBeads {
+				if err := tx.AddLabel(ctx, issueID, n, actor); err != nil {
+					return fmt.Errorf("add label %q: %w", n, err)
+				}
+			}
+
+			// Snapshot reflects the agreed state after pull-side mutations.
+			snapshotEntries := make([]storage.LinearLabelSnapshotEntry, len(res.NewSnapshot))
+			for i, e := range res.NewSnapshot {
+				snapshotEntries[i] = storage.LinearLabelSnapshotEntry{LabelID: e.ID, LabelName: e.Name}
+			}
+			return tx.PutLinearLabelSnapshot(ctx, issueID, snapshotEntries)
+		}
+	}
+
 	return hooks
 }
 
@@ -352,13 +530,85 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 		ContentEqual: func(local *types.Issue, remote *tracker.TrackerIssue) bool {
 			remoteIssue, ok := remote.Raw.(*linear.Issue)
 			if ok && remoteIssue != nil {
-				return linear.PushFieldsEqual(local, remoteIssue, config)
+				if !linear.PushFieldsEqual(local, remoteIssue, config) {
+					return false
+				}
+				// Decision #12: label sync gate. When label sync is enabled,
+				// non-empty PUSH-DIRECTION label delta forces a push even if all
+				// other fields are equal.
+				if lt.LabelSyncEnabled() && hasLabelDelta(ctx, lt, local, remoteIssue) {
+					return false
+				}
+				return true
 			}
 			remoteConv := lt.FieldMapper().IssueToBeads(remote)
 			if remoteConv == nil || remoteConv.Issue == nil {
 				return false
 			}
 			return linear.PushFieldsEqualToBeads(local, remoteConv.Issue)
+		},
+		DescribeDiff: func(local *types.Issue, remote *tracker.TrackerIssue) []string {
+			remoteIssue, ok := remote.Raw.(*linear.Issue)
+			if !ok || remoteIssue == nil {
+				return nil
+			}
+			diffs := linear.PushFieldsDiff(local, remoteIssue, config)
+
+			// Append label diff when label sync is enabled.
+			if lt.LabelSyncEnabled() {
+				linearLabels := make([]linear.LinearLabel, 0)
+				if remoteIssue.Labels != nil {
+					for _, l := range remoteIssue.Labels.Nodes {
+						linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
+					}
+				}
+				snap, snapErr := lt.LoadSnapshot(ctx, local.ID)
+				if snapErr != nil {
+					debug.Logf("DescribeDiff: LoadSnapshot(%s) failed: %v — proceeding with nil snap", local.ID, snapErr)
+				}
+				res := linear.ReconcileLabels(linear.LabelReconcileInput{
+					Beads:    local.Labels,
+					Linear:   linearLabels,
+					Snapshot: snap,
+					Exclude:  lt.LabelExclude(),
+				})
+
+				// Build an ID→name lookup so RemoveFromLinear (which is []ID per
+				// the reconciler design) displays as names. Snapshot is the
+				// canonical source — every removed ID came from there. Linear's
+				// current labels are a fallback for IDs still present remotely.
+				nameByID := make(map[string]string, len(snap)+len(linearLabels))
+				for _, s := range snap {
+					nameByID[s.ID] = s.Name
+				}
+				for _, l := range linearLabels {
+					if _, ok := nameByID[l.ID]; !ok {
+						nameByID[l.ID] = l.Name
+					}
+				}
+				removeNames := make([]string, len(res.RemoveFromLinear))
+				for i, id := range res.RemoveFromLinear {
+					if name, ok := nameByID[id]; ok {
+						removeNames[i] = name
+					} else {
+						removeNames[i] = id // fallback — shouldn't happen for ids sourced from snapshot
+					}
+				}
+
+				if len(res.AddToLinear) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels +%v (push to Linear)", res.AddToLinear))
+				}
+				if len(removeNames) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from Linear)", removeNames))
+				}
+				if len(res.AddToBeads) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels +%v (add to bead)", res.AddToBeads))
+				}
+				if len(res.RemoveFromBeads) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from bead)", res.RemoveFromBeads))
+				}
+			}
+			return diffs
 		},
 		BuildStateCache: func(ctx context.Context) (interface{}, error) {
 			return linear.BuildStateCacheFromTracker(ctx, lt)
@@ -394,7 +644,135 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 			}
 			return false
 		},
+		SyncComments: buildCommentPushHook(ctx, lt),
 	}
+}
+
+// buildCommentPullHook creates a hook that pulls comments from Linear and imports them locally.
+// Uses the tracker's CommentSyncer interface for fetching. The hook unwraps the
+// HookFiringStore decorator to reach the concrete CommentRefStore implementation.
+func buildCommentPullHook(_ context.Context, lt *linear.Tracker) func(context.Context, string, string) error {
+	return func(ctx context.Context, localIssueID, externalIssueID string) error {
+		refStore, ok := storage.UnwrapStore(store).(storage.CommentRefStore)
+		if !ok {
+			return nil
+		}
+
+		comments, err := lt.FetchComments(ctx, externalIssueID, time.Time{})
+		if err != nil {
+			return fmt.Errorf("fetch comments: %w", err)
+		}
+
+		for _, c := range comments {
+			extRef := "linear:comment:" + c.ID
+			existing, err := refStore.GetCommentByExternalRef(ctx, localIssueID, extRef)
+			if err != nil {
+				continue
+			}
+			if existing != nil {
+				continue
+			}
+			if _, err := refStore.ImportCommentWithRef(ctx, localIssueID, c.Author, c.Body, extRef, c.CreatedAt); err != nil {
+				debug.Logf("comment import failed for %s: %v", localIssueID, err)
+			}
+		}
+		return nil
+	}
+}
+
+// buildAttachmentPullHook creates a hook that pulls attachment metadata from Linear.
+// Pull-only: beads does not push attachments to Linear.
+func buildAttachmentPullHook(_ context.Context, lt *linear.Tracker) func(context.Context, string, string) error {
+	return func(ctx context.Context, localIssueID, externalIssueID string) error {
+		attStore, ok := storage.UnwrapStore(store).(storage.AttachmentStore)
+		if !ok {
+			return nil
+		}
+
+		attachments, err := lt.FetchAttachments(ctx, externalIssueID)
+		if err != nil {
+			return fmt.Errorf("fetch attachments: %w", err)
+		}
+
+		for _, a := range attachments {
+			extRef := "linear:attachment:" + a.ID
+			existing, err := attStore.GetAttachmentByExternalRef(ctx, localIssueID, extRef)
+			if err != nil {
+				continue
+			}
+			if existing != nil {
+				continue
+			}
+			att := &types.Attachment{
+				IssueID:     localIssueID,
+				ExternalRef: extRef,
+				Filename:    a.Filename,
+				URL:         a.URL,
+				MimeType:    a.MimeType,
+				SizeBytes:   a.SizeBytes,
+				Source:      "linear",
+				Creator:     a.Creator,
+				CreatedAt:   a.CreatedAt,
+			}
+			if _, err := attStore.CreateAttachment(ctx, att); err != nil {
+				debug.Logf("attachment import failed for %s: %v", localIssueID, err)
+			}
+		}
+		return nil
+	}
+}
+
+// buildCommentPushHook creates a hook that pushes local comments to Linear.
+// Only comments without an existing linear:comment:* external_ref are pushed
+// (already-synced comments are skipped). Newly created Linear comment IDs are
+// recorded on the local comment so subsequent syncs don't duplicate.
+func buildCommentPushHook(_ context.Context, lt *linear.Tracker) func(context.Context, string, string) error {
+	return func(ctx context.Context, localIssueID, externalIssueID string) error {
+		refStore, ok := storage.UnwrapStore(store).(storage.CommentRefStore)
+		if !ok {
+			return nil
+		}
+
+		localComments, err := store.GetIssueComments(ctx, localIssueID)
+		if err != nil {
+			return fmt.Errorf("list local comments: %w", err)
+		}
+
+		for _, c := range localComments {
+			if strings.HasPrefix(c.ExternalRef, "linear:comment:") {
+				continue
+			}
+			remoteID, err := lt.CreateComment(ctx, externalIssueID, c.Text)
+			if err != nil {
+				debug.Logf("push comment to %s failed: %v", externalIssueID, err)
+				continue
+			}
+			extRef := "linear:comment:" + remoteID
+			if err := refStore.UpdateCommentExternalRef(ctx, localIssueID, c.ID, extRef); err != nil {
+				debug.Logf("record external_ref on %s failed: %v", c.ID, err)
+			}
+		}
+		return nil
+	}
+}
+
+// parseSinceFlag parses a --since value as either a duration shorthand
+// (e.g. "15d") or an absolute date (e.g. "2026-03-27"). Returns the cutoff
+// time; UpdatedAt strictly after this cutoff passes the filter.
+func parseSinceFlag(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		if err == nil && days > 0 {
+			return time.Now().UTC().AddDate(0, 0, -days), nil
+		}
+	}
+	for _, layout := range []string{"2006-01-02", "2006-01-02T15:04:05Z", time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("expected date (2006-01-02) or duration (15d)")
 }
 
 func runLinearStatus(cmd *cobra.Command, args []string) {
@@ -687,6 +1065,41 @@ func loadLinearMappingConfig(ctx context.Context) *linear.MappingConfig {
 	return linear.LoadMappingConfig(&storeConfigLoader{ctx: ctx})
 }
 
+// linearLabelSyncConfig holds the parsed label-sync configuration that the
+// Linear tracker needs to enable bidirectional label reconciliation.
+type linearLabelSyncConfig struct {
+	Enabled     bool
+	Exclude     map[string]bool
+	CreateScope linear.LabelScope
+}
+
+// loadLinearLabelSyncConfig parses the three label-sync config keys from a
+// flat config map. Pass `store.GetAllConfig()` results in.
+func loadLinearLabelSyncConfig(cfg map[string]string) linearLabelSyncConfig {
+	out := linearLabelSyncConfig{
+		Exclude:     map[string]bool{},
+		CreateScope: linear.LabelScopeTeam,
+	}
+	if v := cfg["linear.label_sync_enabled"]; strings.EqualFold(strings.TrimSpace(v), "true") {
+		out.Enabled = true
+	}
+	if v := cfg["linear.label_sync_exclude"]; v != "" {
+		for _, raw := range strings.Split(v, ",") {
+			n := strings.ToLower(strings.TrimSpace(raw))
+			if n != "" {
+				out.Exclude[n] = true
+			}
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg["linear.label_create_scope"])) {
+	case "workspace":
+		out.CreateScope = linear.LabelScopeWorkspace
+	default:
+		out.CreateScope = linear.LabelScopeTeam
+	}
+	return out
+}
+
 // getLinearIDMode returns the configured ID mode for Linear imports.
 // Supported values: "hash" (default) or "db".
 func getLinearIDMode(ctx context.Context) string {
@@ -716,4 +1129,83 @@ func getLinearHashLength(ctx context.Context) int {
 		return 8
 	}
 	return value
+}
+
+// hasLabelDelta runs the reconciler in dry-run mode against the persisted
+// snapshot and returns true if any **push-direction** label adds/removes
+// would fire. Used by the push-side ContentEqual to bypass the engine-level
+// skip when only labels differ in the push direction.
+//
+// Pull-direction deltas (AddToBeads, RemoveFromBeads) are deliberately NOT
+// checked here — those are the pull path's concern. Including them here would
+// cause push to issue an IssueUpdate carrying labelIds identical to Linear's
+// current state (a wasted API call) just because the bead is missing labels
+// Linear has.
+//
+// On LoadSnapshot error: log loudly and fall through with a nil snap rather
+// than short-circuiting to true. The reconciler's first-sync synthesis treats
+// nil snap as "use intersection of beads and Linear" — labels that genuinely
+// agree produce no delta, and labels that disagree still surface as adds.
+// Returning true here would force a push that DescribeDiff (which ignores
+// the same error) would then describe as having no diff — a UX inconsistency
+// that masks the true cause and produces no-op API calls in a loop.
+func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, remoteIssue *linear.Issue) bool {
+	linearLabels := make([]linear.LinearLabel, 0)
+	if remoteIssue.Labels != nil {
+		for _, l := range remoteIssue.Labels.Nodes {
+			linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
+		}
+	}
+	snap, err := lt.LoadSnapshot(ctx, local.ID)
+	if err != nil {
+		debug.Logf("hasLabelDelta: LoadSnapshot(%s) failed: %v — proceeding with nil snap", local.ID, err)
+	}
+	res := linear.ReconcileLabels(linear.LabelReconcileInput{
+		Beads:    local.Labels,
+		Linear:   linearLabels,
+		Snapshot: snap,
+		Exclude:  lt.LabelExclude(),
+	})
+	return len(res.AddToLinear) > 0 || len(res.RemoveFromLinear) > 0
+}
+
+// pullHasLabelDelta is the pull-side counterpart to hasLabelDelta. It compares
+// local.Labels (the bead's current label set) against remote.Labels (the
+// converted-from-Linear bead's label set) by name, and returns true if any
+// name differs.
+//
+// The pull-side hook only applies beads-side mutations, so a name-set diff
+// is sufficient to decide whether to enter the update path. The full
+// reconciler runs inside the transaction with full IDs.
+//
+// Excluded labels are ignored on both sides (case-insensitive).
+// Name comparison is case-insensitive — Linear treats labels case-insensitively,
+// and bead casing may diverge from Linear's display casing.
+func pullHasLabelDelta(lt *linear.Tracker, local *types.Issue, remote *types.Issue) bool {
+	localLower := make(map[string]bool, len(local.Labels))
+	for _, n := range local.Labels {
+		localLower[strings.ToLower(n)] = true
+	}
+	remoteLower := make(map[string]bool, len(remote.Labels))
+	for _, n := range remote.Labels {
+		remoteLower[strings.ToLower(n)] = true
+	}
+	excluded := lt.LabelExclude()
+	for k := range remoteLower {
+		if excluded != nil && excluded[k] {
+			continue
+		}
+		if !localLower[k] {
+			return true // Linear has a label beads doesn't
+		}
+	}
+	for k := range localLower {
+		if excluded != nil && excluded[k] {
+			continue
+		}
+		if !remoteLower[k] {
+			return true // beads has a label Linear doesn't
+		}
+	}
+	return false
 }

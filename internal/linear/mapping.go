@@ -1,13 +1,153 @@
 package linear
 
 import (
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// Noise-normalization regexes for markdown that Linear round-trips differently
+// than we send it. Stripping these lets the sync engine skip re-pushing content
+// that only differs in rendering-equivalent markdown syntax.
+var (
+	// Backslash escapes before punctuation Linear's editor emits verbatim
+	// (e.g. `1\. WiFi`, `\~880`, `\[5,5,5\]`, `\"x\"`). Strip escape to match
+	// human-authored form.
+	//
+	// Character class covers every GFM-significant char Linear's renderer is
+	// observed to emit-escaped on round-trip: `.`, `-`, `*`, `_`, `~` (struck),
+	// `[`/`]` (link disambiguation), `(`/`)` (link disambiguation), `<`/`>`
+	// (autolink/HTML), `"` (Linear round-trips quotes through JSON-encoded
+	// ProseMirror state), backtick (inline code), `!` (image syntax), `+`
+	// (list marker), `#` (heading), `=` (heading underline), `|` (table cell),
+	// `{`/`}` (extension syntax). Errs on the side of including chars that are
+	// GFM-significant — adding a char to strip is always safe (the unescape
+	// canonicalizes both sides), but missing a char produces silent push loops.
+	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]()<>!+#=|{}"` + "`" + `])`)
+	// Bold marker style: `__text__` and `**text**` render identically; Linear
+	// canonicalizes to `**text**`. Match local's underscore form and rewrite.
+	// Inner content excludes underscores and newlines so this doesn't munge
+	// nested or ambiguous cases like `__a_b__`.
+	reMarkdownBoldUnderscore = regexp.MustCompile(`__([^_\n]+?)__`)
+	// Bullet marker at line start: normalize `- ` / `+ ` to `* ` (Linear's form).
+	reMarkdownBullet = regexp.MustCompile(`(?m)^(\s*)[-+] `)
+	// Leading whitespace Linear inserts on round-trip but the bead lacks.
+	// Two narrow rules to avoid flattening intentionally-nested lists:
+	//
+	// reLeadingDigitPad strips exactly ONE leading space before a digit —
+	// Linear's digit-width padding for numbered lists (` 1. foo` aligned
+	// with `10. bar`). Nested ordered lists conventionally use 2+ space
+	// indents, so requiring exactly 1 protects them.
+	//
+	// reLeadingIndent strips 1-3 leading spaces/tabs before non-list,
+	// non-digit characters — Linear's continuation-paragraph indent after
+	// list items. 4+ spaces preserved (potential indented code block).
+	// Bullet markers (`-`, `+`, `*`) and digits excluded so nested lists
+	// keep their semantic indentation.
+	reLeadingDigitPad = regexp.MustCompile(`(?m)^ (\d)`)
+	reLeadingIndent   = regexp.MustCompile(`(?m)^[ \t]{1,3}([^ \t\-+*0-9\n])`)
+	// GFM table separator: collapse any run of dashes within a cell to `---`
+	// so widths don't churn on every sync.
+	reMarkdownTableSep = regexp.MustCompile(`\|\s*:?-{2,}:?\s*`)
+	// Trailing whitespace on each line.
+	reTrailingSpace = regexp.MustCompile(`(?m)[ \t]+$`)
+	// Runs of newlines (Linear inserts blank lines around headings/lists).
+	reNewlineRun = regexp.MustCompile(`\n{2,}`)
+	// Table cell inner padding: collapse consecutive spaces within cells.
+	reTableCellPad    = regexp.MustCompile(`\|[ \t]{2,}`)
+	reTableCellPadEnd = regexp.MustCompile(`[ \t]{2,}\|`)
+	// Linear auto-links bare URLs in descriptions on round-trip:
+	// `https://x` → `[https://x](<https://x>)`. Strip back to the bare URL
+	// for drift comparison.
+	reMarkdownAutoLink = regexp.MustCompile(`\[(https?://[^\]]+)\]\(<[^>]*>\)`)
+	// Linear wraps the URL portion of any markdown link in `<...>` when the
+	// URL contains characters that would otherwise need escaping (parens,
+	// spaces, etc.). `[text](<url>)` is semantically identical to
+	// `[text](url)` per CommonMark; collapse to the unwrapped form so a bead
+	// authored with the bare form doesn't drift against Linear's stored form.
+	// Applied AFTER reMarkdownAutoLink so the bare-URL collapse still wins
+	// for the `[url](<url>)` case. URL portion bounded to a single line so a
+	// pathological `>` later in the document can't extend the match.
+	reMarkdownLinkAngleURL = regexp.MustCompile(`\]\(<([^>\n]+)>\)`)
+	// Code-span shielding: fenced ```...``` blocks and inline `...` spans are
+	// extracted before normalization runs and restored after, so the escape
+	// stripper / bullet rewriter / etc. don't mangle content whose backslashes
+	// and markers are intentional. Order matters at apply time: fenced blocks
+	// must match first (they contain backticks).
+	reMarkdownFenced     = regexp.MustCompile("(?s)```.*?```")
+	reMarkdownInlineCode = regexp.MustCompile("`[^`\n]+`")
+)
+
+// NormalizeLinearMarkdown returns a form of s that collapses rendering-
+// equivalent markdown differences Linear's editor and our local authoring
+// produce. Used only for drift detection — does not mutate stored content.
+//
+// Code spans are shielded before the transform passes run so the bullet
+// rewriter and other line-level passes don't mangle code content. Restoration
+// behavior differs by span type:
+//
+//   - Fenced ```...``` blocks: restored verbatim. Inside a fenced block,
+//     escapes like `\(` are literal text (a backslash followed by a paren),
+//     not markdown escapes — stripping them would mask real edits.
+//   - Inline `...` spans: re-apply the escape stripper on restore. Per
+//     CommonMark, backslash escapes have no semantic effect inside an inline
+//     code span, but Linear's editor emits them anyway (e.g. “\[X\]“
+//     inside backticks for what bd authors as `[X]`). Without stripping,
+//     this drifts forever.
+//
+// Tradeoff for inline spans: a literal `\[` written inside an inline code
+// span to display a backslash-bracket sequence will be normalized to `[`
+// for drift purposes only (the source content is unchanged). Niche use case;
+// one false-no-op is preferable to a permanent drift loop on the common
+// case (any inline code span containing brackets/parens).
+func NormalizeLinearMarkdown(s string) string {
+	const sentinelPrefix = "\x00BDCODE"
+	const sentinelSuffix = "\x00"
+	shielded := make([]string, 0, 8)
+	stripEscapes := make([]bool, 0, 8)
+	shield := func(stripOnRestore bool) func(string) string {
+		return func(m string) string {
+			idx := len(shielded)
+			shielded = append(shielded, m)
+			stripEscapes = append(stripEscapes, stripOnRestore)
+			return fmt.Sprintf("%s%d%s", sentinelPrefix, idx, sentinelSuffix)
+		}
+	}
+	// Fenced blocks first (multi-backtick) so they aren't shredded by the
+	// inline pattern. Restored verbatim — escapes inside a fenced block are
+	// literal characters.
+	s = reMarkdownFenced.ReplaceAllStringFunc(s, shield(false))
+	// Inline spans: escapes are noise inside backticks per CommonMark; strip
+	// on restore so Linear's emit-form equates to bd's bare form.
+	s = reMarkdownInlineCode.ReplaceAllStringFunc(s, shield(true))
+
+	s = reMarkdownAutoLink.ReplaceAllString(s, "$1")
+	s = reMarkdownLinkAngleURL.ReplaceAllString(s, "]($1)")
+	s = reMarkdownEscape.ReplaceAllString(s, "$1")
+	s = reMarkdownBoldUnderscore.ReplaceAllString(s, "**$1**")
+	s = reMarkdownBullet.ReplaceAllString(s, "$1* ")
+	s = reLeadingDigitPad.ReplaceAllString(s, "$1")
+	s = reLeadingIndent.ReplaceAllString(s, "$1")
+	s = reMarkdownTableSep.ReplaceAllString(s, "| --- ")
+	s = reTableCellPad.ReplaceAllString(s, "| ")
+	s = reTableCellPadEnd.ReplaceAllString(s, " |")
+	s = reTrailingSpace.ReplaceAllString(s, "")
+	s = reNewlineRun.ReplaceAllString(s, "\n")
+
+	for i, original := range shielded {
+		restored := original
+		if stripEscapes[i] {
+			restored = reMarkdownEscape.ReplaceAllString(original, "$1")
+		}
+		s = strings.ReplaceAll(s, fmt.Sprintf("%s%d%s", sentinelPrefix, i, sentinelSuffix), restored)
+	}
+	return strings.TrimSpace(s)
+}
 
 // IDGenerationOptions configures Linear hash ID generation.
 type IDGenerationOptions struct {
@@ -286,27 +426,40 @@ func PriorityToLinear(beadsPriority int, config *MappingConfig) int {
 	return 3 // Default to Medium
 }
 
-// StateToBeadsStatus maps Linear state type to Beads status.
-// Checks both state type (backlog, unstarted, etc.) and state name for custom workflows.
-// Uses configurable mapping from linear.state_map.* config.
+// StateToBeadsStatus maps a Linear state to a Beads status.
+//
+// Resolution order (most specific → least):
+//  1. Explicit name match — if the user has set `linear.state_map.<state-name>`,
+//     that wins. This lets a Linear state literally named "Deferred" map to
+//     `deferred` even though Linear's backlog state type defaults to `open`.
+//     Only ExplicitStateMap entries (user-configured) win here; defaults are
+//     intentionally excluded so they can't shadow type-level mappings.
+//  2. Type match — fall back to the state's Linear category type (backlog,
+//     unstarted, started, completed, canceled) using StateMap, which combines
+//     defaults + explicit. Preserves prior behavior for teams without explicit
+//     name mappings.
+//  3. Default — StatusOpen.
+//
+// Pull direction only. Push uses ResolveStateIDForBeadsStatus which is
+// already explicit-only.
 func StateToBeadsStatus(state *State, config *MappingConfig) types.Status {
 	if state == nil {
 		return types.StatusOpen
 	}
 
-	// First, try to match by state type (preferred)
+	// 1. Explicit user-configured name match wins (e.g. linear.state_map.deferred = deferred).
+	stateName := strings.ToLower(state.Name)
+	if statusStr, ok := config.ExplicitStateMap[stateName]; ok {
+		return ParseBeadsStatus(statusStr)
+	}
+
+	// 2. Type fallback (defaults + explicit type entries).
 	stateType := strings.ToLower(state.Type)
 	if statusStr, ok := config.StateMap[stateType]; ok {
 		return ParseBeadsStatus(statusStr)
 	}
 
-	// Then try to match by state name (for custom workflow states)
-	stateName := strings.ToLower(state.Name)
-	if statusStr, ok := config.StateMap[stateName]; ok {
-		return ParseBeadsStatus(statusStr)
-	}
-
-	// Default fallback
+	// 3. Default.
 	return types.StatusOpen
 }
 
@@ -322,10 +475,43 @@ func stateMapMatchesStatus(mapped string, status types.Status) bool {
 	return false
 }
 
+// canonicalPushStatus reduces a beads status to one of the four standard
+// statuses Linear can natively represent (open/in_progress/closed) using the
+// beads StatusCategory grouping. Used as a fallback when the user's explicit
+// state_map doesn't have an entry for a less-common status (hooked, blocked,
+// pinned, deferred). Without this, push fails with "no configured Linear
+// state for beads status X" for any status the user hasn't explicitly mapped,
+// even though the category-equivalent state already maps cleanly.
+func canonicalPushStatus(status types.Status) types.Status {
+	switch types.BuiltInStatusCategory(status) {
+	case types.CategoryWIP:
+		return types.StatusInProgress
+	case types.CategoryDone:
+		return types.StatusClosed
+	case types.CategoryActive:
+		return types.StatusOpen
+	case types.CategoryFrozen:
+		// Frozen statuses (pinned/deferred) are paused work — closest tracker
+		// equivalent is open/backlog.
+		return types.StatusOpen
+	}
+	return status
+}
+
+// errNoStateMatch is returned by resolveStateIDExact when no Linear state in
+// the workflow cache maps to the requested beads status. Distinct from
+// ambiguity errors so callers (e.g. ResolveStateIDForBeadsStatus's canonical
+// fallback) can decide whether to retry — only "no match" should fall back;
+// ambiguity should surface immediately so misconfigurations aren't masked.
+var errNoStateMatch = errors.New("no Linear state matches beads status")
+
 // ResolveStateIDForBeadsStatus returns the unique Linear workflow state ID to
 // use when pushing the given beads status. Push only trusts explicit
 // linear.state_map.* entries; defaults are safe for pull but too ambiguous for
-// mutation.
+// mutation. If the explicit map has no entry for the actual status, falls back
+// to the category-canonical status (e.g. hooked → in_progress) before failing.
+// Ambiguity errors are NOT swallowed by the fallback path — they surface
+// immediately so misconfigured state_map entries don't go silently hidden.
 func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config *MappingConfig) (string, error) {
 	if cache == nil || len(cache.States) == 0 {
 		return "", fmt.Errorf("no workflow states found")
@@ -334,6 +520,39 @@ func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config
 		return "", fmt.Errorf("%s", missingExplicitStateMapMessage)
 	}
 
+	// Try the original status first.
+	id, err := resolveStateIDExact(cache, status, config)
+	if err == nil {
+		return id, nil
+	}
+	// Ambiguity (or any non-no-match error) surfaces directly — never masked
+	// by the canonical fallback below.
+	if !errors.Is(err, errNoStateMatch) {
+		return "", err
+	}
+
+	// No-match on the original status: try the category-canonical status
+	// (e.g. hooked → in_progress) once. Errors from this attempt — including
+	// ambiguity on the canonical side — surface as-is.
+	canonical := canonicalPushStatus(status)
+	if canonical == status {
+		return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q", status)
+	}
+	id, err = resolveStateIDExact(cache, canonical, config)
+	if err == nil {
+		return id, nil
+	}
+	if errors.Is(err, errNoStateMatch) {
+		return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q (also tried category-canonical %q)", status, canonical)
+	}
+	return "", fmt.Errorf("resolving canonical state for beads status %q (canonical=%q): %w", status, canonical, err)
+}
+
+// resolveStateIDExact does the explicit name + type lookup against state_map
+// for a single status, returning the unique state ID or an error describing
+// ambiguity / no-match. Extracted from ResolveStateIDForBeadsStatus so the
+// caller can retry with a canonical-fallback status before failing.
+func resolveStateIDExact(cache *StateCache, status types.Status, config *MappingConfig) (string, error) {
 	var nameMatches []State
 	for _, state := range cache.States {
 		mapped, ok := config.ExplicitStateMap[strings.ToLower(strings.TrimSpace(state.Name))]
@@ -370,10 +589,107 @@ func ResolveStateIDForBeadsStatus(cache *StateCache, status types.Status, config
 		return "", fmt.Errorf("linear.state_map type fallback is ambiguous for beads status %q across Linear states: %s", status, strings.Join(names, ", "))
 	}
 
-	return "", fmt.Errorf("linear.state_map has no configured Linear state for beads status %q", status)
+	return "", fmt.Errorf("%w: %q", errNoStateMatch, status)
+}
+
+// CloseIntent describes whether a closed bead represents completion (Done)
+// or cancellation (abandoned, superseded, duplicate) for purposes of routing
+// to the right terminal Linear state.
+type CloseIntent int
+
+const (
+	CloseIntentCompleted CloseIntent = iota
+	CloseIntentCanceled
+)
+
+// ClassifyCloseReason inspects a bead's close_reason free-form string and
+// returns whether the bead was canceled (abandoned) or completed (done).
+// Heuristics match the close_reason strings actually produced in Gas Town
+// (e.g. reaper's "stale:auto-closed by reaper") plus the common vocabulary
+// ("duplicate", "superseded", "obsolete", "wontfix", "abandoned") used by
+// humans when closing without shipping. Empty / generic / done-sounding
+// reasons default to Completed — the safer default for manual bd close.
+func ClassifyCloseReason(reason string) CloseIntent {
+	s := strings.ToLower(strings.TrimSpace(reason))
+	if s == "" {
+		return CloseIntentCompleted
+	}
+	// Both US ("canceled") and British ("cancelled") spellings are accepted.
+	// nolint:misspell // intentionally accepting both spellings
+	for _, prefix := range []string{
+		"stale:", "stale ", "stale,",
+		"canceled", "cancelled",
+		"duplicate",
+		"superseded",
+		"obsolete",
+		"wontfix", "won't fix", "wont-fix",
+		"abandoned",
+	} {
+		if strings.HasPrefix(s, prefix) {
+			return CloseIntentCanceled
+		}
+	}
+	return CloseIntentCompleted
+}
+
+// ResolveStateIDForIssue picks the correct Linear workflow state ID for
+// pushing `issue`. Non-closed statuses delegate to
+// ResolveStateIDForBeadsStatus (the existing explicit-state_map path).
+// Closed beads bypass state_map and use close_reason semantics to pick
+// a state of the correct Linear type:
+//   - cancellation intent → a "canceled"-type state (prefer name "Canceled")
+//   - completion intent   → a "completed"-type state (prefer name "Done")
+//
+// This lets a single beads status=closed correctly round-trip to either
+// Linear terminal state without the ambiguity of having both
+// state_map.canceled=closed and state_map.done=closed configured.
+func ResolveStateIDForIssue(cache *StateCache, issue *types.Issue, config *MappingConfig) (string, error) {
+	if issue == nil {
+		return "", fmt.Errorf("cannot resolve state: nil issue")
+	}
+	if issue.Status != types.StatusClosed {
+		return ResolveStateIDForBeadsStatus(cache, issue.Status, config)
+	}
+	if cache == nil || len(cache.States) == 0 {
+		return "", fmt.Errorf("no workflow states found")
+	}
+
+	desiredType := "completed"
+	preferredName := "done"
+	if ClassifyCloseReason(issue.CloseReason) == CloseIntentCanceled {
+		desiredType = "canceled"
+		preferredName = "canceled"
+	}
+
+	var candidates []State
+	for _, s := range cache.States {
+		if strings.EqualFold(strings.TrimSpace(s.Type), desiredType) {
+			candidates = append(candidates, s)
+		}
+	}
+	if len(candidates) == 0 {
+		// No Linear state of the desired type configured on the team.
+		// Fall back to the state_map path so the user still gets a
+		// deterministic error message if closed is unmapped entirely.
+		return ResolveStateIDForBeadsStatus(cache, types.StatusClosed, config)
+	}
+	for _, s := range candidates {
+		if strings.EqualFold(strings.TrimSpace(s.Name), preferredName) {
+			return s.ID, nil
+		}
+	}
+	// Preferred name absent (unusual team config). Use the first candidate
+	// of the correct type — better than erroring on an otherwise valid push.
+	return candidates[0].ID, nil
 }
 
 // ParseBeadsStatus converts a status string to types.Status.
+//
+// Covers every value defined in types.go's Status enum (open, in_progress,
+// blocked, deferred, closed, pinned, hooked) so callers that need to reason
+// about user-supplied status strings — including the pre-flight push validator
+// — can correctly classify all valid statuses. Unknown strings still default
+// to StatusOpen for backward compatibility.
 func ParseBeadsStatus(s string) types.Status {
 	switch strings.ToLower(s) {
 	case "open":
@@ -382,6 +698,12 @@ func ParseBeadsStatus(s string) types.Status {
 		return types.StatusInProgress
 	case "blocked":
 		return types.StatusBlocked
+	case "deferred":
+		return types.StatusDeferred
+	case "pinned":
+		return types.StatusPinned
+	case "hooked":
+		return types.StatusHooked
 	case "closed":
 		return types.StatusClosed
 	default:
@@ -399,6 +721,8 @@ func StatusToLinearStateType(status types.Status) string {
 		return "started"
 	case types.StatusBlocked:
 		return "started" // Linear doesn't have blocked state type
+	case types.StatusDeferred:
+		return "backlog" // Deferred lives in Linear's backlog category
 	case types.StatusClosed:
 		return "completed"
 	default:
@@ -416,13 +740,171 @@ func PushFieldsEqual(local *types.Issue, remote *Issue, config *MappingConfig) b
 	if local.Title != remote.Title {
 		return false
 	}
-	if BuildLinearDescription(local) != remote.Description {
+	if NormalizeLinearMarkdown(BuildLinearDescription(local)) != NormalizeLinearMarkdown(remote.Description) {
 		return false
 	}
 	if PriorityToLinear(local.Priority, config) != remote.Priority {
 		return false
 	}
-	return StateToBeadsStatus(remote.State, config) == local.Status
+	if StateToBeadsStatus(remote.State, config) != local.Status {
+		return false
+	}
+	// For closed beads, "equal beads status" isn't enough — Linear has
+	// two terminal states (completed → Done, canceled → Canceled) that
+	// both map to beads closed. If local's close_reason would route to a
+	// different Linear type than the current remote state, we must push.
+	if local.Status == types.StatusClosed && remote.State != nil {
+		localIsCanceled := ClassifyCloseReason(local.CloseReason) == CloseIntentCanceled
+		remoteIsCanceled := strings.EqualFold(strings.TrimSpace(remote.State.Type), "canceled")
+		if localIsCanceled != remoteIsCanceled {
+			return false
+		}
+	}
+	return true
+}
+
+// PushFieldsDiff returns a human-readable list of field differences between a
+// local bead and the remote Linear issue. Used for dry-run verbose output so
+// users can see exactly what a push would change, rather than just "Would
+// update". Returns an empty slice when fields are equivalent.
+func PushFieldsDiff(local *types.Issue, remote *Issue, config *MappingConfig) []string {
+	if local == nil || remote == nil {
+		return nil
+	}
+	var diffs []string
+	if local.Title != remote.Title {
+		diffs = append(diffs, fmt.Sprintf("title: %q → %q", remote.Title, local.Title))
+	}
+	localDesc := BuildLinearDescription(local)
+	normalizedRemote := NormalizeLinearMarkdown(remote.Description)
+	normalizedLocal := NormalizeLinearMarkdown(localDesc)
+	if normalizedRemote != normalizedLocal {
+		// Show diff against the normalized strings so the reported byte
+		// position points to genuine drift, not noise the normalizer would
+		// neutralize. Length still reflects the raw strings (more useful for
+		// understanding what's about to be pushed) but the first-diff window
+		// is taken from normalized form.
+		diffs = append(diffs, describeNormalizedTextDiff(
+			"description", remote.Description, localDesc,
+			normalizedRemote, normalizedLocal,
+		))
+	}
+	localPrio := PriorityToLinear(local.Priority, config)
+	if localPrio != remote.Priority {
+		diffs = append(diffs, fmt.Sprintf("priority: %d → %d", remote.Priority, localPrio))
+	}
+	remoteStatus := StateToBeadsStatus(remote.State, config)
+	if remoteStatus != local.Status {
+		remoteName := ""
+		if remote.State != nil {
+			remoteName = remote.State.Name
+		}
+		diffs = append(diffs, fmt.Sprintf("status: %s (%q) → %s", remoteStatus, remoteName, local.Status))
+	}
+	if local.Status == types.StatusClosed && remote.State != nil {
+		localIsCanceled := ClassifyCloseReason(local.CloseReason) == CloseIntentCanceled
+		remoteIsCanceled := strings.EqualFold(strings.TrimSpace(remote.State.Type), "canceled")
+		if localIsCanceled != remoteIsCanceled {
+			targetType := "completed"
+			if localIsCanceled {
+				targetType = "canceled"
+			}
+			diffs = append(diffs, fmt.Sprintf("close intent: %s → %s (from close_reason=%q)", remote.State.Type, targetType, local.CloseReason))
+		}
+	}
+	return diffs
+}
+
+// describeNormalizedTextDiff is like describeTextDiff but takes both the raw
+// and the normalized forms of the two strings. Length numbers come from raw
+// (so users see the size of what would be pushed), but the first-diff byte
+// position and surrounding excerpt come from the normalized strings — the
+// raw position would just point at noise the normalizer neutralizes (markdown
+// bullet style, escape backslashes, etc.) and mislead the reader about where
+// the genuine drift starts.
+func describeNormalizedTextDiff(label, before, after, normBefore, normAfter string) string {
+	if normBefore == normAfter {
+		// Defensive: caller shouldn't invoke this when normalized strings
+		// match, but guard against drift in the call site by emitting nothing.
+		return ""
+	}
+	minLen := len(normBefore)
+	if len(normAfter) < minLen {
+		minLen = len(normAfter)
+	}
+	firstDiff := minLen
+	for i := 0; i < minLen; i++ {
+		if normBefore[i] != normAfter[i] {
+			firstDiff = i
+			break
+		}
+	}
+	const window = 30
+	start := firstDiff - window
+	if start < 0 {
+		start = 0
+	}
+	beforeEnd := firstDiff + window
+	if beforeEnd > len(normBefore) {
+		beforeEnd = len(normBefore)
+	}
+	afterEnd := firstDiff + window
+	if afterEnd > len(normAfter) {
+		afterEnd = len(normAfter)
+	}
+	beforeWin := sanitizeForOneLine(normBefore[start:beforeEnd])
+	afterWin := sanitizeForOneLine(normAfter[start:afterEnd])
+	return fmt.Sprintf("%s: %d → %d chars, first real diff (after markdown-noise normalization) at byte %d\n        remote: …%s…\n        local:  …%s…",
+		label, len(before), len(after), firstDiff, beforeWin, afterWin)
+}
+
+// describeTextDiff returns a short, human-readable summary of how two strings
+// differ. Includes length delta and the first differing excerpt so users can
+// see *what* changed, not just "it's different". Used for dry-run verbose
+// descriptions of field drift.
+func describeTextDiff(label, before, after string) string {
+	if before == after {
+		return ""
+	}
+	// Find first differing byte position.
+	minLen := len(before)
+	if len(after) < minLen {
+		minLen = len(after)
+	}
+	firstDiff := minLen
+	for i := 0; i < minLen; i++ {
+		if before[i] != after[i] {
+			firstDiff = i
+			break
+		}
+	}
+
+	// Extract a ~30-char window of context on each side.
+	const window = 30
+	start := firstDiff - window
+	if start < 0 {
+		start = 0
+	}
+	beforeEnd := firstDiff + window
+	if beforeEnd > len(before) {
+		beforeEnd = len(before)
+	}
+	afterEnd := firstDiff + window
+	if afterEnd > len(after) {
+		afterEnd = len(after)
+	}
+	beforeWin := sanitizeForOneLine(before[start:beforeEnd])
+	afterWin := sanitizeForOneLine(after[start:afterEnd])
+
+	return fmt.Sprintf("%s: %d → %d chars, first diff at byte %d\n        remote: …%s…\n        local:  …%s…",
+		label, len(before), len(after), firstDiff, beforeWin, afterWin)
+}
+
+// sanitizeForOneLine collapses newlines/tabs so a multi-line excerpt prints
+// as a single readable line in terminal output.
+func sanitizeForOneLine(s string) string {
+	r := strings.NewReplacer("\n", "⏎", "\r", "⏎", "\t", "→")
+	return r.Replace(s)
 }
 
 // PushFieldsEqualToBeads is a fallback comparator for cases where Linear's raw
@@ -434,7 +916,7 @@ func PushFieldsEqualToBeads(local, remote *types.Issue) bool {
 	if local.Title != remote.Title {
 		return false
 	}
-	if BuildLinearDescription(local) != remote.Description {
+	if NormalizeLinearMarkdown(BuildLinearDescription(local)) != NormalizeLinearMarkdown(remote.Description) {
 		return false
 	}
 	if local.Priority != remote.Priority {
@@ -519,6 +1001,18 @@ func IssueToBeads(li *Issue, config *MappingConfig) *IssueConversion {
 
 	// Map state using configurable mapping
 	issue.Status = StateToBeadsStatus(li.State, config)
+
+	// Record cancel-intent in close_reason so future pushes route the bead
+	// to the same terminal Linear state (Canceled, not Done). beads only
+	// has a single closed status — without this hint, a bead that pulled
+	// from Linear's Canceled state would push back as Done on the next
+	// sync because ResolveStateIDForIssue defaults to Completed when
+	// close_reason is absent or looks done-ish.
+	if issue.Status == types.StatusClosed && li.State != nil {
+		if strings.EqualFold(strings.TrimSpace(li.State.Type), "canceled") {
+			issue.CloseReason = "canceled: pulled from Linear state " + li.State.Name
+		}
+	}
 
 	if li.CompletedAt != "" {
 		completedAt, err := time.Parse(time.RFC3339, li.CompletedAt)
