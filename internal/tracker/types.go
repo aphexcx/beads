@@ -97,6 +97,15 @@ type SyncOptions struct {
 	// beads tagged "gt:agent") that shouldn't be exported to the external
 	// tracker. Matched case-sensitively against issue.Labels.
 	ExcludeLabels []string
+	// ExcludeIDPrefix skips issues whose ID starts with this prefix (case-
+	// sensitive). Used to filter workflow-artifact beads (e.g. "hw-mol-")
+	// from external sync. Empty means no prefix filter.
+	ExcludeIDPrefix string
+	// ExcludeIDPatterns skips issues whose ID contains any of these
+	// substrings (case-sensitive, anywhere in the ID). Empty means no
+	// pattern filter. Combined with ExcludeIDPrefix as a union (matches
+	// either rule → excluded).
+	ExcludeIDPatterns []string
 	// ExcludeEphemeral skips ephemeral/wisp issues from push (default behavior in CLI).
 	ExcludeEphemeral bool
 	// ParentID limits push to this beads issue and all its descendants via

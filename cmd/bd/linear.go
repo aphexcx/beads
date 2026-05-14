@@ -300,6 +300,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 			}
 		}
 	}
+	applyLinearExcludeIDConfig(ctx, store, &opts)
 	if !includeEphemeral {
 		opts.ExcludeEphemeral = true
 	}
@@ -339,6 +340,17 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 		os.Exit(1)
+	}
+
+	// Post-sync: reconcile parent-child relationships into Linear's parent
+	// field. The per-issue create/update path can't always set parentId
+	// (children are sometimes pushed before parents have an external_ref),
+	// and previously-pushed orphan trees need a backfill. Idempotent — no
+	// API mutation when remote parent already matches. Skipped on scoped
+	// syncs (--parent / --type / --exclude-type / --issue-id) since the
+	// reconciler walks ALL local beads with external_refs.
+	if push && !dryRun && result.Success && !syncIsScoped(&opts) {
+		reconcileLinearParents(ctx, lt, &result.Warnings)
 	}
 
 	// Output results
@@ -1208,4 +1220,142 @@ func pullHasLabelDelta(lt *linear.Tracker, local *types.Issue, remote *types.Iss
 		}
 	}
 	return false
+}
+
+// linearConfigReader is the minimal slice of storage.Storage that the
+// linear-config helpers depend on. Lets tests inject a fake without
+// spinning up a Dolt server.
+type linearConfigReader interface {
+	GetConfig(ctx context.Context, key string) (string, error)
+}
+
+// applyLinearExcludeIDConfig reads linear.exclude_id_prefix and
+// linear.exclude_id_patterns from the given config reader and applies them
+// to opts. Push-direction-only filters; see the help text on linearSyncCmd.
+//
+// Empty values are no-ops. Patterns are comma-split, trimmed, with empty
+// entries dropped. If reader is nil (no store configured), this is a no-op.
+func applyLinearExcludeIDConfig(ctx context.Context, reader linearConfigReader, opts *tracker.SyncOptions) {
+	if reader == nil || opts == nil {
+		return
+	}
+	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_prefix"); v != "" {
+		opts.ExcludeIDPrefix = strings.TrimSpace(v)
+	}
+	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_patterns"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				opts.ExcludeIDPatterns = append(opts.ExcludeIDPatterns, p)
+			}
+		}
+	}
+}
+
+// syncIsScoped returns true when the user constrained the sync to a subset
+// of beads (via --parent, --type, --exclude-type, or specific IDs). The
+// parent reconcile pass is skipped on scoped syncs because it walks the
+// full local tree, which could mutate Linear-side state outside the scope
+// the user asked for.
+func syncIsScoped(opts *tracker.SyncOptions) bool {
+	if opts == nil {
+		return false
+	}
+	if opts.ParentID != "" || len(opts.IssueIDs) > 0 {
+		return true
+	}
+	if len(opts.TypeFilter) > 0 || len(opts.ExcludeTypes) > 0 {
+		return true
+	}
+	return false
+}
+
+// reconcileLinearParents runs as a post-sync pass to wire parent-child bead
+// dependencies into Linear's parent issue field. Idempotent — no API call
+// when the remote parent already matches.
+func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, warnings *[]string) {
+	if lt == nil || store == nil {
+		return
+	}
+	links, err := buildLinearParentLinks(ctx, lt)
+	if err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: building link set failed: %v", err))
+		return
+	}
+	if len(links) == 0 {
+		return
+	}
+	stats, err := lt.ReconcileParents(ctx, links)
+	if stats != nil && stats.Updated > 0 {
+		fmt.Printf("✓ Reconciled %d Linear parent link%s\n",
+			stats.Updated, plural(stats.Updated))
+	}
+	if err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: %v", err))
+		return
+	}
+	for _, e := range stats.Errors {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: %v", e))
+	}
+}
+
+// buildLinearParentLinks enumerates local beads with a Linear external_ref
+// and a parent-child dependency to a parent that also has a Linear
+// external_ref. Beads whose parent isn't yet synced to Linear are silently
+// skipped — they'll get picked up on a subsequent sync.
+func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.ParentLink, error) {
+	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	if err != nil {
+		return nil, err
+	}
+	idToIdent := make(map[string]string, len(issues))
+	for _, issue := range issues {
+		if issue.ExternalRef == nil {
+			continue
+		}
+		ref := strings.TrimSpace(*issue.ExternalRef)
+		if !lt.IsExternalRef(ref) {
+			continue
+		}
+		ident := lt.ExtractIdentifier(ref)
+		if ident == "" {
+			continue
+		}
+		idToIdent[issue.ID] = ident
+	}
+	if len(idToIdent) == 0 {
+		return nil, nil
+	}
+	links := make([]linear.ParentLink, 0)
+	for _, issue := range issues {
+		childIdent, ok := idToIdent[issue.ID]
+		if !ok {
+			continue
+		}
+		deps, err := store.GetDependenciesWithMetadata(ctx, issue.ID)
+		if err != nil {
+			return nil, fmt.Errorf("loading deps for %s: %w", issue.ID, err)
+		}
+		for _, d := range deps {
+			if d == nil || d.DependencyType != types.DepParentChild {
+				continue
+			}
+			parentIdent, ok := idToIdent[d.Issue.ID]
+			if !ok {
+				continue
+			}
+			links = append(links, linear.ParentLink{
+				ChildIdentifier:  childIdent,
+				ParentIdentifier: parentIdent,
+			})
+		}
+	}
+	return links, nil
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
