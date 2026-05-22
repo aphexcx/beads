@@ -842,7 +842,25 @@ func BuildStateCache(ctx context.Context, client *Client) (*StateCache, error) {
 	return cache, nil
 }
 
-// FindStateForBeadsStatus returns the best Linear state ID for a Beads status.
+// FindStateForBeadsStatus returns the best Linear state ID for a Beads status
+// by matching only on Linear's state TYPE (backlog/unstarted/started/etc.) —
+// the first matching state wins, falling back to the first state in the cache
+// when no type matches.
+//
+// DEPRECATED: this function ignores explicit user mappings (linear.state_map.*)
+// and silently picks the first type-matched state. That is the failure mode that
+// produced the original Canceled-state regression — when a Linear team has both
+// "Done" and "Canceled" with type=completed, this function returns whichever the
+// API listed first, which can collapse a closed bead onto Canceled (or vice versa)
+// without warning.
+//
+// Use ResolveStateIDForBeadsStatus instead. It honors explicit linear.state_map
+// entries, surfaces ambiguity errors, and falls back to category-canonical
+// statuses safely. The only remaining caller (cmd/bd/linear.go's
+// PushHooks.ResolveState wiring) feeds an Engine.ResolveState path that has
+// no production callers (verified 2026-05-02 — only test invocations); the
+// wiring is preserved to avoid touching the cross-tracker PushHooks contract,
+// but new callers should migrate.
 func (sc *StateCache) FindStateForBeadsStatus(status types.Status) string {
 	targetType := StatusToLinearStateType(status)
 

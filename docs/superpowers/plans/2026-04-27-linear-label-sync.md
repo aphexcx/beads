@@ -4076,14 +4076,15 @@ All major spec requirements have at least one task. ✓
 - Every code step has actual code, not pseudo-code ✓
 - Test stubs in D2/D3 are intentional skips with cross-references to G3/G4 ✓
 
-**Known limitation (case-sensitivity, partial):** The reconciler matches label names case-sensitively in pass 3 (the truth table). Round 3-5 fixes have made the surrounding system case-aware enough to prevent the most dangerous failure modes:
-- Round 3: `LabelsByName` matches case-insensitively (`bug` resolves to existing Linear `Bug`).
-- Round 4: snapshot persists Linear's display case (no churn loop), `hasLabelDelta` is push-direction-only (no wasted pushes).
-- Round 5: `classifyRenames` (pass 2 of the reconciler) does case-insensitive `beadsSet` lookup, so casing mismatch + Linear rename does NOT destroy the Linear label. Duplicate `labelIds` from case mismatch are now deduplicated before the IssueUpdate call (preventing PK violations on snapshot insert).
+**Case-sensitivity (resolved post-merge):** Originally documented as a known v1 limitation; resolved as a follow-up fix (commit landing after this plan). The reconciler now does case-insensitive matching across all four call sites:
+- `applyTruthTable` — case-fold maps with original-case-preserved values. Bead "bug" + Linear "Bug" with no snapshot collapses to "in agreement" (no spurious adds).
+- `synthesizeFirstSyncSnapshot` — case-fold intersection.
+- `computeNewSnapshot` — lowercase-keyed map with Linear's display case preserved in values. Rename detection by ID.
+- `pullHasLabelDelta` (cmd/bd/linear.go) — case-fold set comparison.
 
-**What's still imperfect with case mismatches:** the truth table in pass 3 still treats `bug` and `Bug` as distinct labels, so a beads-`bug` + Linear-`Bug` scenario emits both `AddToLinear=["bug"]` and `AddToBeads=["Bug"]`. After dedup, the push sends one labelId (Linear's existing `Bug=L1`) and beads still gets a second `Bug` added via `AddToBeads`. End state: bead has `[bug, Bug]`, Linear has `[Bug]`. Visible duplication on the bead side, no data loss anywhere. User must reconcile casing manually.
+Output casing rule: `AddToLinear` uses the bead's spelling (sent to Linear); `AddToBeads` uses Linear's display case (so beads adopts Linear's canonical name). Snapshot persists Linear's display case as canonical.
 
-Recommendation in user docs (Task H1): keep bead label casing aligned with Linear's display casing. A v2 enhancement would push case normalization into the truth table itself.
+Verified via the mayor's hw-gxrq production scenario: bead "bug" + Linear "Bug" no longer thrashes, no duplicate label appears on either side.
 
 **Codex-found issues addressed (rounds 1-4):**
 

@@ -16,10 +16,19 @@ import (
 // that only differs in rendering-equivalent markdown syntax.
 var (
 	// Backslash escapes before punctuation Linear's editor emits verbatim
-	// (e.g. `1\. WiFi`, `\~880`, `\[5,5,5\]`). Strip escape to match
-	// human-authored form. Includes `[` and `]` because Linear escapes
-	// brackets in plain text to disambiguate markdown links.
-	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]` + "`" + `])`)
+	// (e.g. `1\. WiFi`, `\~880`, `\[5,5,5\]`, `\"x\"`). Strip escape to match
+	// human-authored form.
+	//
+	// Character class covers every GFM-significant char Linear's renderer is
+	// observed to emit-escaped on round-trip: `.`, `-`, `*`, `_`, `~` (struck),
+	// `[`/`]` (link disambiguation), `(`/`)` (link disambiguation), `<`/`>`
+	// (autolink/HTML), `"` (Linear round-trips quotes through JSON-encoded
+	// ProseMirror state), backtick (inline code), `!` (image syntax), `+`
+	// (list marker), `#` (heading), `=` (heading underline), `|` (table cell),
+	// `{`/`}` (extension syntax). Errs on the side of including chars that are
+	// GFM-significant — adding a char to strip is always safe (the unescape
+	// canonicalizes both sides), but missing a char produces silent push loops.
+	reMarkdownEscape = regexp.MustCompile(`\\([.\-*_~\[\]()<>!+#=|{}"` + "`" + `])`)
 	// Bold marker style: `__text__` and `**text**` render identically; Linear
 	// canonicalizes to `**text**`. Match local's underscore form and rewrite.
 	// Inner content excludes underscores and newlines so this doesn't munge
@@ -27,6 +36,21 @@ var (
 	reMarkdownBoldUnderscore = regexp.MustCompile(`__([^_\n]+?)__`)
 	// Bullet marker at line start: normalize `- ` / `+ ` to `* ` (Linear's form).
 	reMarkdownBullet = regexp.MustCompile(`(?m)^(\s*)[-+] `)
+	// Leading whitespace Linear inserts on round-trip but the bead lacks.
+	// Two narrow rules to avoid flattening intentionally-nested lists:
+	//
+	// reLeadingDigitPad strips exactly ONE leading space before a digit —
+	// Linear's digit-width padding for numbered lists (` 1. foo` aligned
+	// with `10. bar`). Nested ordered lists conventionally use 2+ space
+	// indents, so requiring exactly 1 protects them.
+	//
+	// reLeadingIndent strips 1-3 leading spaces/tabs before non-list,
+	// non-digit characters — Linear's continuation-paragraph indent after
+	// list items. 4+ spaces preserved (potential indented code block).
+	// Bullet markers (`-`, `+`, `*`) and digits excluded so nested lists
+	// keep their semantic indentation.
+	reLeadingDigitPad = regexp.MustCompile(`(?m)^ (\d)`)
+	reLeadingIndent   = regexp.MustCompile(`(?m)^[ \t]{1,3}([^ \t\-+*0-9\n])`)
 	// GFM table separator: collapse any run of dashes within a cell to `---`
 	// so widths don't churn on every sync.
 	reMarkdownTableSep = regexp.MustCompile(`\|\s*:?-{2,}:?\s*`)
@@ -41,21 +65,87 @@ var (
 	// `https://x` → `[https://x](<https://x>)`. Strip back to the bare URL
 	// for drift comparison.
 	reMarkdownAutoLink = regexp.MustCompile(`\[(https?://[^\]]+)\]\(<[^>]*>\)`)
+	// Linear wraps the URL portion of any markdown link in `<...>` when the
+	// URL contains characters that would otherwise need escaping (parens,
+	// spaces, etc.). `[text](<url>)` is semantically identical to
+	// `[text](url)` per CommonMark; collapse to the unwrapped form so a bead
+	// authored with the bare form doesn't drift against Linear's stored form.
+	// Applied AFTER reMarkdownAutoLink so the bare-URL collapse still wins
+	// for the `[url](<url>)` case. URL portion bounded to a single line so a
+	// pathological `>` later in the document can't extend the match.
+	reMarkdownLinkAngleURL = regexp.MustCompile(`\]\(<([^>\n]+)>\)`)
+	// Code-span shielding: fenced ```...``` blocks and inline `...` spans are
+	// extracted before normalization runs and restored after, so the escape
+	// stripper / bullet rewriter / etc. don't mangle content whose backslashes
+	// and markers are intentional. Order matters at apply time: fenced blocks
+	// must match first (they contain backticks).
+	reMarkdownFenced     = regexp.MustCompile("(?s)```.*?```")
+	reMarkdownInlineCode = regexp.MustCompile("`[^`\n]+`")
 )
 
 // NormalizeLinearMarkdown returns a form of s that collapses rendering-
 // equivalent markdown differences Linear's editor and our local authoring
 // produce. Used only for drift detection — does not mutate stored content.
+//
+// Code spans are shielded before the transform passes run so the bullet
+// rewriter and other line-level passes don't mangle code content. Restoration
+// behavior differs by span type:
+//
+//   - Fenced ```...``` blocks: restored verbatim. Inside a fenced block,
+//     escapes like `\(` are literal text (a backslash followed by a paren),
+//     not markdown escapes — stripping them would mask real edits.
+//   - Inline `...` spans: re-apply the escape stripper on restore. Per
+//     CommonMark, backslash escapes have no semantic effect inside an inline
+//     code span, but Linear's editor emits them anyway (e.g. “\[X\]“
+//     inside backticks for what bd authors as `[X]`). Without stripping,
+//     this drifts forever.
+//
+// Tradeoff for inline spans: a literal `\[` written inside an inline code
+// span to display a backslash-bracket sequence will be normalized to `[`
+// for drift purposes only (the source content is unchanged). Niche use case;
+// one false-no-op is preferable to a permanent drift loop on the common
+// case (any inline code span containing brackets/parens).
 func NormalizeLinearMarkdown(s string) string {
+	const sentinelPrefix = "\x00BDCODE"
+	const sentinelSuffix = "\x00"
+	shielded := make([]string, 0, 8)
+	stripEscapes := make([]bool, 0, 8)
+	shield := func(stripOnRestore bool) func(string) string {
+		return func(m string) string {
+			idx := len(shielded)
+			shielded = append(shielded, m)
+			stripEscapes = append(stripEscapes, stripOnRestore)
+			return fmt.Sprintf("%s%d%s", sentinelPrefix, idx, sentinelSuffix)
+		}
+	}
+	// Fenced blocks first (multi-backtick) so they aren't shredded by the
+	// inline pattern. Restored verbatim — escapes inside a fenced block are
+	// literal characters.
+	s = reMarkdownFenced.ReplaceAllStringFunc(s, shield(false))
+	// Inline spans: escapes are noise inside backticks per CommonMark; strip
+	// on restore so Linear's emit-form equates to bd's bare form.
+	s = reMarkdownInlineCode.ReplaceAllStringFunc(s, shield(true))
+
 	s = reMarkdownAutoLink.ReplaceAllString(s, "$1")
+	s = reMarkdownLinkAngleURL.ReplaceAllString(s, "]($1)")
 	s = reMarkdownEscape.ReplaceAllString(s, "$1")
 	s = reMarkdownBoldUnderscore.ReplaceAllString(s, "**$1**")
 	s = reMarkdownBullet.ReplaceAllString(s, "$1* ")
+	s = reLeadingDigitPad.ReplaceAllString(s, "$1")
+	s = reLeadingIndent.ReplaceAllString(s, "$1")
 	s = reMarkdownTableSep.ReplaceAllString(s, "| --- ")
 	s = reTableCellPad.ReplaceAllString(s, "| ")
 	s = reTableCellPadEnd.ReplaceAllString(s, " |")
 	s = reTrailingSpace.ReplaceAllString(s, "")
 	s = reNewlineRun.ReplaceAllString(s, "\n")
+
+	for i, original := range shielded {
+		restored := original
+		if stripEscapes[i] {
+			restored = reMarkdownEscape.ReplaceAllString(original, "$1")
+		}
+		s = strings.ReplaceAll(s, fmt.Sprintf("%s%d%s", sentinelPrefix, i, sentinelSuffix), restored)
+	}
 	return strings.TrimSpace(s)
 }
 
@@ -336,27 +426,40 @@ func PriorityToLinear(beadsPriority int, config *MappingConfig) int {
 	return 3 // Default to Medium
 }
 
-// StateToBeadsStatus maps Linear state type to Beads status.
-// Checks both state type (backlog, unstarted, etc.) and state name for custom workflows.
-// Uses configurable mapping from linear.state_map.* config.
+// StateToBeadsStatus maps a Linear state to a Beads status.
+//
+// Resolution order (most specific → least):
+//  1. Explicit name match — if the user has set `linear.state_map.<state-name>`,
+//     that wins. This lets a Linear state literally named "Deferred" map to
+//     `deferred` even though Linear's backlog state type defaults to `open`.
+//     Only ExplicitStateMap entries (user-configured) win here; defaults are
+//     intentionally excluded so they can't shadow type-level mappings.
+//  2. Type match — fall back to the state's Linear category type (backlog,
+//     unstarted, started, completed, canceled) using StateMap, which combines
+//     defaults + explicit. Preserves prior behavior for teams without explicit
+//     name mappings.
+//  3. Default — StatusOpen.
+//
+// Pull direction only. Push uses ResolveStateIDForBeadsStatus which is
+// already explicit-only.
 func StateToBeadsStatus(state *State, config *MappingConfig) types.Status {
 	if state == nil {
 		return types.StatusOpen
 	}
 
-	// First, try to match by state type (preferred)
+	// 1. Explicit user-configured name match wins (e.g. linear.state_map.deferred = deferred).
+	stateName := strings.ToLower(state.Name)
+	if statusStr, ok := config.ExplicitStateMap[stateName]; ok {
+		return ParseBeadsStatus(statusStr)
+	}
+
+	// 2. Type fallback (defaults + explicit type entries).
 	stateType := strings.ToLower(state.Type)
 	if statusStr, ok := config.StateMap[stateType]; ok {
 		return ParseBeadsStatus(statusStr)
 	}
 
-	// Then try to match by state name (for custom workflow states)
-	stateName := strings.ToLower(state.Name)
-	if statusStr, ok := config.StateMap[stateName]; ok {
-		return ParseBeadsStatus(statusStr)
-	}
-
-	// Default fallback
+	// 3. Default.
 	return types.StatusOpen
 }
 
@@ -581,6 +684,12 @@ func ResolveStateIDForIssue(cache *StateCache, issue *types.Issue, config *Mappi
 }
 
 // ParseBeadsStatus converts a status string to types.Status.
+//
+// Covers every value defined in types.go's Status enum (open, in_progress,
+// blocked, deferred, closed, pinned, hooked) so callers that need to reason
+// about user-supplied status strings — including the pre-flight push validator
+// — can correctly classify all valid statuses. Unknown strings still default
+// to StatusOpen for backward compatibility.
 func ParseBeadsStatus(s string) types.Status {
 	switch strings.ToLower(s) {
 	case "open":
@@ -589,6 +698,12 @@ func ParseBeadsStatus(s string) types.Status {
 		return types.StatusInProgress
 	case "blocked":
 		return types.StatusBlocked
+	case "deferred":
+		return types.StatusDeferred
+	case "pinned":
+		return types.StatusPinned
+	case "hooked":
+		return types.StatusHooked
 	case "closed":
 		return types.StatusClosed
 	default:
@@ -606,6 +721,8 @@ func StatusToLinearStateType(status types.Status) string {
 		return "started"
 	case types.StatusBlocked:
 		return "started" // Linear doesn't have blocked state type
+	case types.StatusDeferred:
+		return "backlog" // Deferred lives in Linear's backlog category
 	case types.StatusClosed:
 		return "completed"
 	default:

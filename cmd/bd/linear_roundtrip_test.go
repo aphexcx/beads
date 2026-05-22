@@ -861,6 +861,9 @@ func patchTestHooksForLabelSync(ctx context.Context, lt *linear.Tracker, push *t
 }
 
 // hasLabelDeltaTest mirrors hasLabelDelta from cmd/bd/linear.go — push direction only.
+// On LoadSnapshot error, falls through with nil snap (matches production behavior:
+// the reconciler's first-sync synthesis treats nil as "use intersection" which
+// produces no false delta when label sets agree).
 func hasLabelDeltaTest(ctx context.Context, lt *linear.Tracker, local *types.Issue, remoteIssue *linear.Issue) bool {
 	linearLabels := make([]linear.LinearLabel, 0)
 	if remoteIssue.Labels != nil {
@@ -868,10 +871,7 @@ func hasLabelDeltaTest(ctx context.Context, lt *linear.Tracker, local *types.Iss
 			linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
 		}
 	}
-	snap, err := lt.LoadSnapshot(ctx, local.ID)
-	if err != nil {
-		return true
-	}
+	snap, _ := lt.LoadSnapshot(ctx, local.ID)
 	res := linear.ReconcileLabels(linear.LabelReconcileInput{
 		Beads: local.Labels, Linear: linearLabels, Snapshot: snap, Exclude: lt.LabelExclude(),
 	})
@@ -879,29 +879,30 @@ func hasLabelDeltaTest(ctx context.Context, lt *linear.Tracker, local *types.Iss
 }
 
 // pullHasLabelDeltaTest mirrors pullHasLabelDelta from cmd/bd/linear.go.
+// Case-insensitive comparison so bead/Linear casing differences don't trigger false deltas.
 func pullHasLabelDeltaTest(lt *linear.Tracker, local, remote *types.Issue) bool {
-	localSet := make(map[string]bool, len(local.Labels))
+	localLower := make(map[string]bool, len(local.Labels))
 	for _, n := range local.Labels {
-		localSet[n] = true
+		localLower[strings.ToLower(n)] = true
 	}
-	remoteSet := make(map[string]bool, len(remote.Labels))
+	remoteLower := make(map[string]bool, len(remote.Labels))
 	for _, n := range remote.Labels {
-		remoteSet[n] = true
+		remoteLower[strings.ToLower(n)] = true
 	}
 	excluded := lt.LabelExclude()
-	for n := range remoteSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range remoteLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !localSet[n] {
+		if !localLower[k] {
 			return true
 		}
 	}
-	for n := range localSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range localLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !remoteSet[n] {
+		if !remoteLower[k] {
 			return true
 		}
 	}

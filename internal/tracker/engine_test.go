@@ -2417,3 +2417,224 @@ func TestEngineExcludeLabelsNoLabelsOnIssue(t *testing.T) {
 		t.Errorf("created %d issues; expected the no-label issue to pass through (want 1)", len(tracker.created))
 	}
 }
+
+// remoteAwareMockTracker is a mock that implements RemoteAwareUpdater so the
+// engine takes the fetchForForce branch on forced pushes (mirrors Linear's
+// production wiring).
+type remoteAwareMockTracker struct {
+	*mockTracker
+	updateWithRemoteCalls int
+}
+
+func (m *remoteAwareMockTracker) UpdateIssueWithRemote(ctx context.Context, externalID string, issue *types.Issue, _ *TrackerIssue) (*TrackerIssue, error) {
+	m.updateWithRemoteCalls++
+	return m.mockTracker.UpdateIssue(ctx, externalID, issue)
+}
+
+// TestEngineForcedPushSkipsWhenContentEqual is the bd-joz follow-up regression:
+// when the conflict resolver flags a bead as forced (local newer by timestamp)
+// but the actual content is unchanged (the timestamp drift came from a status
+// bulk-update or similar), the push should be skipped — not result in a no-op
+// API call (wet-run) or a "Would push field change (state preserved)" line
+// with no diffs (dry-run). Only applies to RemoteAwareUpdater trackers because
+// those are the ones for which we fetch the remote even on forced paths.
+func TestEngineForcedPushSkipsWhenContentEqual(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	// Local issue: content matches what the mock will return as remote;
+	// UpdatedAt is recent so the conflict resolver flags it as "local newer".
+	now := time.Now().UTC()
+	issue := &types.Issue{
+		ID:          "bd-force-eq",
+		Title:       "Same title",
+		Status:      types.StatusDeferred,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: strPtr("https://test.test/EXT-FE"),
+		UpdatedAt:   now,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	// Last sync is older than the issue's UpdatedAt → conflict detector sees
+	// a local edit since last sync.
+	lastSync := now.Add(-1 * time.Hour)
+	if err := store.SetConfig(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetConfig() error: %v", err)
+	}
+
+	base := newMockTracker("test")
+	base.issues = []TrackerIssue{
+		{
+			// Remote also "edited since last sync" so a conflict registers.
+			ID: "EXT-FE", Identifier: "EXT-FE",
+			Title:     "Same title",
+			UpdatedAt: now.Add(-15 * time.Minute),
+		},
+	}
+	tracker := &remoteAwareMockTracker{mockTracker: base}
+
+	contentEqualCalls := 0
+	hooks := &PushHooks{
+		ContentEqual: func(_ *types.Issue, _ *TrackerIssue) bool {
+			contentEqualCalls++
+			return true // simulate "timestamp bumped but content identical"
+		},
+	}
+	engine := NewEngine(tracker, store, "test-actor")
+	engine.PushHooks = hooks
+
+	// Run sync with ConflictLocal so the resolver pushes local on every
+	// conflict — produces forceIDs[bd-force-eq] = true.
+	result, err := engine.Sync(ctx, SyncOptions{
+		Push:               true,
+		Pull:               true,
+		DryRun:             true,
+		ConflictResolution: ConflictLocal,
+	})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Sync() not successful: %s", result.Error)
+	}
+	if contentEqualCalls == 0 {
+		t.Fatal("ContentEqual was never called on forced path — fix did not apply")
+	}
+	if result.PushStats.Updated != 0 {
+		t.Errorf("Updated = %d, want 0 (forced push should be filtered by ContentEqual)", result.PushStats.Updated)
+	}
+	if result.PushStats.Skipped == 0 {
+		t.Errorf("Skipped = %d, want >0 (forced push should be skipped when content is equal)", result.PushStats.Skipped)
+	}
+	if tracker.updateWithRemoteCalls != 0 {
+		t.Errorf("updateWithRemoteCalls = %d, want 0 (no API call for content-equal forced bead)", tracker.updateWithRemoteCalls)
+	}
+}
+
+// TestEngineForcedPushNonRemoteAwareStillForces verifies that the bd-joz #2
+// fix did NOT regress non-RemoteAwareUpdater trackers' intentional-overwrite
+// semantics on forced paths. A forced bead on a tracker without
+// RemoteAwareUpdater must still push even if a ContentEqual hook is present —
+// because we never fetch the remote on that path, ContentEqual has no remote
+// to compare against and is correctly NOT consulted.
+func TestEngineForcedPushNonRemoteAwareStillForces(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	now := time.Now().UTC()
+	issue := &types.Issue{
+		ID:          "bd-force-plain",
+		Title:       "Plain forced",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: strPtr("https://test.test/EXT-FP"),
+		UpdatedAt:   now,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	if err := store.SetConfig(ctx, "test.last_sync", now.Add(-1*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetConfig() error: %v", err)
+	}
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{ID: "EXT-FP", Identifier: "EXT-FP", Title: "Plain forced", UpdatedAt: now.Add(-15 * time.Minute)},
+	}
+
+	contentEqualCalls := 0
+	hooks := &PushHooks{
+		ContentEqual: func(_ *types.Issue, _ *TrackerIssue) bool {
+			contentEqualCalls++
+			return true // would skip if consulted — but it shouldn't be consulted on this path
+		},
+	}
+	engine := NewEngine(tracker, store, "test-actor")
+	engine.PushHooks = hooks
+
+	result, err := engine.Sync(ctx, SyncOptions{
+		Push:               true,
+		Pull:               true,
+		ConflictResolution: ConflictLocal,
+	})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Sync() not successful: %s", result.Error)
+	}
+	if contentEqualCalls != 0 {
+		t.Errorf("ContentEqual called %d times on non-RA forced path; want 0", contentEqualCalls)
+	}
+	if result.PushStats.Updated != 1 {
+		t.Errorf("Updated = %d, want 1 (forced push must still fire on non-RA tracker)", result.PushStats.Updated)
+	}
+}
+
+// TestEngineForcedPushRemoteAwareWithDiffStillPushes is the symmetric guard:
+// on a RemoteAwareUpdater forced path where ContentEqual returns FALSE
+// (genuine content drift), the push must proceed.
+func TestEngineForcedPushRemoteAwareWithDiffStillPushes(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	now := time.Now().UTC()
+	issue := &types.Issue{
+		ID:          "bd-force-diff",
+		Title:       "Local title (changed)",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: strPtr("https://test.test/EXT-FD"),
+		UpdatedAt:   now,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	if err := store.SetConfig(ctx, "test.last_sync", now.Add(-1*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetConfig() error: %v", err)
+	}
+
+	base := newMockTracker("test")
+	base.issues = []TrackerIssue{
+		{ID: "EXT-FD", Identifier: "EXT-FD", Title: "Old remote title", UpdatedAt: now.Add(-15 * time.Minute)},
+	}
+	tracker := &remoteAwareMockTracker{mockTracker: base}
+
+	contentEqualCalls := 0
+	hooks := &PushHooks{
+		ContentEqual: func(_ *types.Issue, _ *TrackerIssue) bool {
+			contentEqualCalls++
+			return false // genuine drift
+		},
+	}
+	engine := NewEngine(tracker, store, "test-actor")
+	engine.PushHooks = hooks
+
+	result, err := engine.Sync(ctx, SyncOptions{
+		Push:               true,
+		Pull:               true,
+		ConflictResolution: ConflictLocal,
+	})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Fatalf("Sync() not successful: %s", result.Error)
+	}
+	if contentEqualCalls == 0 {
+		t.Error("ContentEqual was never called on RA forced path with drift")
+	}
+	if result.PushStats.Updated != 1 {
+		t.Errorf("Updated = %d, want 1 (RA forced push with real diff must fire)", result.PushStats.Updated)
+	}
+	if tracker.updateWithRemoteCalls != 1 {
+		t.Errorf("updateWithRemoteCalls = %d, want 1", tracker.updateWithRemoteCalls)
+	}
+}

@@ -120,61 +120,67 @@ func classifyRenames(beads []string, linear []LinearLabel, snap []SnapshotEntry)
 //
 // It does not handle the rename results themselves — those are emitted
 // separately by the orchestrator using the LabelRename entries from pass 2.
+//
+// Matching is case-insensitive on label names — Linear treats labels case-
+// insensitively, and bead casing may diverge from Linear's display casing.
+// AddToBeads emits Linear's display case (so beads adopts Linear's spelling
+// for new labels). AddToLinear and RemoveFromBeads emit the bead's actual
+// spelling so existing local references stay correct.
 func applyTruthTable(beads []string, linear []LinearLabel, snap []SnapshotEntry, rc renameClass) LabelReconcileResult {
-	// Build presence sets, skipping consumed rows.
-	beadsSet := map[string]bool{}
+	// Build presence maps keyed by lowercase name; preserve original casing in values.
+	beadsByLower := map[string]string{} // lower → bead's actual spelling
 	for _, b := range beads {
 		if rc.consumedBeadsName[b] {
 			continue
 		}
-		beadsSet[b] = true
+		beadsByLower[strings.ToLower(b)] = b
 	}
-	linearByName := map[string]LinearLabel{}
+	linearByLower := map[string]LinearLabel{} // lower → LinearLabel (with Linear's display case)
 	for _, l := range linear {
 		if rc.consumedLinearID[l.ID] {
 			continue
 		}
-		linearByName[l.Name] = l
+		linearByLower[strings.ToLower(l.Name)] = l
 	}
-	snapByName := map[string]SnapshotEntry{}
+	snapByLower := map[string]SnapshotEntry{} // lower → SnapshotEntry
 	for _, s := range snap {
 		if rc.consumedSnapshotID[s.ID] {
 			continue
 		}
-		snapByName[s.Name] = s
+		snapByLower[strings.ToLower(s.Name)] = s
 	}
 
-	// Union of all names across the three sets.
+	// Union of all lowercase keys across the three sets.
 	all := map[string]bool{}
-	for n := range beadsSet {
-		all[n] = true
+	for k := range beadsByLower {
+		all[k] = true
 	}
-	for n := range linearByName {
-		all[n] = true
+	for k := range linearByLower {
+		all[k] = true
 	}
-	for n := range snapByName {
-		all[n] = true
+	for k := range snapByLower {
+		all[k] = true
 	}
 
 	var res LabelReconcileResult
-	for n := range all {
-		inBeads := beadsSet[n]
-		_, inLinear := linearByName[n]
-		snapEntry, inSnap := snapByName[n]
+	for k := range all {
+		beadName, inBeads := beadsByLower[k]
+		linearLabel, inLinear := linearByLower[k]
+		snapEntry, inSnap := snapByLower[k]
 
 		switch {
 		case inSnap && inBeads && inLinear:
-			// unchanged
+			// unchanged (bead and Linear may have different casing — leave as-is)
 		case !inSnap && inBeads && !inLinear:
-			res.AddToLinear = append(res.AddToLinear, n)
+			res.AddToLinear = append(res.AddToLinear, beadName)
 		case !inSnap && !inBeads && inLinear:
-			res.AddToBeads = append(res.AddToBeads, n)
+			res.AddToBeads = append(res.AddToBeads, linearLabel.Name)
 		case !inSnap && inBeads && inLinear:
-			// agreement — nothing
+			// agreement (both sides have it, casing may differ — no action)
 		case inSnap && !inBeads && inLinear:
 			res.RemoveFromLinear = append(res.RemoveFromLinear, snapEntry.ID)
 		case inSnap && inBeads && !inLinear:
-			res.RemoveFromBeads = append(res.RemoveFromBeads, n)
+			res.RemoveFromBeads = append(res.RemoveFromBeads, beadName)
 		case inSnap && !inBeads && !inLinear:
 			// agreement — nothing
 		}
@@ -187,14 +193,17 @@ func applyTruthTable(beads []string, linear []LinearLabel, snap []SnapshotEntry,
 // snapshot input on the first sync for a bead, so the truth table behaves
 // as if both sides were already in agreement on shared labels — preventing
 // removals while still allowing both-side adds to flow.
+//
+// Matching is case-insensitive (Linear treats labels case-insensitively); the
+// snapshot entry preserves Linear's display case for the canonical name.
 func synthesizeFirstSyncSnapshot(beads []string, linear []LinearLabel) []SnapshotEntry {
-	beadsSet := make(map[string]bool, len(beads))
+	beadsByLower := make(map[string]bool, len(beads))
 	for _, b := range beads {
-		beadsSet[b] = true
+		beadsByLower[strings.ToLower(b)] = true
 	}
 	var out []SnapshotEntry
 	for _, l := range linear {
-		if beadsSet[l.Name] {
+		if beadsByLower[strings.ToLower(l.Name)] {
 			out = append(out, SnapshotEntry{Name: l.Name, ID: l.ID})
 		}
 	}
@@ -269,32 +278,43 @@ func ReconcileLabels(in LabelReconcileInput) LabelReconcileResult {
 //     correctly reflects what we last agreed on, so the next sync's
 //     reconciler sees the same delta and retries.
 func computeNewSnapshot(snapshot []SnapshotEntry, linear []LinearLabel, res LabelReconcileResult) []SnapshotEntry {
+	// Use lowercase keys so case mismatches between snapshot, beads, and Linear
+	// don't produce duplicate entries or missed lookups. Values preserve the
+	// canonical display case (Linear's, when known).
 	out := make(map[string]SnapshotEntry, len(snapshot))
 	for _, s := range snapshot {
-		out[s.Name] = s
+		out[strings.ToLower(s.Name)] = s
 	}
 
-	// Apply renames: replace OldName entry with NewName (same ID).
+	// Apply renames: match the snapshot entry by ID (case-insensitive on names),
+	// then replace with the new name from the rename event.
 	for _, r := range res.RenamesApplied {
-		if entry, ok := out[r.OldName]; ok {
-			delete(out, r.OldName)
-			out[r.NewName] = SnapshotEntry{Name: r.NewName, ID: entry.ID}
+		var matchKey string
+		for k, v := range out {
+			if v.ID == r.ID {
+				matchKey = k
+				break
+			}
+		}
+		if matchKey != "" {
+			delete(out, matchKey)
+			out[strings.ToLower(r.NewName)] = SnapshotEntry{Name: r.NewName, ID: r.ID}
 		}
 	}
 
-	// Apply RemoveFromBeads: drop from snapshot.
+	// Apply RemoveFromBeads: drop from snapshot (case-insensitive).
 	for _, n := range res.RemoveFromBeads {
-		delete(out, n)
+		delete(out, strings.ToLower(n))
 	}
 
-	// Apply AddToBeads: add with Linear's ID/Name (preserves Linear's display case).
-	linearByName := make(map[string]LinearLabel, len(linear))
+	// Apply AddToBeads: add with Linear's display case (case-insensitive lookup).
+	linearByLower := make(map[string]LinearLabel, len(linear))
 	for _, l := range linear {
-		linearByName[l.Name] = l
+		linearByLower[strings.ToLower(l.Name)] = l
 	}
 	for _, n := range res.AddToBeads {
-		if l, ok := linearByName[n]; ok {
-			out[n] = SnapshotEntry{Name: n, ID: l.ID}
+		if l, ok := linearByLower[strings.ToLower(n)]; ok {
+			out[strings.ToLower(l.Name)] = SnapshotEntry{Name: l.Name, ID: l.ID}
 		}
 	}
 

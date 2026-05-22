@@ -562,18 +562,44 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 						linearLabels = append(linearLabels, linear.LinearLabel{Name: l.Name, ID: l.ID})
 					}
 				}
-				snap, _ := lt.LoadSnapshot(ctx, local.ID)
+				snap, snapErr := lt.LoadSnapshot(ctx, local.ID)
+				if snapErr != nil {
+					debug.Logf("DescribeDiff: LoadSnapshot(%s) failed: %v — proceeding with nil snap", local.ID, snapErr)
+				}
 				res := linear.ReconcileLabels(linear.LabelReconcileInput{
 					Beads:    local.Labels,
 					Linear:   linearLabels,
 					Snapshot: snap,
 					Exclude:  lt.LabelExclude(),
 				})
+
+				// Build an ID→name lookup so RemoveFromLinear (which is []ID per
+				// the reconciler design) displays as names. Snapshot is the
+				// canonical source — every removed ID came from there. Linear's
+				// current labels are a fallback for IDs still present remotely.
+				nameByID := make(map[string]string, len(snap)+len(linearLabels))
+				for _, s := range snap {
+					nameByID[s.ID] = s.Name
+				}
+				for _, l := range linearLabels {
+					if _, ok := nameByID[l.ID]; !ok {
+						nameByID[l.ID] = l.Name
+					}
+				}
+				removeNames := make([]string, len(res.RemoveFromLinear))
+				for i, id := range res.RemoveFromLinear {
+					if name, ok := nameByID[id]; ok {
+						removeNames[i] = name
+					} else {
+						removeNames[i] = id // fallback — shouldn't happen for ids sourced from snapshot
+					}
+				}
+
 				if len(res.AddToLinear) > 0 {
 					diffs = append(diffs, fmt.Sprintf("labels +%v (push to Linear)", res.AddToLinear))
 				}
-				if len(res.RemoveFromLinear) > 0 {
-					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from Linear)", res.RemoveFromLinear))
+				if len(removeNames) > 0 {
+					diffs = append(diffs, fmt.Sprintf("labels -%v (remove from Linear)", removeNames))
 				}
 				if len(res.AddToBeads) > 0 {
 					diffs = append(diffs, fmt.Sprintf("labels +%v (add to bead)", res.AddToBeads))
@@ -1116,8 +1142,13 @@ func getLinearHashLength(ctx context.Context) int {
 // current state (a wasted API call) just because the bead is missing labels
 // Linear has.
 //
-// Fail-safe: if the snapshot read errors, return true to force a push;
-// worse to silently swallow a label change than to issue a no-op mutation.
+// On LoadSnapshot error: log loudly and fall through with a nil snap rather
+// than short-circuiting to true. The reconciler's first-sync synthesis treats
+// nil snap as "use intersection of beads and Linear" — labels that genuinely
+// agree produce no delta, and labels that disagree still surface as adds.
+// Returning true here would force a push that DescribeDiff (which ignores
+// the same error) would then describe as having no diff — a UX inconsistency
+// that masks the true cause and produces no-op API calls in a loop.
 func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, remoteIssue *linear.Issue) bool {
 	linearLabels := make([]linear.LinearLabel, 0)
 	if remoteIssue.Labels != nil {
@@ -1127,7 +1158,7 @@ func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, 
 	}
 	snap, err := lt.LoadSnapshot(ctx, local.ID)
 	if err != nil {
-		return true
+		debug.Logf("hasLabelDelta: LoadSnapshot(%s) failed: %v — proceeding with nil snap", local.ID, err)
 	}
 	res := linear.ReconcileLabels(linear.LabelReconcileInput{
 		Beads:    local.Labels,
@@ -1148,29 +1179,31 @@ func hasLabelDelta(ctx context.Context, lt *linear.Tracker, local *types.Issue, 
 // reconciler runs inside the transaction with full IDs.
 //
 // Excluded labels are ignored on both sides (case-insensitive).
+// Name comparison is case-insensitive — Linear treats labels case-insensitively,
+// and bead casing may diverge from Linear's display casing.
 func pullHasLabelDelta(lt *linear.Tracker, local *types.Issue, remote *types.Issue) bool {
-	localSet := make(map[string]bool, len(local.Labels))
+	localLower := make(map[string]bool, len(local.Labels))
 	for _, n := range local.Labels {
-		localSet[n] = true
+		localLower[strings.ToLower(n)] = true
 	}
-	remoteSet := make(map[string]bool, len(remote.Labels))
+	remoteLower := make(map[string]bool, len(remote.Labels))
 	for _, n := range remote.Labels {
-		remoteSet[n] = true
+		remoteLower[strings.ToLower(n)] = true
 	}
 	excluded := lt.LabelExclude()
-	for n := range remoteSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range remoteLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !localSet[n] {
+		if !localLower[k] {
 			return true // Linear has a label beads doesn't
 		}
 	}
-	for n := range localSet {
-		if excluded != nil && excluded[strings.ToLower(n)] {
+	for k := range localLower {
+		if excluded != nil && excluded[k] {
 			continue
 		}
-		if !remoteSet[n] {
+		if !remoteLower[k] {
 			return true // beads has a label Linear doesn't
 		}
 	}
