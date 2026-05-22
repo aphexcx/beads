@@ -345,12 +345,22 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 	// Post-sync: reconcile parent-child relationships into Linear's parent
 	// field. The per-issue create/update path can't always set parentId
 	// (children are sometimes pushed before parents have an external_ref),
-	// and previously-pushed orphan trees need a backfill. Idempotent — no
-	// API mutation when remote parent already matches. Skipped on scoped
-	// syncs (--parent / --type / --exclude-type / --issue-id) since the
-	// reconciler walks ALL local beads with external_refs.
-	if push && !dryRun && result.Success && !syncIsScoped(&opts) {
-		reconcileLinearParents(ctx, lt, &result.Warnings)
+	// and previously-pushed orphan trees need a backfill. This pass is
+	// idempotent — no API mutation when remote parent already matches.
+	//
+	// In dry-run mode the pass still runs (read-only fetches) so the user
+	// gets a preview of which parents would be set; the IssueUpdate
+	// mutation is skipped per-link.
+	//
+	// Skipped on scoped syncs (--parent / --type / --exclude-type / --issue-id)
+	// since the reconciler walks ALL local beads with external_refs.
+	//
+	// `effectivePush` mirrors engine.Sync's bidirectional default so
+	// `bd linear sync --dry-run` (no direction flag) still previews the
+	// reconcile. opts.Push isn't readable after engine.Sync (passed by value).
+	effectivePush := push || (!push && !pull)
+	if effectivePush && result.Success && !syncIsScoped(&opts) {
+		reconcileLinearParents(ctx, lt, dryRun, jsonOutput, &result.Warnings)
 	}
 
 	// Output results
@@ -1273,7 +1283,17 @@ func syncIsScoped(opts *tracker.SyncOptions) bool {
 // reconcileLinearParents runs as a post-sync pass to wire parent-child bead
 // dependencies into Linear's parent issue field. Idempotent — no API call
 // when the remote parent already matches.
-func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, warnings *[]string) {
+//
+// In dry-run mode the read-only fetches still run and the per-link mutation
+// plan is printed as [dry-run] lines, but no IssueUpdate is issued. Lets
+// users preview the orphan-repair scope before committing to a wet sync.
+//
+// Human-readable output is suppressed when jsonOutput is true so the
+// caller's JSON serialization (in runLinearSync's output section) isn't
+// polluted with stray fmt.Printf lines. Warnings and errors still go
+// through the warnings slice, which IS surfaced in JSON output via
+// SyncResult.Warnings.
+func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jsonOutput bool, warnings *[]string) {
 	if lt == nil || store == nil {
 		return
 	}
@@ -1285,10 +1305,23 @@ func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, warnings *[
 	if len(links) == 0 {
 		return
 	}
-	stats, err := lt.ReconcileParents(ctx, links)
-	if stats != nil && stats.Updated > 0 {
-		fmt.Printf("✓ Reconciled %d Linear parent link%s\n",
-			stats.Updated, plural(stats.Updated))
+	stats, err := lt.ReconcileParents(ctx, links, dryRun)
+	// Print mutation summary; suppress when --json is requested so the
+	// JSON envelope stays clean.
+	if stats != nil && !jsonOutput {
+		if dryRun {
+			if stats.WouldUpdate > 0 {
+				fmt.Printf("[dry-run] Would reconcile %d Linear parent link%s\n",
+					stats.WouldUpdate, plural(stats.WouldUpdate))
+				for _, link := range stats.Mutations {
+					fmt.Printf("[dry-run] Would set parent of %s → %s\n",
+						link.ChildIdentifier, link.ParentIdentifier)
+				}
+			}
+		} else if stats.Updated > 0 {
+			fmt.Printf("✓ Reconciled %d Linear parent link%s\n",
+				stats.Updated, plural(stats.Updated))
+		}
 	}
 	if err != nil {
 		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: %v", err))
