@@ -111,6 +111,22 @@ type Storage interface {
 	Close() error
 }
 
+// CommentRefStore is an optional interface for stores that support comment external_ref operations.
+// Used by the sync engine for bidirectional comment synchronization.
+type CommentRefStore interface {
+	GetCommentByExternalRef(ctx context.Context, issueID, externalRef string) (*types.Comment, error)
+	ImportCommentWithRef(ctx context.Context, issueID, author, text, externalRef string, createdAt time.Time) (*types.Comment, error)
+	UpdateCommentExternalRef(ctx context.Context, issueID, commentID, externalRef string) error
+}
+
+// AttachmentStore is an optional interface for stores that support attachment operations.
+// Used by the sync engine for pulling attachment metadata from external trackers.
+type AttachmentStore interface {
+	CreateAttachment(ctx context.Context, att *types.Attachment) (*types.Attachment, error)
+	GetIssueAttachments(ctx context.Context, issueID string) ([]*types.Attachment, error)
+	GetAttachmentByExternalRef(ctx context.Context, issueID, externalRef string) (*types.Attachment, error)
+}
+
 // MergeSlotStatus is returned by MergeSlotCheck and describes the current
 // state of the merge slot bead.
 type MergeSlotStatus struct {
@@ -281,4 +297,24 @@ type Transaction interface {
 	AddComment(ctx context.Context, issueID, actor, comment string) error
 	ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error)
+
+	// Linear label snapshot operations (per-bead, written inside sync transactions).
+
+	// GetLinearLabelSnapshot returns the last-known label snapshot for the given bead.
+	// Returns an empty slice (never nil) when no snapshot exists. Order is unspecified;
+	// callers must not depend on a particular row order.
+	GetLinearLabelSnapshot(ctx context.Context, issueID string) ([]LinearLabelSnapshotEntry, error)
+
+	// PutLinearLabelSnapshot replaces the entire snapshot for the given bead.
+	// The replacement is atomic within the transaction (delete-then-insert).
+	// Passing an empty (or nil) entries slice clears the snapshot for the issue.
+	PutLinearLabelSnapshot(ctx context.Context, issueID string, entries []LinearLabelSnapshotEntry) error
+}
+
+// LinearLabelSnapshotEntry represents one row of a label-sync snapshot for a bead.
+// The snapshot captures the last-known agreed state between beads and Linear,
+// keyed by Linear label ID so renames can be detected on subsequent syncs.
+type LinearLabelSnapshotEntry struct {
+	LabelID   string
+	LabelName string
 }

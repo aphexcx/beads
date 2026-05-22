@@ -2127,3 +2127,293 @@ func TestEngineWarnCollectsMessages(t *testing.T) {
 		t.Errorf("expected 3 total warnings, got %d", len(engine.warnings))
 	}
 }
+
+// --- Tests for new sync behaviors ---
+
+func TestEnginePushSkipsTombstoneCreatesByDefault(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	closed := &types.Issue{
+		ID:        "bd-tomb",
+		Title:     "Done locally, never tracked",
+		Status:    types.StatusClosed,
+		IssueType: types.TypeTask,
+		Priority:  2,
+	}
+	if err := store.CreateIssue(ctx, closed, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	if err := store.UpdateIssue(ctx, closed.ID, map[string]interface{}{"status": string(types.StatusClosed)}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue() error: %v", err)
+	}
+
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Push: true})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(tracker.created) != 0 {
+		t.Errorf("expected zero creates (tombstone skip), got %d", len(tracker.created))
+	}
+	if result.PushStats.Created != 0 {
+		t.Errorf("PushStats.Created = %d, want 0", result.PushStats.Created)
+	}
+	if result.Stats.Skipped != 1 {
+		t.Errorf("Stats.Skipped = %d, want 1", result.Stats.Skipped)
+	}
+}
+
+func TestEnginePushCreateClosedOptInForcesTombstoneCreate(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	closed := &types.Issue{
+		ID:        "bd-tomb-2",
+		Title:     "Done locally",
+		Status:    types.StatusClosed,
+		IssueType: types.TypeTask,
+		Priority:  2,
+	}
+	if err := store.CreateIssue(ctx, closed, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	if err := store.UpdateIssue(ctx, closed.ID, map[string]interface{}{"status": string(types.StatusClosed)}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue() error: %v", err)
+	}
+
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Push: true, CreateClosed: true})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(tracker.created) != 1 {
+		t.Errorf("expected one create (--create-closed), got %d", len(tracker.created))
+	}
+	if result.PushStats.Created != 1 {
+		t.Errorf("PushStats.Created = %d, want 1", result.PushStats.Created)
+	}
+}
+
+func TestEnginePullUsesContentEqualHook(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	extRef := "https://test.test/EXT-CE"
+	existing := &types.Issue{
+		ID:          "bd-pull-ce",
+		Title:       "Local title",
+		Description: "Local body",
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		Priority:    2,
+		ExternalRef: &extRef,
+	}
+	if err := store.CreateIssue(ctx, existing, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	if err := store.UpdateIssue(ctx, existing.ID, map[string]interface{}{"external_ref": extRef}, "test-actor"); err != nil {
+		t.Fatalf("UpdateIssue() error: %v", err)
+	}
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{{
+		ID:         "EXT-CE",
+		Identifier: "EXT-CE",
+		URL:        extRef,
+		Title:      "Local title",
+		// Description differs from local — pullIssueEqual would say not-equal,
+		// but our hook will declare them equal.
+		Description: "Different body",
+	}}
+
+	engine := NewEngine(tracker, store, "test-actor")
+	hookCalls := 0
+	engine.PullHooks = &PullHooks{
+		ContentEqual: func(local, remote *types.Issue) bool {
+			hookCalls++
+			return true // declare equal regardless
+		},
+	}
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if hookCalls != 1 {
+		t.Errorf("ContentEqual hook should have been called once, got %d", hookCalls)
+	}
+	if result.PullStats.Updated != 0 {
+		t.Errorf("PullStats.Updated = %d, want 0 (hook returned equal)", result.PullStats.Updated)
+	}
+	if result.PullStats.Skipped != 1 {
+		t.Errorf("PullStats.Skipped = %d, want 1", result.PullStats.Skipped)
+	}
+}
+
+func TestPullIssueEqualClearsCloseReasonOnReopen(t *testing.T) {
+	ref := "https://test.com/EXT-3"
+	local := &types.Issue{
+		Title:       "same",
+		Description: "same",
+		Priority:    2,
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+		CloseReason: "stale:auto-closed by reaper",
+		ExternalRef: &ref,
+	}
+	remote := &types.Issue{
+		Title:       "same",
+		Description: "same",
+		Priority:    2,
+		Status:      types.StatusOpen,
+		IssueType:   types.TypeTask,
+	}
+	if pullIssueEqual(local, remote, ref) {
+		t.Errorf("pullIssueEqual should return false on reopen with stale close_reason")
+	}
+}
+
+func TestBuildPullIssueUpdatesClearsCloseReasonOnReopen(t *testing.T) {
+	ref := "https://test.com/EXT-4"
+	existing := &types.Issue{
+		ID:          "bd-reopen",
+		Status:      types.StatusClosed,
+		CloseReason: "stale:auto-closed by reaper",
+		ExternalRef: &ref,
+	}
+	remote := &types.Issue{
+		Status:      types.StatusOpen,
+		CloseReason: "",
+	}
+	updates := buildPullIssueUpdates(existing, remote, ref)
+	got, ok := updates["close_reason"]
+	if !ok {
+		t.Fatal("close_reason should be in updates map for reopen case")
+	}
+	if got != "" {
+		t.Errorf("close_reason update = %q, want empty (reopen clears it)", got)
+	}
+}
+
+func TestEngineExcludeLabels(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	// Create three issues — one carrying the agent label, one normal,
+	// one carrying multiple labels including the excluded one.
+	cases := []struct {
+		id     string
+		labels []string
+	}{
+		{"bd-agent1", []string{"gt:agent"}},
+		{"bd-feature1", []string{"frontend"}},
+		{"bd-multi", []string{"frontend", "gt:agent"}},
+	}
+	for _, tc := range cases {
+		issue := &types.Issue{
+			ID:        tc.id,
+			Title:     "Issue " + tc.id,
+			Status:    types.StatusOpen,
+			IssueType: types.TypeTask,
+			Priority:  2,
+			Labels:    tc.labels,
+		}
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue(%s) error: %v", tc.id, err)
+		}
+		if err := store.UpdateIssue(ctx, tc.id, map[string]interface{}{"labels": tc.labels}, "test-actor"); err != nil {
+			t.Fatalf("UpdateIssue(%s) labels error: %v", tc.id, err)
+		}
+	}
+
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+
+	result, err := engine.Sync(ctx, SyncOptions{
+		Push:          true,
+		ExcludeLabels: []string{"gt:agent"},
+	})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Errorf("Sync() not successful: %s", result.Error)
+	}
+	// Only bd-feature1 should make it through; bd-agent1 + bd-multi share gt:agent.
+	if len(tracker.created) != 1 {
+		t.Errorf("created %d issues (excluding gt:agent), want 1; tracker.created=%v", len(tracker.created), tracker.created)
+	}
+	for _, c := range tracker.created {
+		if c.ID != "bd-feature1" {
+			t.Errorf("unexpected issue created: %s (only bd-feature1 should pass the gt:agent filter)", c.ID)
+		}
+	}
+}
+
+func TestEngineExcludeLabelsEmpty(t *testing.T) {
+	// Empty ExcludeLabels (or no labels on issue) must not filter anything.
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	for _, id := range []string{"bd-a", "bd-b"} {
+		issue := &types.Issue{
+			ID: id, Title: "x", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2,
+		}
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue(%s) error: %v", id, err)
+		}
+	}
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+
+	// Empty ExcludeLabels — should NOT filter.
+	result, err := engine.Sync(ctx, SyncOptions{Push: true, ExcludeLabels: nil})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Errorf("Sync() not successful: %s", result.Error)
+	}
+	if len(tracker.created) != 2 {
+		t.Errorf("created %d issues with empty ExcludeLabels, want 2", len(tracker.created))
+	}
+}
+
+func TestEngineExcludeLabelsNoLabelsOnIssue(t *testing.T) {
+	// Non-empty ExcludeLabels filter but the issue has zero labels — must
+	// pass through unfiltered. Covers the implicit early-return when
+	// issue.Labels is empty/nil.
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issue := &types.Issue{
+		ID: "bd-nolabel", Title: "x", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2,
+	}
+	if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+		t.Fatalf("CreateIssue() error: %v", err)
+	}
+	tracker := newMockTracker("test")
+	engine := NewEngine(tracker, store, "test-actor")
+
+	result, err := engine.Sync(ctx, SyncOptions{
+		Push:          true,
+		ExcludeLabels: []string{"gt:agent"},
+	})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if !result.Success {
+		t.Errorf("Sync() not successful: %s", result.Error)
+	}
+	if len(tracker.created) != 1 {
+		t.Errorf("created %d issues; expected the no-label issue to pass through (want 1)", len(tracker.created))
+	}
+}

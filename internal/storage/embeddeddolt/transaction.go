@@ -124,6 +124,18 @@ func (t *embeddedTransaction) GetLabels(ctx context.Context, issueID string) ([]
 	return issueops.GetLabelsInTx(ctx, t.tx, "", issueID)
 }
 
+func (t *embeddedTransaction) GetLinearLabelSnapshot(ctx context.Context, issueID string) ([]storage.LinearLabelSnapshotEntry, error) {
+	return selectLinearLabelSnapshot(ctx, t.tx, issueID)
+}
+
+func (t *embeddedTransaction) PutLinearLabelSnapshot(ctx context.Context, issueID string, entries []storage.LinearLabelSnapshotEntry) error {
+	if err := replaceLinearLabelSnapshot(ctx, t.tx, issueID, entries); err != nil {
+		return err
+	}
+	t.dirty.MarkDirty("linear_label_snapshots")
+	return nil
+}
+
 func (t *embeddedTransaction) SetConfig(ctx context.Context, key, value string) error {
 	t.dirty.MarkDirty("config")
 	if err := issueops.SetConfigInTx(ctx, t.tx, key, value); err != nil {

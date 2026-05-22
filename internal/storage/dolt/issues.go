@@ -311,7 +311,7 @@ func (s *DoltStore) DeleteIssue(ctx context.Context, id string) error {
 	}
 
 	// GH#2455: Stage only the tables we modified, then commit without -A.
-	for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
+	for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots", "linear_label_snapshots"} {
 		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
 	}
 	commitMsg := fmt.Sprintf("bd: delete %s", id)
@@ -400,7 +400,7 @@ func (s *DoltStore) DeleteIssues(ctx context.Context, ids []string, cascade bool
 
 	// GH#2455: Stage only the tables this operation modified, then commit
 	// without -A.
-	for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots"} {
+	for _, table := range []string{"issues", "dependencies", "labels", "comments", "events", "child_counters", "issue_snapshots", "compaction_snapshots", "linear_label_snapshots"} {
 		_, _ = tx.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
 	}
 	commitMsg := fmt.Sprintf("bd: delete %d issue(s)", result.DeletedCount-wispDeleteCount)

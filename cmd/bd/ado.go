@@ -677,11 +677,15 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 			_, _ = fmt.Fprintf(out, "✓ Bootstrap matched %d issues\n", bootstrapMatched)
 		}
 		if result.Stats.Pulled > 0 {
-			_, _ = fmt.Fprintf(out, "✓ Pulled %d issues (%d created, %d updated)\n",
-				result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+			_, _ = fmt.Fprintf(out, "✓ Pulled %d issues from ADO (%d created, %d updated locally)\n",
+				result.Stats.Pulled, result.PullStats.Created, result.PullStats.Updated)
 		}
 		if result.Stats.Pushed > 0 {
-			_, _ = fmt.Fprintf(out, "✓ Pushed %d issues\n", result.Stats.Pushed)
+			_, _ = fmt.Fprintf(out, "✓ Pushed %d issues to ADO (%d created, %d updated)\n",
+				result.Stats.Pushed, result.PushStats.Created, result.PushStats.Updated)
+		}
+		if result.Stats.Skipped > 0 {
+			_, _ = fmt.Fprintf(out, "  Skipped %d (no changes needed)\n", result.Stats.Skipped)
 		}
 		if linksPushed > 0 {
 			_, _ = fmt.Fprintf(out, "✓ Synced %d dependency links\n", linksPushed)

@@ -774,6 +774,25 @@ func (t *doltTransaction) RemoveLabel(ctx context.Context, issueID, label, actor
 	return wrapExecError("remove label in tx", err)
 }
 
+// GetLinearLabelSnapshot returns the last-known label snapshot for the given bead.
+// Order is unspecified — callers must not depend on it.
+func (t *doltTransaction) GetLinearLabelSnapshot(ctx context.Context, issueID string) ([]storage.LinearLabelSnapshotEntry, error) {
+	return selectLinearLabelSnapshot(ctx, t.tx, issueID)
+}
+
+// PutLinearLabelSnapshot replaces the entire snapshot for the given bead.
+// The replacement is atomic within the transaction (delete-then-insert).
+// Passing an empty (or nil) entries slice clears the snapshot for the issue.
+func (t *doltTransaction) PutLinearLabelSnapshot(ctx context.Context, issueID string, entries []storage.LinearLabelSnapshotEntry) error {
+	if err := replaceLinearLabelSnapshot(ctx, t.tx, issueID, entries); err != nil {
+		return err
+	}
+	// CRITICAL: Dolt only commits tables in tx.dirty.DirtyTables() — without
+	// MarkDirty the rows are written to the session but dropped on commit.
+	t.dirty.MarkDirty("linear_label_snapshots")
+	return nil
+}
+
 // SetConfig sets a config value within the transaction
 func (t *doltTransaction) SetConfig(ctx context.Context, key, value string) error {
 	_, err := t.tx.ExecContext(ctx, `
@@ -860,32 +879,13 @@ func (t *doltTransaction) ImportIssueComment(ctx context.Context, issueID, autho
 	return &types.Comment{ID: id, IssueID: issueID, Author: author, Text: text, CreatedAt: createdAt}, nil
 }
 
+// GetIssueComments delegates to issueops.GetIssueCommentsInTx so
+// external_ref and updated_at are populated. The Linear push hook dedupes
+// already-synced comments by prefix-checking external_ref — a missing
+// column here causes every local comment to re-push on every sync
+// (observed as geometric comment growth on HOU-43 and others).
 func (t *doltTransaction) GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error) {
-	table := "comments"
-	if t.isActiveWisp(ctx, issueID) {
-		table = "wisp_comments"
-	}
-
-	//nolint:gosec // G201: table is hardcoded
-	rows, err := t.tx.QueryContext(ctx, fmt.Sprintf(`
-		SELECT id, issue_id, author, text, created_at
-		FROM %s
-		WHERE issue_id = ?
-		ORDER BY created_at ASC, id ASC
-	`, table), issueID)
-	if err != nil {
-		return nil, wrapQueryError("get comments in tx", err)
-	}
-	defer rows.Close()
-	var comments []*types.Comment
-	for rows.Next() {
-		var c types.Comment
-		if err := rows.Scan(&c.ID, &c.IssueID, &c.Author, &c.Text, &c.CreatedAt); err != nil {
-			return nil, wrapScanError("get comments in tx", err)
-		}
-		comments = append(comments, &c)
-	}
-	return comments, rows.Err()
+	return issueops.GetIssueCommentsInTx(ctx, t.tx, issueID)
 }
 
 // AddComment adds a comment within the transaction
