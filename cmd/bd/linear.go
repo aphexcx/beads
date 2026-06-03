@@ -1347,12 +1347,24 @@ func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jso
 // and a parent-child dependency to a parent that also has a Linear
 // external_ref. Beads whose parent isn't yet synced to Linear are silently
 // skipped — they'll get picked up on a subsequent sync.
+//
+// bd-go9 carve-out: when the parent's external_ref is a Linear Project URL
+// (set by `bd linear migrate-epic-to-project`), the parent isn't an Issue
+// and setting parentId on the child would be semantically wrong (and the
+// Linear API would reject it). Such links are silently skipped here.
+// The projectId-reconcile loop that mirrors this for the Project case is
+// bd-1ay scope; in the meantime, the migration tool itself sets projectId
+// on the descendants at conversion time.
 func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.ParentLink, error) {
 	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
 		return nil, err
 	}
-	idToIdent := make(map[string]string, len(issues))
+	type refInfo struct {
+		identifier string
+		isProject  bool
+	}
+	idToInfo := make(map[string]refInfo, len(issues))
 	for _, issue := range issues {
 		if issue.ExternalRef == nil {
 			continue
@@ -1365,15 +1377,25 @@ func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.P
 		if ident == "" {
 			continue
 		}
-		idToIdent[issue.ID] = ident
+		idToInfo[issue.ID] = refInfo{
+			identifier: ident,
+			isProject:  lt.IsProjectRef(ref),
+		}
 	}
-	if len(idToIdent) == 0 {
+	if len(idToInfo) == 0 {
 		return nil, nil
 	}
 	links := make([]linear.ParentLink, 0)
 	for _, issue := range issues {
-		childIdent, ok := idToIdent[issue.ID]
+		childInfo, ok := idToInfo[issue.ID]
 		if !ok {
+			continue
+		}
+		if childInfo.isProject {
+			// A child that is itself a Project is invalid for parentId
+			// assignment — skip defensively. (Shouldn't occur in normal
+			// trees; only matters if a Project bead ends up with a
+			// parent-child dep, which the migration tool doesn't create.)
 			continue
 		}
 		deps, err := store.GetDependenciesWithMetadata(ctx, issue.ID)
@@ -1384,13 +1406,20 @@ func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.P
 			if d == nil || d.DependencyType != types.DepParentChild {
 				continue
 			}
-			parentIdent, ok := idToIdent[d.Issue.ID]
+			parentInfo, ok := idToInfo[d.Issue.ID]
 			if !ok {
 				continue
 			}
+			if parentInfo.isProject {
+				// Parent has been migrated to a Linear Project — the
+				// child's relationship is via projectId, not parentId.
+				// Migration tool set it; bd-1ay will reconcile it on
+				// ongoing sync.
+				continue
+			}
 			links = append(links, linear.ParentLink{
-				ChildIdentifier:  childIdent,
-				ParentIdentifier: parentIdent,
+				ChildIdentifier:  childInfo.identifier,
+				ParentIdentifier: parentInfo.identifier,
 			})
 		}
 	}
