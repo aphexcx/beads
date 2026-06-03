@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/types"
@@ -1213,4 +1214,45 @@ func MapEpicToProjectState(status types.Status) string {
 	default:
 		return "planned"
 	}
+}
+
+// LinearProjectDescriptionMaxChars is the hard upper bound Linear enforces
+// on ProjectCreateInput.description / ProjectUpdateInput.description.
+// Exceeding this returns "Argument Validation Error" from the GraphQL
+// endpoint with "description must be shorter than or equal to 255
+// characters." Linear's content field has no such limit — for long bead
+// descriptions, callers should truncate description for the summary and
+// pass the full text via the content field.
+const LinearProjectDescriptionMaxChars = 255
+
+// TruncateLinearProjectDescription returns a copy of s that fits within
+// Linear's ProjectCreate/UpdateInput.description 255-char ceiling.
+//
+// Counts characters (runes), not bytes — Linear's limit is character-
+// based, and a byte-based cut could break a multi-byte UTF-8 sequence
+// and produce invalid output.
+//
+// When truncation is needed: prefers cutting at a word boundary (space
+// or newline) within the last 30 runes of the budget. Appends a "…"
+// marker so readers know the text was truncated. The marker counts
+// against the 255-char ceiling.
+//
+// Returns (cut, wasTruncated). wasTruncated lets callers conditionally
+// stash the full text in Project.content.
+func TruncateLinearProjectDescription(s string) (string, bool) {
+	const marker = "…"
+	if utf8.RuneCountInString(s) <= LinearProjectDescriptionMaxChars {
+		return s, false
+	}
+	runes := []rune(s)
+	// Budget: ceiling minus marker (1 rune).
+	maxBefore := LinearProjectDescriptionMaxChars - utf8.RuneCountInString(marker)
+	// Look for a clean word boundary in the last 30 runes of the budget.
+	const searchWindow = 30
+	for i := maxBefore; i > maxBefore-searchWindow && i > 0; i-- {
+		if runes[i] == ' ' || runes[i] == '\n' {
+			return string(runes[:i]) + marker, true
+		}
+	}
+	return string(runes[:maxBefore]) + marker, true
 }

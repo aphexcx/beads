@@ -903,6 +903,11 @@ func (t *Tracker) FetchAttachments(ctx context.Context, externalIssueID string) 
 
 // CreateProject creates a new Linear project from a beads epic.
 // Implements tracker.ProjectSyncer.
+//
+// Long descriptions are split: the truncated form (≤255 chars per
+// Linear's ProjectCreateInput limit) goes into description; the full
+// text goes into content (no length limit), preserving the bead's
+// authored body on the Project page (bd-cs1).
 func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string, string, error) {
 	client := t.primaryClient()
 	if client == nil {
@@ -910,7 +915,8 @@ func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string,
 	}
 
 	state := MapEpicToProjectState(epic.Status)
-	project, err := client.CreateProject(ctx, epic.Title, epic.Description, state)
+	desc, content := splitEpicDescriptionForProject(epic.Description)
+	project, err := client.CreateProject(ctx, epic.Title, desc, content, state)
 	if err != nil {
 		return "", "", err
 	}
@@ -920,20 +926,52 @@ func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string,
 
 // UpdateProject updates an existing Linear project from a beads epic.
 // Implements tracker.ProjectSyncer.
+//
+// Long descriptions follow the same description/content split as
+// CreateProject (bd-cs1): truncated summary in description, full text
+// in content. Same Linear-side length limits apply.
+//
+// content is ALWAYS included in the update map — when the bead's
+// description shortened from a long-truncated form to a short non-
+// truncated form, the prior Project.content (rich body from the long
+// run) would otherwise remain stale on Linear. Sending nil tells
+// Linear's GraphQL to clear the field.
 func (t *Tracker) UpdateProject(ctx context.Context, projectID string, epic *types.Issue) error {
 	client := t.primaryClient()
 	if client == nil {
 		return fmt.Errorf("no Linear client available")
 	}
 
+	desc, content := splitEpicDescriptionForProject(epic.Description)
 	updates := map[string]interface{}{
 		"name":        epic.Title,
-		"description": epic.Description,
+		"description": desc,
 		"state":       MapEpicToProjectState(epic.Status),
+	}
+	if content != "" {
+		updates["content"] = content
+	} else {
+		// Explicit clear: a previous long description that left content
+		// populated must not linger if the user shortens the description.
+		// Go nil → JSON null → Linear clears the field. (Same pattern as
+		// clearLinearIssueParent for parentId.)
+		updates["content"] = nil
 	}
 
 	_, err := client.UpdateProject(ctx, projectID, updates)
 	return err
+}
+
+// splitEpicDescriptionForProject splits an epic's description into the
+// short (description) and long (content) forms Linear's Project model
+// expects. When the source fits within Linear's 255-char limit,
+// content is empty so the caller can omit it from the GraphQL input.
+func splitEpicDescriptionForProject(full string) (description, content string) {
+	cut, truncated := TruncateLinearProjectDescription(full)
+	if !truncated {
+		return cut, ""
+	}
+	return cut, full
 }
 
 // FetchProjects retrieves Linear projects and converts them to TrackerProjects.

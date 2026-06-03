@@ -468,6 +468,15 @@ func printEpicMigrationPlan(plan *epicMigrationPlan, dryRun bool, legacyMode str
 		fmt.Printf("%sWould create Project %q in team %s for bead %s (currently Issue %s)\n",
 			prefix, plan.Bead.Title, plan.TeamID, plan.Bead.ID, plan.LegacyIdentifier)
 	}
+	// Surface the description-truncation behavior so users know what to
+	// expect on Linear (bd-cs1). Linear's ProjectCreateInput.description
+	// hard-caps at 255 chars; we truncate for the description summary
+	// and pass the full text via content (rich body, no length limit).
+	if _, truncated := linear.TruncateLinearProjectDescription(plan.Bead.Description); truncated {
+		fmt.Printf("%sNote: bead description (%d chars) exceeds Linear's Project description limit (255); "+
+			"the truncated summary will be the description, full text will be the Project content (rich body).\n",
+			prefix, len(plan.Bead.Description))
+	}
 	fmt.Printf("%sWould assign %d descendant Issue(s) to the Project:\n",
 		prefix, len(plan.Descendants))
 	for _, d := range plan.Descendants {

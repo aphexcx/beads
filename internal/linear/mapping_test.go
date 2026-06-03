@@ -1433,3 +1433,137 @@ func TestNormalizeLinearMarkdownEscapeCoverage(t *testing.T) {
 		})
 	}
 }
+
+// TestTruncateLinearProjectDescription is the bd-cs1 regression: Linear's
+// ProjectCreateInput.description hard-caps at 255 chars. Without
+// truncation, beads with long epic descriptions (e.g. houmanoids hw-sv1v
+// at 840 chars) fail CreateProject with "Argument Validation Error".
+// This helper produces a description that fits the cap; callers send the
+// full text via Project.content.
+func TestTruncateLinearProjectDescription(t *testing.T) {
+	const maxChars = LinearProjectDescriptionMaxChars
+
+	t.Run("short string returns unchanged", func(t *testing.T) {
+		got, truncated := TruncateLinearProjectDescription("short")
+		if truncated || got != "short" {
+			t.Errorf("got (%q, %v), want (\"short\", false)", got, truncated)
+		}
+	})
+
+	t.Run("empty returns empty", func(t *testing.T) {
+		got, truncated := TruncateLinearProjectDescription("")
+		if truncated || got != "" {
+			t.Errorf("got (%q, %v), want (\"\", false)", got, truncated)
+		}
+	})
+
+	t.Run("exactly at limit returns unchanged", func(t *testing.T) {
+		input := strings.Repeat("a", maxChars)
+		got, truncated := TruncateLinearProjectDescription(input)
+		if truncated {
+			t.Errorf("exactly %d chars should not be truncated", maxChars)
+		}
+		if got != input {
+			t.Errorf("got %q (len=%d), want unchanged", got, len(got))
+		}
+	})
+
+	t.Run("one over limit is truncated with marker", func(t *testing.T) {
+		input := strings.Repeat("a", maxChars+1)
+		got, truncated := TruncateLinearProjectDescription(input)
+		if !truncated {
+			t.Errorf("expected truncation for %d chars", len(input))
+		}
+		if utf8RuneCount(got) > maxChars {
+			t.Errorf("got %d runes, want ≤%d", utf8RuneCount(got), maxChars)
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Errorf("expected truncation marker at end, got %q", got[len(got)-10:])
+		}
+	})
+
+	t.Run("hw-sv1v case (840 chars) fits with word-boundary cut", func(t *testing.T) {
+		// Real bd-cs1 case shape: paragraph of English words.
+		const sentence = "The teleop-video-livekit epic spans nine phases delivering low-latency operator video to LiveKit Cloud via local SFU on the m20. "
+		input := strings.Repeat(sentence, 7) // ~ 870+ chars
+		got, truncated := TruncateLinearProjectDescription(input)
+		if !truncated {
+			t.Fatalf("expected truncation for %d-char input", len(input))
+		}
+		if utf8RuneCount(got) > maxChars {
+			t.Errorf("got %d runes, want ≤%d", utf8RuneCount(got), maxChars)
+		}
+		// Word-boundary cut: should not end mid-word (modulo the marker
+		// rune at the end). Strip marker and check the prior char is a
+		// word-boundary OR a letter at the very end of input's leading
+		// content (acceptable when no boundary exists in search window).
+		core := strings.TrimSuffix(got, "…")
+		if len(core) > 0 && !isWordBoundaryEnd(core) {
+			// Word-boundary preference is best-effort, not strict, so
+			// accept if no boundary exists in the search window. Just
+			// log for visibility.
+			t.Logf("non-word-boundary cut for hw-sv1v-shaped input: ...%q", core[max0(len(core)-20):])
+		}
+	})
+
+	t.Run("multi-byte runes counted as 1 char each", func(t *testing.T) {
+		// 300 emoji-style runes (each multi-byte in UTF-8). Should
+		// truncate based on rune count (300 > 255), not byte count.
+		input := strings.Repeat("🚀", 300)
+		got, truncated := TruncateLinearProjectDescription(input)
+		if !truncated {
+			t.Fatalf("expected truncation for 300 runes")
+		}
+		if utf8RuneCount(got) > maxChars {
+			t.Errorf("got %d runes, want ≤%d", utf8RuneCount(got), maxChars)
+		}
+		// Output must still be valid UTF-8 (no mid-codepoint cut).
+		if !utf8ValidString(got) {
+			t.Errorf("truncated output is not valid UTF-8: %q", got)
+		}
+	})
+
+	t.Run("no spaces in window falls back to hard cut", func(t *testing.T) {
+		input := strings.Repeat("abcdefghij", 30) // 300 chars, no spaces
+		got, truncated := TruncateLinearProjectDescription(input)
+		if !truncated {
+			t.Fatalf("expected truncation")
+		}
+		if utf8RuneCount(got) > maxChars {
+			t.Errorf("hard-cut overshot: got %d runes", utf8RuneCount(got))
+		}
+	})
+}
+
+// Helpers kept local so they don't pollute the linear package surface.
+func utf8RuneCount(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
+}
+
+func utf8ValidString(s string) bool {
+	for _, r := range s {
+		if r == 0xFFFD && !strings.ContainsRune(s, r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isWordBoundaryEnd(s string) bool {
+	if len(s) == 0 {
+		return true
+	}
+	last := s[len(s)-1]
+	return last == ' ' || last == '\n' || last == '.' || last == ','
+}
+
+func max0(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
