@@ -7,6 +7,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/linear"
@@ -472,10 +473,13 @@ func printEpicMigrationPlan(plan *epicMigrationPlan, dryRun bool, legacyMode str
 	// expect on Linear (bd-cs1). Linear's ProjectCreateInput.description
 	// hard-caps at 255 chars; we truncate for the description summary
 	// and pass the full text via content (rich body, no length limit).
+	// Count runes (chars), not bytes — matches TruncateLinearProjectDescription's
+	// rune-counted budget, so the user-facing number is consistent with the
+	// 255 cap they're being told about.
 	if _, truncated := linear.TruncateLinearProjectDescription(plan.Bead.Description); truncated {
 		fmt.Printf("%sNote: bead description (%d chars) exceeds Linear's Project description limit (255); "+
 			"the truncated summary will be the description, full text will be the Project content (rich body).\n",
-			prefix, len(plan.Bead.Description))
+			prefix, utf8.RuneCountInString(plan.Bead.Description))
 	}
 	fmt.Printf("%sWould assign %d descendant Issue(s) to the Project:\n",
 		prefix, len(plan.Descendants))

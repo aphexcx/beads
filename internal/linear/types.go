@@ -181,9 +181,17 @@ type ProjectTeam struct {
 
 // Project represents a project in Linear.
 type Project struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Description string  `json:"description"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Content is the rich-body markdown shown on the Project page itself.
+	// Distinct from Description (which has a 255-char cap). Populated by
+	// bd-cs1's CreateProject/UpdateProject split for long bead
+	// descriptions; only populated on fetch when the GraphQL query
+	// explicitly selects content (added to projectsQuery for read-back
+	// parity — without it, content written by bd would never be visible
+	// to subsequent pull/reconcile passes).
+	Content     string  `json:"content,omitempty"`
 	SlugId      string  `json:"slugId"`
 	URL         string  `json:"url"`
 	State       string  `json:"state"` // "planned", "started", "paused", "completed", "canceled"

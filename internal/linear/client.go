@@ -29,6 +29,7 @@ const projectsQuery = `
 				id
 				name
 				description
+				content
 				slugId
 				url
 				state
@@ -1282,6 +1283,7 @@ func (c *Client) CreateProject(ctx context.Context, name, description, content, 
 					id
 					name
 					description
+					content
 					slugId
 					url
 					state
@@ -1385,6 +1387,7 @@ func (c *Client) UpdateProject(ctx context.Context, projectID string, updates ma
 					id
 					name
 					description
+					content
 					slugId
 					url
 					state
