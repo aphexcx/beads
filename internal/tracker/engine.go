@@ -750,6 +750,19 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 	}
 
+	// bd-1ay: Epic-sync pass. For trackers implementing ProjectSyncer
+	// (Linear), ensure each top-level epic has a Linear Project. doPush's
+	// per-issue loop below uses epicProjectMap to skip those epics so
+	// they don't double-create as Issues.
+	//
+	// Scoped to top-level epics with empty or Project-URL external_ref;
+	// Issue-URL external_refs are left to the bd-go9 migration tool.
+	// Skipped silently for trackers that don't implement ProjectSyncer.
+	epicProjectMap, err := e.doEpicSync(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("epic-sync: %w", err)
+	}
+
 	// Fetch local issues
 	filter := types.IssueFilter{}
 	issues, err := e.Store.SearchIssues(ctx, "", filter)
@@ -777,6 +790,15 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 	}
 
+	// bd-1ay TODO (forward-risk note from codex round 2): the
+	// BatchPushTracker fast path below bypasses the per-issue loop
+	// where epicProjectMap is consulted. Linear (the only ProjectSyncer
+	// today) does NOT implement BatchPushTracker, so this is safe right
+	// now. If a future ProjectSyncer adapter ALSO implements
+	// BatchPushTracker, the batch path would need an epic-skip layer
+	// at the collectBatchPushIssues stage (parallel to the existing
+	// per-issue filter), or epic Projects would double-create as Issues
+	// in the batch.
 	if batchTracker, ok := e.Tracker.(BatchPushTracker); ok {
 		pushIssues, skipped := e.collectBatchPushIssues(issues, opts, descendantSet, skipIDs, forceIDs)
 		stats.Skipped += skipped
@@ -834,6 +856,16 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 		// Skip filtered types/states/ephemeral
 		if !e.shouldPushIssue(issue, opts) {
+			stats.Skipped++
+			continue
+		}
+
+		// bd-1ay: top-level epics handled as Projects by doEpicSync are
+		// skipped here so they don't double-create as Issues. The
+		// post-sync ReconcileProjectMembership pass (Linear-specific,
+		// fired from cmd/bd/linear.go) walks descendants and assigns
+		// them to the right Project via projectId.
+		if _, isEpicProject := epicProjectMap[issue.ID]; isEpicProject {
 			stats.Skipped++
 			continue
 		}
