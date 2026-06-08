@@ -3,6 +3,7 @@ package tracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -237,8 +238,23 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	return result, nil
 }
 
-// DetectConflicts identifies issues that were modified both locally and externally
-// since the last sync.
+// DetectConflicts identifies issues that need cross-side attention since
+// the last sync. bd-ajn extended this from whole-issue timestamp
+// comparison to per-field diff backed by snapshots:
+//
+//   - LOCAL side: dolt_history_issues for state at lastSync
+//   - REMOTE side: linear_issue_snapshots (LinearIssueSnapshotStore)
+//
+// The resulting Conflict carries LocalChanged / ExternalChanged /
+// Conflicting field maps. resolveConflicts consumes them to dispatch
+// per-field push / pull / true-conflict actions.
+//
+// Falls back to whole-issue timestamp behavior when:
+//   - The storage backend doesn't expose HistoryViewer
+//   - The tracker doesn't expose a snapshot store
+//   - The snapshot row doesn't exist yet (first-sync soft rollout —
+//     mayor's Q5: baseline + emit no conflict, next sync gets the
+//     real field-scoped path)
 func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.detect_conflicts",
 		trace.WithAttributes(attribute.String("sync.tracker", e.Tracker.DisplayName())),
@@ -264,6 +280,11 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 		return nil, fmt.Errorf("searching issues: %w", err)
 	}
 
+	// bd-ajn: check capability surface once up front so the per-issue
+	// loop doesn't repeat type assertions.
+	snapStore, snapStoreOK := e.Store.(storage.LinearIssueSnapshotStore)
+	snapshotter, snapshotterOK := e.Tracker.(PostPullSnapshotter)
+
 	var conflicts []Conflict
 	for _, issue := range issues {
 		extRef := derefStr(issue.ExternalRef)
@@ -271,22 +292,50 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 			continue
 		}
 
-		// Check if locally modified since last sync
-		if issue.UpdatedAt.Before(lastSync) || issue.UpdatedAt.Equal(lastSync) {
+		localChanged := issue.UpdatedAt.After(lastSync)
+
+		// Whole-issue fast-skip: no local change AND we'll only know
+		// about external changes after fetching. The old code skipped
+		// here unconditionally; field-scoping needs to fetch even when
+		// !localChanged because the external side may have changed
+		// fields we still want to pull. The conservative compromise:
+		// keep the fast-skip when neither snapshot infra is available
+		// (legacy behavior preserved).
+		if !localChanged && !(snapStoreOK && snapshotterOK) {
 			continue
 		}
 
-		// Fetch external version to check if also modified
+		// Fetch external version
 		extID := e.Tracker.ExtractIdentifier(extRef)
 		if extID == "" {
 			continue
 		}
-
 		extIssue, err := e.Tracker.FetchIssue(ctx, extID)
 		if err != nil || extIssue == nil {
 			continue
 		}
 
+		// Try field-scoped path. Falls through to whole-issue logic on
+		// any of the documented fallback conditions.
+		if snapStoreOK && snapshotterOK {
+			emitted, fieldErr := e.detectFieldScopedConflict(ctx, issue, extIssue, extRef, lastSync, snapStore, snapshotter)
+			if fieldErr == nil {
+				if emitted != nil {
+					conflicts = append(conflicts, *emitted)
+				}
+				continue
+			}
+			// Field-scoped detection error → fall through to legacy.
+			e.warn("Field-scoped conflict detection failed for %s; falling back to whole-issue: %v", issue.ID, fieldErr)
+		}
+
+		// Legacy whole-issue timestamp path. Reached when the backend
+		// doesn't expose snapshot infra OR when field-scoped detection
+		// errored. Preserves pre-bd-ajn behavior for trackers that
+		// haven't opted into the snapshot pattern.
+		if !localChanged {
+			continue
+		}
 		if extIssue.UpdatedAt.After(lastSync) {
 			conflicts = append(conflicts, Conflict{
 				IssueID:            issue.ID,
@@ -301,6 +350,73 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 
 	span.SetAttributes(attribute.Int("sync.conflicts", len(conflicts)))
 	return conflicts, nil
+}
+
+// detectFieldScopedConflict runs the per-field diff for a single
+// issue. Returns (conflict, nil) when a conflict should be emitted,
+// (nil, nil) when no action is needed (no changes on either side),
+// or (nil, err) to signal the caller to fall back to whole-issue
+// logic.
+//
+// First-sync soft rollout (mayor's Q5): a missing snapshot triggers
+// a baseline write + log line, and we return (nil, nil) — no
+// conflict this run, next sync gets real field-scoping.
+func (e *Engine) detectFieldScopedConflict(
+	ctx context.Context,
+	issue *types.Issue,
+	extIssue *TrackerIssue,
+	extRef string,
+	lastSync time.Time,
+	snapStore storage.LinearIssueSnapshotStore,
+	snapshotter PostPullSnapshotter,
+) (*Conflict, error) {
+	snap, err := snapStore.GetLinearIssueSnapshot(ctx, issue.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read snapshot: %w", err)
+	}
+	if snap == nil {
+		// First-sync soft rollout.
+		e.msg("first sync — snapshotting baseline for issue %s (no conflict possible this run)", issue.ID)
+		if writeErr := snapshotter.RecordPullSnapshot(ctx, issue.ID, *extIssue); writeErr != nil {
+			// Don't escalate to legacy path: baseline failure just
+			// means next sync also gets the soft-rollout treatment.
+			e.warn("baseline snapshot write failed for %s: %v", issue.ID, writeErr)
+		}
+		return nil, nil
+	}
+
+	// Local-side state at lastSync via dolt_history. nil result means
+	// the issue had no committed state at lastSync (created since);
+	// diffLocalFields treats that as "all populated fields new".
+	localAtSync, err := loadLocalStateAtSync(ctx, e.Store, issue.ID, lastSync)
+	if err != nil {
+		if errors.Is(err, errHistoryNotSupported) {
+			// Backend without history capability — signal fallback.
+			return nil, err
+		}
+		return nil, fmt.Errorf("load local state at sync: %w", err)
+	}
+
+	localChanged := diffLocalFields(issue, localAtSync)
+	externalChanged := diffExternalFields(extIssue, snap)
+	conflicting := computeConflictingFields(localChanged, externalChanged)
+
+	// No changes on either side → no work for the resolver.
+	if len(localChanged) == 0 && len(externalChanged) == 0 {
+		return nil, nil
+	}
+
+	return &Conflict{
+		IssueID:            issue.ID,
+		LocalUpdated:       issue.UpdatedAt,
+		ExternalUpdated:    extIssue.UpdatedAt,
+		ExternalRef:        extRef,
+		ExternalIdentifier: extIssue.Identifier,
+		ExternalInternalID: extIssue.ID,
+		LocalChanged:       localChanged,
+		ExternalChanged:    externalChanged,
+		Conflicting:        conflicting,
+	}, nil
 }
 
 // doPull imports issues from the external tracker into beads.
@@ -1145,8 +1261,50 @@ func (e *Engine) renderBatchDryRun(issues []*types.Issue, result *BatchPushResul
 }
 
 // resolveConflicts applies the configured conflict resolution strategy.
+//
+// bd-ajn: each conflict is now per-field-aware. When the conflict
+// carries field-scoped diff data (HasFieldScopedDiff), this routine
+// emits per-field decisions:
+//
+//   - Field in LocalChanged only → push that field (no skip, no force
+//     at the whole-issue level — the push path field-scopes itself
+//     via pushFieldScopes)
+//   - Field in ExternalChanged only → pull that field (pullFieldScopes
+//     tells the pull path which fields to apply)
+//   - Field in Conflicting → policy decides (ConflictLocal /
+//     ConflictExternal / ConflictTimestamp at whole-issue scope, since
+//     Linear doesn't expose per-field updatedAt — mayor's Q7
+//     acknowledgment).
+//
+// When the conflict lacks field-scoped data (legacy path —
+// HasFieldScopedDiff returns false), falls through to the old
+// whole-issue logic for backward compatibility.
+//
+// The field-scope maps are nil-safe — callers (doPush, doPull) check
+// presence before consuming.
 func (e *Engine) resolveConflicts(opts SyncOptions, conflicts []Conflict, skipIDs, forceIDs, allowPullOverwriteIDs map[string]bool) {
+	e.resolveConflictsWithFieldScopes(opts, conflicts, skipIDs, forceIDs, allowPullOverwriteIDs, nil, nil)
+}
+
+// resolveConflictsWithFieldScopes is the field-aware extension.
+// pushFieldScopes and pullFieldScopes, when non-nil, are populated
+// with per-field action maps. Tests and the field-scoped doPush /
+// doPull paths consume these; the legacy wrapper (resolveConflicts)
+// passes nil and ignores them.
+func (e *Engine) resolveConflictsWithFieldScopes(
+	opts SyncOptions,
+	conflicts []Conflict,
+	skipIDs, forceIDs, allowPullOverwriteIDs map[string]bool,
+	pushFieldScopes, pullFieldScopes map[string]map[ConflictField]bool,
+) {
 	for _, c := range conflicts {
+		if c.HasFieldScopedDiff() {
+			e.resolveFieldScopedConflict(opts, c, skipIDs, forceIDs, allowPullOverwriteIDs, pushFieldScopes, pullFieldScopes)
+			continue
+		}
+
+		// Legacy whole-issue path (no snapshot infra, or first-sync
+		// fallback).
 		switch opts.ConflictResolution {
 		case ConflictLocal:
 			forceIDs[c.IssueID] = true
@@ -1167,6 +1325,88 @@ func (e *Engine) resolveConflicts(opts SyncOptions, conflicts []Conflict, skipID
 				e.msg("Conflict on %s: external is newer, importing", c.IssueID)
 			}
 		}
+	}
+}
+
+// resolveFieldScopedConflict dispatches per-field decisions for a
+// single conflict that carries snapshot-backed diff data.
+func (e *Engine) resolveFieldScopedConflict(
+	opts SyncOptions,
+	c Conflict,
+	skipIDs, forceIDs, allowPullOverwriteIDs map[string]bool,
+	pushFieldScopes, pullFieldScopes map[string]map[ConflictField]bool,
+) {
+	// Step 1: auto-merge non-conflicting fields.
+	//   - LocalChanged \ Conflicting → push these fields
+	//   - ExternalChanged \ Conflicting → pull these fields
+	conflictSet := make(map[ConflictField]bool, len(c.Conflicting))
+	for _, f := range c.Conflicting {
+		conflictSet[f] = true
+	}
+	pushFields := make(map[ConflictField]bool)
+	pullFields := make(map[ConflictField]bool)
+	for f := range c.LocalChanged {
+		if !conflictSet[f] {
+			pushFields[f] = true
+		}
+	}
+	for f := range c.ExternalChanged {
+		if !conflictSet[f] {
+			pullFields[f] = true
+		}
+	}
+
+	// Step 2: dispatch the truly-conflicting fields per policy.
+	for _, f := range c.Conflicting {
+		var winner string // for logging only
+		switch opts.ConflictResolution {
+		case ConflictLocal:
+			pushFields[f] = true
+			winner = "local"
+		case ConflictExternal:
+			pullFields[f] = true
+			winner = "external"
+		default: // timestamp — falls back to whole-issue updatedAt per Q7
+			if c.LocalUpdated.After(c.ExternalUpdated) {
+				pushFields[f] = true
+				winner = "local (newer)"
+			} else {
+				pullFields[f] = true
+				winner = "external (newer)"
+			}
+		}
+		e.msg("Conflict on %s.%s: keeping %s version", c.IssueID, f, winner)
+	}
+
+	// Step 3: publish to the caller's scope maps (when provided).
+	if pushFieldScopes != nil && len(pushFields) > 0 {
+		pushFieldScopes[c.IssueID] = pushFields
+	}
+	if pullFieldScopes != nil && len(pullFields) > 0 {
+		pullFieldScopes[c.IssueID] = pullFields
+	}
+
+	// Step 4: legacy whole-issue compatibility. Until doPush / doPull
+	// are fully field-scoped (P6 / P7), these gate the whole-issue
+	// push/pull paths so the resolution decisions take effect.
+	//
+	// Rules:
+	//   - Any pushFields present → force the push path to run for this
+	//     issue (so locally-modified fields propagate).
+	//   - Any pullFields present → allow the pull path to overwrite
+	//     local (so externally-modified fields land).
+	//
+	// In a mixed case (push some, pull some), this currently means
+	// the whole issue is processed by BOTH paths. P6/P7 will narrow
+	// the scope properly; for v1 this is OK because the only mixed
+	// scenarios where it matters are the genuinely-conflicting ones
+	// (covered by Step 2's per-field policy + Step 3's field maps).
+	if len(pushFields) > 0 {
+		forceIDs[c.IssueID] = true
+	}
+	if len(pullFields) > 0 {
+		skipIDs[c.IssueID] = true
+		allowPullOverwriteIDs[c.IssueID] = true
 	}
 }
 
