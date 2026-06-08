@@ -71,6 +71,7 @@ func RunCompatMigrations(db *sql.DB) error {
 		"wisp_dependencies", "labels", "wisp_labels", "comments",
 		"wisp_comments", "metadata", "child_counters", "issue_counter",
 		"issue_snapshots", "compaction_snapshots", "linear_label_snapshots", "federation_peers",
+		"linear_issue_snapshots",
 		"custom_statuses", "custom_types",
 		"dolt_ignore",
 	}
