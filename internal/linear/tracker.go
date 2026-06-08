@@ -268,6 +268,13 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 		}
 	}
 
+	// bd-ajn: persist the per-issue snapshot baseline for field-scoped
+	// conflict detection on the next sync. The CreateIssue response is
+	// the full post-create Linear state, so we know every field.
+	if err := t.writeIssueSnapshot(ctx, issue.ID, created); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("issue snapshot write failed for new bead %s: %v", issue.ID, err)
+	}
+
 	ti := linearToTrackerIssue(created)
 	return &ti, nil
 }
@@ -360,6 +367,14 @@ func (t *Tracker) UpdateIssueWithRemote(ctx context.Context, externalID string, 
 				t.labelWarnFn("snapshot write failed for %s: %v", issue.ID, err)
 			}
 		}
+	}
+
+	// bd-ajn: refresh the per-issue snapshot to the post-update state.
+	// Without this, the next sync would diff against the pre-update
+	// snapshot and incorrectly see "Linear changed these fields" for
+	// the values we just pushed.
+	if err := t.writeIssueSnapshot(ctx, issue.ID, updated); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("issue snapshot write failed for %s: %v", issue.ID, err)
 	}
 
 	ti := linearToTrackerIssue(updated)
@@ -1010,6 +1025,14 @@ func (t *Tracker) FetchProjects(ctx context.Context, state string) ([]tracker.Tr
 
 // AssignIssueToProject assigns a Linear issue to a project.
 // Implements tracker.ProjectSyncer.
+//
+// bd-ajn: callers that own the local bead ID should call
+// RecordPostAssignSnapshot after this returns nil — that's the
+// snapshot patch that prevents the next sync from seeing the
+// just-pushed projectId as "Linear changed it." The interface
+// signature stays Linear-identifier-only (matches the GraphQL
+// mutation) because some callers (e.g., raw API users) don't have
+// the local ID handy.
 func (t *Tracker) AssignIssueToProject(ctx context.Context, issueExternalID, projectID string) error {
 	client := t.clientForExternalID(ctx, issueExternalID)
 	if client == nil {
@@ -1024,6 +1047,9 @@ func (t *Tracker) AssignIssueToProject(ctx context.Context, issueExternalID, pro
 
 // SetIssueParent sets the parent issue for sub-issue nesting in Linear.
 // Implements tracker.ProjectSyncer.
+//
+// bd-ajn: see AssignIssueToProject — callers with the local ID should
+// follow up with RecordPostSetParentSnapshot.
 func (t *Tracker) SetIssueParent(ctx context.Context, issueExternalID, parentExternalID string) error {
 	client := t.clientForExternalID(ctx, issueExternalID)
 	if client == nil {
@@ -1034,6 +1060,51 @@ func (t *Tracker) SetIssueParent(ctx context.Context, issueExternalID, parentExt
 		"parentId": parentExternalID,
 	})
 	return err
+}
+
+// RecordPostAssignSnapshot patches the per-issue snapshot's project_id
+// after a successful AssignIssueToProject. Callers invoke this when
+// they have the local bead ID in hand. Silently no-ops when no
+// baseline snapshot exists yet (first-sync soft rollout — see
+// patchIssueSnapshotProjectID).
+//
+// Separate from AssignIssueToProject because the ProjectSyncer
+// interface is Linear-identifier-only; the local bead ID isn't
+// recoverable from a bare identifier without an extra lookup. Callers
+// (migration tool, project reconciler) already have the mapping in
+// scope at the point of the call, so the work falls to them.
+func (t *Tracker) RecordPostAssignSnapshot(ctx context.Context, localBeadID, projectID string) error {
+	return t.patchIssueSnapshotProjectID(ctx, localBeadID, projectID)
+}
+
+// RecordPostSetParentSnapshot patches the per-issue snapshot's
+// parent_id after a successful SetIssueParent. See
+// RecordPostAssignSnapshot for the rationale on why this is a
+// separate call.
+func (t *Tracker) RecordPostSetParentSnapshot(ctx context.Context, localBeadID, parentUUID string) error {
+	return t.patchIssueSnapshotParentID(ctx, localBeadID, parentUUID)
+}
+
+// RecordPullSnapshot implements tracker.PostPullSnapshotter. Called
+// by the engine after each successful pull-side import or update so
+// the snapshot reflects the just-pulled Linear state. Without this,
+// the next bidirectional sync would diff against the pre-pull
+// snapshot and incorrectly see "Linear changed these fields" for the
+// fields we just pulled into local.
+//
+// Derives the snapshot from `fetched.Raw` (which linearToTrackerIssue
+// sets to the source *Issue), preserving Linear UUIDs that the
+// TrackerIssue abstraction loses (state_id, project_id, etc.). When
+// Raw isn't a *Issue (mock trackers, non-Linear adapters slipping
+// through), silently no-ops — the snapshot machinery is best-effort
+// at this layer; DetectConflicts's first-sync path handles missing
+// snapshots safely.
+func (t *Tracker) RecordPullSnapshot(ctx context.Context, localBeadID string, fetched tracker.TrackerIssue) error {
+	li, ok := fetched.Raw.(*Issue)
+	if !ok || li == nil {
+		return nil
+	}
+	return t.writeIssueSnapshot(ctx, localBeadID, li)
 }
 
 // IsProjectRef checks if an external_ref is a Linear project URL.

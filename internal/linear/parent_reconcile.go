@@ -70,12 +70,20 @@ func isRateLimitExhausted(err error) bool {
 }
 
 // ParentLink describes a desired parent-child relationship to wire up
-// on the Linear side. Both fields are Linear identifiers (e.g. "HOU-159")
-// — typically extracted from each bead's external_ref via
-// Tracker.ExtractIdentifier.
+// on the Linear side. Both identifier fields are Linear identifiers
+// (e.g. "HOU-159") — typically extracted from each bead's external_ref
+// via Tracker.ExtractIdentifier.
+//
+// ChildLocalBeadID is bd-ajn glue: the reconciler doesn't use it, but
+// post-success the caller iterates stats.Mutations and patches the
+// per-issue snapshot via Tracker.RecordPostSetParentSnapshot (passing
+// the parent's Linear UUID resolved from the reconciler's fetch).
+// Optional — empty string means the caller doesn't care about
+// snapshot upkeep (mocks, tests).
 type ParentLink struct {
 	ChildIdentifier  string
 	ParentIdentifier string
+	ChildLocalBeadID string
 }
 
 // ParentReconcileStats summarizes a ReconcileParents run.
@@ -237,6 +245,18 @@ func (t *Tracker) ReconcileParents(ctx context.Context, links []ParentLink, dryR
 		// as a parent sees the freshest state. Host client is unchanged.
 		if updated != nil {
 			fetched[link.ChildIdentifier] = entry{issue: updated, client: childE.client}
+		}
+		// bd-ajn: patch the child's per-issue snapshot's parent_id so the
+		// next sync doesn't see "Linear changed parent" for the parentId
+		// we just pushed. Best-effort: failures don't abort the reconcile
+		// pass (a missed snapshot will baseline on next sync's first-sync
+		// path; the worst case is one spurious conflict gate).
+		if link.ChildLocalBeadID != "" {
+			if sErr := t.RecordPostSetParentSnapshot(ctx, link.ChildLocalBeadID, parentE.issue.ID); sErr != nil {
+				stats.Errors = append(stats.Errors,
+					fmt.Errorf("snapshot patch for %s after parent-set: %w",
+						link.ChildIdentifier, sErr))
+			}
 		}
 		// Record the mutation only AFTER the API call succeeds, so
 		// Mutations reflects actual state propagated to Linear (callers

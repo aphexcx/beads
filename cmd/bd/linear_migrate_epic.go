@@ -588,6 +588,14 @@ func executeEpicMigration(ctx context.Context, lt *linear.Tracker, plan *epicMig
 			if err := lt.AssignIssueToProject(ctx, d.Identifier, projectID); err != nil {
 				return fmt.Errorf("assigning %s to Project: %w", d.Identifier, err)
 			}
+			// bd-ajn: patch the per-issue snapshot so the next sync
+			// doesn't read this projectId-set as "Linear changed it"
+			// and force-pull, reverting any unrelated local changes
+			// (the specific scenario bd-ajn fixes — migration vs.
+			// concurrent local status close).
+			if sErr := lt.RecordPostAssignSnapshot(ctx, d.BeadID, projectID); sErr != nil {
+				fmt.Printf("⚠ snapshot patch failed for %s after assign: %v (next sync will baseline)\n", d.BeadID, sErr)
+			}
 			assigned++
 		}
 
@@ -600,6 +608,13 @@ func executeEpicMigration(ctx context.Context, lt *linear.Tracker, plan *epicMig
 			} else {
 				if err := clearLinearIssueParent(ctx, lt, d.Identifier); err != nil {
 					return fmt.Errorf("clearing parentId on direct sub-epic %s: %w", d.Identifier, err)
+				}
+				// bd-ajn: snapshot's parent_id needs to clear too
+				// (empty string represents "no parent"). Without this,
+				// next sync sees Linear's parent field as having
+				// changed from <old uuid> to nil and force-pulls.
+				if sErr := lt.RecordPostSetParentSnapshot(ctx, d.BeadID, ""); sErr != nil {
+					fmt.Printf("⚠ snapshot patch failed for %s after parent clear: %v (next sync will baseline)\n", d.BeadID, sErr)
 				}
 				parentCleared++
 			}

@@ -1425,6 +1425,7 @@ func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.P
 			links = append(links, linear.ParentLink{
 				ChildIdentifier:  childInfo.identifier,
 				ParentIdentifier: parentInfo.identifier,
+				ChildLocalBeadID: issue.ID, // bd-ajn: lets reconciler patch snapshot post-success
 			})
 		}
 	}
@@ -1570,6 +1571,7 @@ func buildLinearProjectMembershipLinks(ctx context.Context, lt *linear.Tracker) 
 		links = append(links, linear.ProjectMembershipLink{
 			IssueIdentifier: ident,
 			ProjectID:       projectID,
+			LocalBeadID:     issue.ID, // bd-ajn: lets reconciler patch snapshot post-success
 		})
 	}
 	return links, nil

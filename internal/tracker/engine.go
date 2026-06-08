@@ -531,6 +531,18 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		if existing != nil {
 			localID = existing.ID
 		}
+		// bd-ajn: record the per-issue snapshot for trackers that
+		// support PostPullSnapshotter. Captures the just-pulled remote
+		// state so the NEXT DetectConflicts run can correctly diff
+		// "did Linear change this field?" without confusing pulled
+		// state with newly-changed remote state. Best-effort: a
+		// failure here surfaces as a warning but does not abort
+		// import.
+		if snapshotter, ok := e.Tracker.(PostPullSnapshotter); ok && localID != "" {
+			if err := snapshotter.RecordPullSnapshot(ctx, localID, extIssue); err != nil {
+				e.warn("Snapshot write failed for %s after pull: %v", localID, err)
+			}
+		}
 		if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
 			if err := e.PullHooks.SyncComments(ctx, localID, extIssue.ID); err != nil {
 				e.warn("Comment sync failed for %s: %v", localID, err)
@@ -1185,6 +1197,16 @@ func (e *Engine) reimportIssue(ctx context.Context, c Conflict) {
 
 	if err := e.Store.UpdateIssue(ctx, c.IssueID, updates, e.Actor); err != nil {
 		e.warn("Failed to update %s during reimport: %v", c.IssueID, err)
+		return
+	}
+	// bd-ajn: refresh the snapshot to the just-pulled state, matching
+	// the doPull import path. Without this, the next sync would see
+	// stale snapshot fields as "Linear changed them" after a
+	// conflict-resolution import.
+	if snapshotter, ok := e.Tracker.(PostPullSnapshotter); ok {
+		if err := snapshotter.RecordPullSnapshot(ctx, c.IssueID, *extIssue); err != nil {
+			e.warn("Snapshot write failed for %s after reimport: %v", c.IssueID, err)
+		}
 	}
 }
 

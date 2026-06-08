@@ -11,9 +11,17 @@ import (
 // Tracker.ExtractIdentifier yields from a bead's external_ref (e.g.
 // "HOU-167"); ProjectID is the Linear Project UUID (already resolved
 // — caller must pass the UUID, not the Project URL or slug).
+//
+// LocalBeadID is bd-ajn glue: the reconciler doesn't use it, but
+// post-success the caller iterates stats.Mutations and patches the
+// per-issue snapshot via Tracker.RecordPostAssignSnapshot to prevent
+// the next sync from misreading "Linear's projectId changed" for the
+// projectId we just pushed. Optional — empty string means the caller
+// doesn't care about snapshot upkeep (mocks, tests).
 type ProjectMembershipLink struct {
 	IssueIdentifier string
 	ProjectID       string
+	LocalBeadID     string
 }
 
 // ProjectMembershipStats summarizes a ReconcileProjectMembership run.
@@ -139,6 +147,18 @@ func (t *Tracker) ReconcileProjectMembership(ctx context.Context, links []Projec
 				fmt.Errorf("assign %s to Project %s: %w",
 					link.IssueIdentifier, link.ProjectID, err))
 			continue
+		}
+		// bd-ajn: patch the per-issue snapshot's project_id so the next
+		// sync doesn't read this projectId-set as "Linear changed it"
+		// and override unrelated local changes (the migration scenario
+		// the bug ticket describes). Best-effort: failures don't abort
+		// the reconcile — first-sync handling will baseline next sync.
+		if link.LocalBeadID != "" {
+			if sErr := t.RecordPostAssignSnapshot(ctx, link.LocalBeadID, link.ProjectID); sErr != nil {
+				stats.Errors = append(stats.Errors,
+					fmt.Errorf("snapshot patch for %s after Project-assign: %w",
+						link.IssueIdentifier, sErr))
+			}
 		}
 		// Mutations is appended only after the IssueUpdate API call
 		// succeeds, so the list reflects state actually propagated to

@@ -200,6 +200,25 @@ type ProjectSyncer interface {
 	ExtractProjectID(ref string) string
 }
 
+// PostPullSnapshotter is the bd-ajn capability for trackers that
+// maintain a per-issue snapshot used by field-scoped conflict
+// detection. The engine calls RecordPullSnapshot after each
+// successful pull-side import or update so the snapshot row reflects
+// the just-pulled remote state.
+//
+// Implementations should derive snapshot fields from `fetched` (and
+// fetched.Raw when richer data is needed). When the tracker can't
+// snapshot a given issue — wrong adapter type, missing fields,
+// transient store error — they should return nil (best-effort write,
+// next sync will re-baseline via DetectConflicts's first-sync path)
+// or a wrapped error that the engine surfaces as a warning. The
+// engine treats failures as non-fatal because the pull itself has
+// already succeeded; a missed snapshot only costs one spurious
+// conflict-gate next sync.
+type PostPullSnapshotter interface {
+	RecordPullSnapshot(ctx context.Context, localBeadID string, fetched TrackerIssue) error
+}
+
 // TrackerProject represents a project from an external tracker.
 type TrackerProject struct {
 	ID          string
