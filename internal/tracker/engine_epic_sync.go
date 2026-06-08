@@ -69,6 +69,17 @@ func (e *Engine) doEpicSync(ctx context.Context, opts SyncOptions) (map[string]s
 		extRef := derefStr(issue.ExternalRef)
 		switch {
 		case extRef == "":
+			// bd-pcb: respect SyncOptions.CreateClosed. doPush already
+			// has this gate for non-epic beads ("willCreate && closed
+			// && !CreateClosed → skip"); doEpicSync needs the equivalent
+			// for closed top-level epics with no Linear identity so they
+			// don't retroactively create Projects on every sync. The
+			// gate ONLY fires on the create branch — closed epics that
+			// already have a Project external_ref still flow to
+			// UpdateProject below (so state propagation works).
+			if issue.Status == types.StatusClosed && !opts.CreateClosed {
+				continue
+			}
 			// New top-level epic: ensure Linear has a Project for it.
 			projectID, cErr := e.ensureLinearProjectForEpic(ctx, syncer, issue, opts.DryRun)
 			if cErr != nil {
