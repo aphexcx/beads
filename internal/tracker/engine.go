@@ -191,7 +191,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 
 	// Phase 1: Detect conflicts (only for bidirectional sync)
 	if opts.Pull && opts.Push {
-		conflicts, err := e.DetectConflicts(ctx)
+		conflicts, err := e.DetectConflicts(ctx, opts)
 		if err != nil {
 			e.warn("Failed to detect conflicts: %v", err)
 		} else if len(conflicts) > 0 {
@@ -281,7 +281,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 //   - The snapshot row doesn't exist yet (first-sync soft rollout —
 //     mayor's Q5: baseline + emit no conflict, next sync gets the
 //     real field-scoped path)
-func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
+func (e *Engine) DetectConflicts(ctx context.Context, opts SyncOptions) ([]Conflict, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.detect_conflicts",
 		trace.WithAttributes(attribute.String("sync.tracker", e.Tracker.DisplayName())),
 	)
@@ -344,7 +344,7 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 		// Try field-scoped path. Falls through to whole-issue logic on
 		// any of the documented fallback conditions.
 		if snapStoreOK && snapshotterOK {
-			emitted, fieldErr := e.detectFieldScopedConflict(ctx, issue, extIssue, extRef, lastSync, snapStore, snapshotter)
+			emitted, fieldErr := e.detectFieldScopedConflict(ctx, issue, extIssue, extRef, lastSync, snapStore, snapshotter, opts.DryRun)
 			if fieldErr == nil {
 				if emitted != nil {
 					conflicts = append(conflicts, *emitted)
@@ -387,6 +387,12 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 // First-sync soft rollout (mayor's Q5): a missing snapshot triggers
 // a baseline write + log line, and we return (nil, nil) — no
 // conflict this run, next sync gets real field-scoping.
+//
+// bd-p4m: dryRun gates the baseline write. In dry-run mode we
+// preview the would-be write but do NOT touch the snapshot table —
+// otherwise --dry-run consumes the soft-rollout grace period and
+// the next wet-run takes a different code path than it would have
+// without the dry-run. Dry-run must be a pure preview.
 func (e *Engine) detectFieldScopedConflict(
 	ctx context.Context,
 	issue *types.Issue,
@@ -395,6 +401,7 @@ func (e *Engine) detectFieldScopedConflict(
 	lastSync time.Time,
 	snapStore storage.LinearIssueSnapshotStore,
 	snapshotter PostPullSnapshotter,
+	dryRun bool,
 ) (*Conflict, error) {
 	snap, err := snapStore.GetLinearIssueSnapshot(ctx, issue.ID)
 	if err != nil {
@@ -402,6 +409,13 @@ func (e *Engine) detectFieldScopedConflict(
 	}
 	if snap == nil {
 		// First-sync soft rollout.
+		if dryRun {
+			// bd-p4m: preview only; don't write. Skipping the write
+			// preserves dry-run idempotency AND keeps the soft-
+			// rollout grace period available for the next wet-run.
+			e.msg("[dry-run] Would snapshot baseline for issue %s (no conflict possible this run)", issue.ID)
+			return nil, nil
+		}
 		e.msg("first sync — snapshotting baseline for issue %s (no conflict possible this run)", issue.ID)
 		if writeErr := snapshotter.RecordPullSnapshot(ctx, issue.ID, *extIssue); writeErr != nil {
 			// Codex bd-ajn round-2 bug 6: a persistent baseline write
