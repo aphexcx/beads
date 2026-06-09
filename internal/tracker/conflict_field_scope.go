@@ -229,6 +229,76 @@ func extractProjectID(ti *TrackerIssue) string {
 	return ""
 }
 
+// pullUpdateFieldMap maps a ConflictField onto the bead-side update-
+// map keys produced by buildPullIssueUpdates. Used by
+// restrictPullUpdatesToFields to filter the whole-issue update map
+// down to just the fields the conflict resolver approved for pull.
+//
+// FieldStatus expands to both "status" and "close_reason" because
+// buildPullIssueUpdates writes close_reason alongside status to
+// preserve Done-vs-Canceled intent. A status pull without close_reason
+// would leave the bead with a stale close_reason on the next push.
+//
+// FieldProject and FieldParent currently map to nothing in the
+// pull-update path — neither field flows through buildPullIssueUpdates
+// (the bead store models them as dependencies, not columns). Their
+// pull is handled separately by the parent/project reconcilers; the
+// pull-side restriction here just filters the issues-table update.
+var pullUpdateFieldMap = map[ConflictField][]string{
+	FieldTitle:       {"title"},
+	FieldDescription: {"description"},
+	FieldStatus:      {"status", "close_reason"},
+	FieldPriority:    {"priority"},
+	FieldAssignee:    {"assignee"},
+}
+
+// restrictPullUpdatesToFields filters the buildPullIssueUpdates map
+// to only the keys corresponding to the approved ConflictFields,
+// plus any housekeeping keys (external_ref) that aren't user fields.
+// Returns a new map; does not mutate the input.
+func restrictPullUpdatesToFields(updates map[string]interface{}, scope map[ConflictField]bool) map[string]interface{} {
+	allow := map[string]bool{
+		"external_ref": true, // always allowed — pull writes the ref on first import
+		"issue_type":   true, // bead-side classification; rarely conflicts, safe to pass through
+	}
+	for f := range scope {
+		for _, key := range pullUpdateFieldMap[f] {
+			allow[key] = true
+		}
+	}
+	out := make(map[string]interface{}, len(updates))
+	for k, v := range updates {
+		if allow[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// conflictFieldKeys returns the sorted-stable slice of fields from a
+// set map. The deterministic order helps tests assert against the
+// payload sent to trackers and keeps any downstream rate-limit
+// retries idempotent.
+func conflictFieldKeys(set map[ConflictField]bool) []ConflictField {
+	if len(set) == 0 {
+		return nil
+	}
+	// Pre-declared order so tests and log lines are stable regardless
+	// of Go's map iteration nondeterminism. Add new ConflictField
+	// values to this list when introducing them.
+	canonical := []ConflictField{
+		FieldTitle, FieldDescription, FieldStatus, FieldPriority,
+		FieldAssignee, FieldProject, FieldParent,
+	}
+	out := make([]ConflictField, 0, len(set))
+	for _, f := range canonical {
+		if set[f] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // computeConflictingFields returns the intersection of two field
 // sets — the fields where BOTH sides moved since lastSync.
 func computeConflictingFields(local, external map[ConflictField]bool) []ConflictField {

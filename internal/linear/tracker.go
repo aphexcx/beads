@@ -1085,6 +1085,116 @@ func (t *Tracker) RecordPostSetParentSnapshot(ctx context.Context, localBeadID, 
 	return t.patchIssueSnapshotParentID(ctx, localBeadID, parentUUID)
 }
 
+// linearUpdateKeyForField is the per-ConflictField → Linear GraphQL
+// update-map key. Used by UpdateIssueFields to restrict a full
+// IssueToTracker payload down to only the resolver-approved fields.
+//
+// FieldStatus maps to stateId, not the bead's "status" string. The
+// resolution happens inside UpdateIssueFields where state lookup is
+// in scope.
+//
+// FieldProject and FieldParent map to projectId / parentId — but
+// those fields are typically handled by AssignIssueToProject /
+// SetIssueParent, not by UpdateIssue. The mapping is here for
+// completeness; in practice the conflict resolver rarely flags these
+// for field-scoped push because they don't pass through the bead
+// store's issue update path.
+var linearUpdateKeyForField = map[tracker.ConflictField]string{
+	tracker.FieldTitle:       "title",
+	tracker.FieldDescription: "description",
+	tracker.FieldStatus:      "stateId",
+	tracker.FieldPriority:    "priority",
+	tracker.FieldAssignee:    "assigneeId",
+	tracker.FieldProject:     "projectId",
+	tracker.FieldParent:      "parentId",
+}
+
+// UpdateIssueFields implements tracker.FieldScopedUpdater. Builds a
+// full update payload via the field mapper, then filters to only the
+// requested ConflictFields. Status updates additionally resolve a
+// stateId via findStateIDForIssue (same as UpdateIssueWithRemote's
+// resolve path).
+//
+// Labels are NOT touched here. Label sync is independent of the
+// other-fields conflict resolver — it has its own per-issue
+// reconciler. Routing labels through this path would re-trigger the
+// reconciler unnecessarily and duplicate the snapshot write below.
+//
+// After successful push, persists the issue snapshot with the
+// post-update remote state — same as UpdateIssueWithRemote.
+func (t *Tracker) UpdateIssueFields(ctx context.Context, externalID string, issue *types.Issue, remote *tracker.TrackerIssue, fields []tracker.ConflictField) (*tracker.TrackerIssue, error) {
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("UpdateIssueFields: empty field list")
+	}
+
+	client := t.clientForExternalID(ctx, externalID)
+	if client == nil {
+		return nil, fmt.Errorf("cannot determine Linear team for issue %s", externalID)
+	}
+
+	// Build the field-restricted payload directly from issue state.
+	updates := make(map[string]interface{}, len(fields))
+	for _, f := range fields {
+		key, ok := linearUpdateKeyForField[f]
+		if !ok {
+			continue // unknown field — skip rather than error
+		}
+		switch f {
+		case tracker.FieldTitle:
+			updates[key] = issue.Title
+		case tracker.FieldDescription:
+			updates[key] = issue.Description
+		case tracker.FieldPriority:
+			updates[key] = PriorityToLinear(issue.Priority, t.config)
+		case tracker.FieldAssignee:
+			updates[key] = issue.Assignee
+		case tracker.FieldProject, tracker.FieldParent:
+			// These fields aren't pushed through UpdateIssue's main
+			// path — they have dedicated AssignIssueToProject /
+			// SetIssueParent endpoints. Skip silently; reconcilers
+			// own them.
+			continue
+		case tracker.FieldStatus:
+			// State requires a Linear state UUID lookup. Skip when
+			// the remote already matches local (mirrors the
+			// remoteStatusMatchesLocal logic in UpdateIssueWithRemote)
+			// to preserve remote-owned states like "In Review".
+			if t.remoteStatusMatchesLocal(remote, issue) {
+				continue
+			}
+			stateID, err := t.findStateIDForIssue(ctx, client, issue)
+			if err != nil {
+				return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
+			}
+			if stateID != "" {
+				updates[key] = stateID
+			}
+		}
+	}
+
+	if len(updates) == 0 {
+		// All requested fields filtered out (e.g., status preserved
+		// + no other fields). Treat as a no-op push — the caller's
+		// pre-fetched remote already matches what we'd send.
+		ti := *remote
+		return &ti, nil
+	}
+
+	updated, err := client.UpdateIssue(ctx, externalID, updates)
+	if err != nil {
+		return nil, err
+	}
+
+	// bd-ajn: refresh the snapshot to the post-update state, same as
+	// UpdateIssueWithRemote does for the full-issue path.
+	if err := t.writeIssueSnapshot(ctx, issue.ID, updated); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("issue snapshot write failed for %s after field-scoped update: %v", issue.ID, err)
+	}
+
+	ti := linearToTrackerIssue(updated)
+	return &ti, nil
+}
+
 // RecordPullSnapshot implements tracker.PostPullSnapshotter. Called
 // by the engine after each successful pull-side import or update so
 // the snapshot reflects the just-pulled Linear state. Without this,

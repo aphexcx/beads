@@ -200,6 +200,27 @@ type ProjectSyncer interface {
 	ExtractProjectID(ref string) string
 }
 
+// FieldScopedUpdater is the bd-ajn capability for trackers that
+// support partial-field issue updates. When the conflict resolver
+// determines that only a subset of fields should propagate to the
+// external tracker (LocalChanged \ Conflicting, plus
+// Conflicting-fields-the-policy-resolved-to-local), the engine calls
+// UpdateIssueFields with the explicit field list — instead of the
+// full UpdateIssue, which would also push fields the user didn't
+// touch and potentially clobber concurrent remote changes.
+//
+// fields is the list of ConflictField values to include in the
+// update payload. Adapters are expected to ignore unknown values and
+// to no-op when fields is empty (caller error guard).
+//
+// remote, when non-nil, is the engine's already-fetched current
+// remote — same threading as RemoteAwareUpdater so the adapter can
+// preserve remote-owned state on fields it would otherwise
+// re-resolve from local context.
+type FieldScopedUpdater interface {
+	UpdateIssueFields(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue, fields []ConflictField) (*TrackerIssue, error)
+}
+
 // PostPullSnapshotter is the bd-ajn capability for trackers that
 // maintain a per-issue snapshot used by field-scoped conflict
 // detection. The engine calls RecordPullSnapshot after each

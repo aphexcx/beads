@@ -165,6 +165,13 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 
 	allowPullOverwriteIDs := make(map[string]bool)
 
+	// bd-ajn field-scoped per-issue field maps. Keyed by issue.ID;
+	// each inner map lists the ConflictFields to push or pull. Empty
+	// (or missing entry) means "no scoping — push/pull whole issue"
+	// for legacy compatibility.
+	pushFieldScopes := make(map[string]map[ConflictField]bool)
+	pullFieldScopes := make(map[string]map[ConflictField]bool)
+
 	// Phase 1: Detect conflicts (only for bidirectional sync)
 	if opts.Pull && opts.Push {
 		conflicts, err := e.DetectConflicts(ctx)
@@ -172,13 +179,15 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 			e.warn("Failed to detect conflicts: %v", err)
 		} else if len(conflicts) > 0 {
 			result.Stats.Conflicts = len(conflicts)
-			e.resolveConflicts(opts, conflicts, skipPushIDs, forcePushIDs, allowPullOverwriteIDs)
+			e.resolveConflictsWithFieldScopes(opts, conflicts,
+				skipPushIDs, forcePushIDs, allowPullOverwriteIDs,
+				pushFieldScopes, pullFieldScopes)
 		}
 	}
 
 	// Phase 2: Pull
 	if opts.Pull {
-		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs)
+		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs, pullFieldScopes)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("pull failed: %v", err)
@@ -196,7 +205,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 
 	// Phase 3: Push
 	if opts.Push {
-		pushStats, err := e.doPush(ctx, opts, skipPushIDs, forcePushIDs)
+		pushStats, err := e.doPush(ctx, opts, skipPushIDs, forcePushIDs, pushFieldScopes)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("push failed: %v", err)
@@ -420,7 +429,13 @@ func (e *Engine) detectFieldScopedConflict(
 }
 
 // doPull imports issues from the external tracker into beads.
-func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs map[string]bool) (*PullStats, error) {
+// doPull imports issues from the external tracker. bd-ajn:
+// pullFieldScopes carries per-issue field restrictions from the
+// conflict resolver. When set for an issue, buildPullIssueUpdates
+// returns ONLY those fields so the pull doesn't clobber locally-
+// changed fields that aren't part of the resolver's pull set.
+// Empty / missing entry → whole-issue update (legacy path).
+func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs map[string]bool, pullFieldScopes map[string]map[ConflictField]bool) (*PullStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.pull",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -612,6 +627,13 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 
 			updates := buildPullIssueUpdates(existing, conv.Issue, ref)
+			if scope := pullFieldScopes[existing.ID]; len(scope) > 0 {
+				// bd-ajn field-scoped pull: keep only the resolver-
+				// approved fields + ref (which is metadata, not a
+				// user-editable field). external_ref keys stay because
+				// pull is the path that backfills them.
+				updates = restrictPullUpdatesToFields(updates, scope)
+			}
 			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
 				updates["metadata"] = raw
 			}
@@ -856,7 +878,15 @@ func parseSyncTime(value string) (time.Time, error) {
 }
 
 // doPush exports beads issues to the external tracker.
-func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs map[string]bool) (*PushStats, error) {
+//
+// bd-ajn: pushFieldScopes carries per-issue field restrictions
+// produced by resolveConflictsWithFieldScopes. When pushFieldScopes
+// has an entry for an issue and the tracker implements
+// FieldScopedUpdater, only those fields are sent in the update —
+// preventing whole-issue overwrites that would clobber concurrent
+// remote changes to fields the local side didn't touch. Trackers
+// without FieldScopedUpdater fall back to full-issue UpdateIssue.
+func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs map[string]bool, pushFieldScopes map[string]map[ConflictField]bool) (*PushStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.push",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -1149,13 +1179,26 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				continue
 			}
 
-			// Prefer RemoteAwareUpdater when available — passes the fetched remote
-			// so the tracker can preserve remote-owned state.
+			// Prefer FieldScopedUpdater + RemoteAwareUpdater when both
+			// the scope is set and the tracker supports field scoping
+			// (bd-ajn). Otherwise fall through to the legacy ordering:
+			// RemoteAwareUpdater preferred over plain UpdateIssue.
 			var updateErr error
-			if rau, ok := e.Tracker.(RemoteAwareUpdater); ok {
-				_, updateErr = rau.UpdateIssueWithRemote(ctx, extID, pushIssue, fetchedExt)
-			} else {
-				_, updateErr = e.Tracker.UpdateIssue(ctx, extID, pushIssue)
+			scope := pushFieldScopes[issue.ID]
+			fsu, fsuOK := e.Tracker.(FieldScopedUpdater)
+			switch {
+			case len(scope) > 0 && fsuOK:
+				// Field-scoped path: only the conflict-resolver-approved
+				// fields go to Linear. Other fields (which may have been
+				// touched on Linear's side without local change) stay
+				// untouched.
+				_, updateErr = fsu.UpdateIssueFields(ctx, extID, pushIssue, fetchedExt, conflictFieldKeys(scope))
+			default:
+				if rau, ok := e.Tracker.(RemoteAwareUpdater); ok {
+					_, updateErr = rau.UpdateIssueWithRemote(ctx, extID, pushIssue, fetchedExt)
+				} else {
+					_, updateErr = e.Tracker.UpdateIssue(ctx, extID, pushIssue)
+				}
 			}
 			if updateErr != nil {
 				e.warn("Failed to update %s in %s: %v", issue.ID, e.Tracker.DisplayName(), updateErr)

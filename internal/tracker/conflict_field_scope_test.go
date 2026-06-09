@@ -301,6 +301,86 @@ func TestResolveFieldScopedConflict_MixedAutoMerge(t *testing.T) {
 	}
 }
 
+// TestRestrictPullUpdatesToFields_KeepsApprovedFieldsOnly — the
+// pull-side scoping must drop fields outside the scope, preserving
+// housekeeping keys (external_ref, issue_type).
+func TestRestrictPullUpdatesToFields_KeepsApprovedFieldsOnly(t *testing.T) {
+	full := map[string]interface{}{
+		"title":        "T",
+		"description":  "D",
+		"priority":     2,
+		"status":       "in_progress",
+		"close_reason": "",
+		"issue_type":   "task",
+		"assignee":     "user-1",
+		"external_ref": "https://linear.app/x",
+	}
+	scope := map[ConflictField]bool{FieldDescription: true}
+	got := restrictPullUpdatesToFields(full, scope)
+
+	wantKeys := []string{"description", "external_ref", "issue_type"}
+	for _, k := range wantKeys {
+		if _, ok := got[k]; !ok {
+			t.Errorf("missing expected key %q in restricted updates: %v", k, got)
+		}
+	}
+	dropped := []string{"title", "priority", "status", "close_reason", "assignee"}
+	for _, k := range dropped {
+		if _, ok := got[k]; ok {
+			t.Errorf("key %q should have been dropped, got %v", k, got)
+		}
+	}
+}
+
+// TestRestrictPullUpdatesToFields_StatusBringsCloseReason — when
+// FieldStatus is in scope, both "status" and "close_reason" must
+// pass through. Otherwise pulling a status from Linear leaves a
+// stale local close_reason that the next push would route through.
+func TestRestrictPullUpdatesToFields_StatusBringsCloseReason(t *testing.T) {
+	full := map[string]interface{}{
+		"title":        "T",
+		"status":       "closed",
+		"close_reason": "Done by Linear automation",
+	}
+	scope := map[ConflictField]bool{FieldStatus: true}
+	got := restrictPullUpdatesToFields(full, scope)
+	if _, ok := got["status"]; !ok {
+		t.Errorf("status missing: %v", got)
+	}
+	if _, ok := got["close_reason"]; !ok {
+		t.Errorf("close_reason should ride along with status: %v", got)
+	}
+	if _, ok := got["title"]; ok {
+		t.Errorf("title should be dropped (not in scope): %v", got)
+	}
+}
+
+// TestConflictFieldKeys_StableOrder — the canonical order matters
+// for log/test determinism and idempotent payloads on retry.
+func TestConflictFieldKeys_StableOrder(t *testing.T) {
+	in := map[ConflictField]bool{
+		FieldStatus:   true,
+		FieldTitle:    true,
+		FieldPriority: true,
+	}
+	got := conflictFieldKeys(in)
+	want := []ConflictField{FieldTitle, FieldStatus, FieldPriority}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("index %d: got %s, want %s (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestConflictFieldKeys_EmptyReturnsNil(t *testing.T) {
+	if got := conflictFieldKeys(map[ConflictField]bool{}); got != nil {
+		t.Errorf("expected nil for empty input, got %v", got)
+	}
+}
+
 // TestHasFieldScopedDiff — sanity check on the discriminator.
 func TestHasFieldScopedDiff(t *testing.T) {
 	cases := []struct {
