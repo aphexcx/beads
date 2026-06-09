@@ -80,11 +80,10 @@ func TestDiffExternalFields_NoChangeAfterSnapshotPatch(t *testing.T) {
 		},
 	}
 	got := diffExternalFields(ti, snap)
-	// State comparison without a State value falls back to name
-	// comparison (extractStatusName returns "" when State is nil),
-	// which matches snap.Status only if snap.Status == "". Since
-	// snap.Status here is "Todo", the name fallback would say
-	// "changed". Validate by giving the TrackerIssue a State.
+	// State comparison: ti.State is nil here, but snap has a populated
+	// StateID. The asymmetric-presence case in diffExternalFields
+	// intentionally does NOT flag status as changed (codex round-1
+	// hardening — no evidence of change → conservative no-flag).
 	if got[FieldStatus] {
 		t.Errorf("status flagged as changed despite matching state: %v", got)
 	}
@@ -263,13 +262,80 @@ func TestResolveFieldScopedConflict_TrueConflictExternalPolicy(t *testing.T) {
 	}
 }
 
+// TestResolveFieldScopedConflict_MixedDoesNotSetSkipIDs — codex
+// round-1 regression. When BOTH pushFields and pullFields are
+// populated (mixed-field auto-merge), the resolver MUST NOT set
+// skipIDs — doing so would short-circuit doPush's iteration before
+// pushFieldScopes can dispatch the field-scoped update, silently
+// dropping the local-side field change.
+//
+// The pull-only case (no pushFields) DOES set skipIDs to block the
+// legacy push path, since pullFieldScopes carries the work.
+func TestResolveFieldScopedConflict_MixedDoesNotSetSkipIDs(t *testing.T) {
+	e := &Engine{}
+	conflict := Conflict{
+		IssueID:         "bd-1",
+		LocalChanged:    map[ConflictField]bool{FieldTitle: true},
+		ExternalChanged: map[ConflictField]bool{FieldDescription: true},
+		Conflicting:     nil,
+	}
+	skipIDs := map[string]bool{}
+	forceIDs := map[string]bool{}
+	allowPullOverwriteIDs := map[string]bool{}
+	pushFieldScopes := map[string]map[ConflictField]bool{}
+	pullFieldScopes := map[string]map[ConflictField]bool{}
+
+	e.resolveFieldScopedConflict(SyncOptions{}, conflict,
+		skipIDs, forceIDs, allowPullOverwriteIDs,
+		pushFieldScopes, pullFieldScopes)
+
+	if skipIDs["bd-1"] {
+		t.Errorf("mixed scenario MUST NOT set skipIDs (would block field-scoped push), got %v", skipIDs)
+	}
+	if !forceIDs["bd-1"] || !allowPullOverwriteIDs["bd-1"] {
+		t.Errorf("mixed scenario should set force+overwrite: force=%v overwrite=%v",
+			forceIDs, allowPullOverwriteIDs)
+	}
+}
+
+// TestResolveFieldScopedConflict_PullOnlyDoesSetSkipIDs — the
+// counterpart to the mixed test: when only ExternalChanged has
+// fields, the legacy push path must be blocked via skipIDs so it
+// doesn't run a full-issue push that would re-overwrite the just-
+// pulled fields.
+func TestResolveFieldScopedConflict_PullOnlyDoesSetSkipIDs(t *testing.T) {
+	e := &Engine{}
+	conflict := Conflict{
+		IssueID:         "bd-1",
+		LocalChanged:    map[ConflictField]bool{},
+		ExternalChanged: map[ConflictField]bool{FieldDescription: true},
+		Conflicting:     nil,
+	}
+	skipIDs := map[string]bool{}
+	forceIDs := map[string]bool{}
+	allowPullOverwriteIDs := map[string]bool{}
+	pushFieldScopes := map[string]map[ConflictField]bool{}
+	pullFieldScopes := map[string]map[ConflictField]bool{}
+
+	e.resolveFieldScopedConflict(SyncOptions{}, conflict,
+		skipIDs, forceIDs, allowPullOverwriteIDs,
+		pushFieldScopes, pullFieldScopes)
+
+	if !skipIDs["bd-1"] {
+		t.Errorf("pull-only scenario should set skipIDs to block legacy push, got %v", skipIDs)
+	}
+	if forceIDs["bd-1"] {
+		t.Errorf("pull-only scenario should NOT set forceIDs, got %v", forceIDs)
+	}
+	if !allowPullOverwriteIDs["bd-1"] {
+		t.Errorf("pull-only scenario should allow pull-overwrite, got %v", allowPullOverwriteIDs)
+	}
+}
+
 // TestResolveFieldScopedConflict_MixedAutoMerge — different fields
 // changed on each side, no overlap. The auto-merge path: push
-// LocalChanged, pull ExternalChanged. Both forceIDs AND
-// allowPullOverwriteIDs end up set; without P6/P7 strict scoping,
-// the whole-issue paths fire for both, which has the known mixed-
-// field caveat documented in the commit message. The per-field maps
-// (consumed by P6/P7 when they land) record the correct intent.
+// LocalChanged, pull ExternalChanged. Field-scope maps record the
+// intent for P6/P7's strict scoping.
 func TestResolveFieldScopedConflict_MixedAutoMerge(t *testing.T) {
 	e := &Engine{}
 	conflict := Conflict{
@@ -294,9 +360,8 @@ func TestResolveFieldScopedConflict_MixedAutoMerge(t *testing.T) {
 	if !pullFieldScopes["bd-1"][FieldDescription] {
 		t.Errorf("expected pull scope description, got %v", pullFieldScopes)
 	}
-	// Both forceIDs and allowPullOverwriteIDs set — v1 fallback.
 	if !forceIDs["bd-1"] || !allowPullOverwriteIDs["bd-1"] {
-		t.Errorf("expected both force and overwrite set (whole-issue fallback): force=%v overwrite=%v",
+		t.Errorf("expected both force and overwrite set: force=%v overwrite=%v",
 			forceIDs, allowPullOverwriteIDs)
 	}
 }

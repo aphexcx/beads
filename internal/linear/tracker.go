@@ -823,6 +823,19 @@ func linearToTrackerIssue(li *Issue) tracker.TrackerIssue {
 		ti.ParentInternalID = li.Parent.ID
 	}
 
+	// bd-ajn: surface Linear's project UUID via Metadata for the
+	// generic tracker layer's field-scoped diff. The bd-ajn
+	// diffExternalFields path reads Metadata["project_id"] when
+	// comparing against the snapshot's ProjectID column. Without this
+	// wiring, every issue with a Project would falsely flag
+	// FieldProject as changed on every sync.
+	if li.Project != nil && li.Project.ID != "" {
+		if ti.Metadata == nil {
+			ti.Metadata = map[string]interface{}{}
+		}
+		ti.Metadata["project_id"] = li.Project.ID
+	}
+
 	if t, err := time.Parse(time.RFC3339, li.CreatedAt); err == nil {
 		ti.CreatedAt = t
 	}

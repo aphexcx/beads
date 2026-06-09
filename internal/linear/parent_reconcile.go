@@ -110,6 +110,13 @@ type ParentReconcileStats struct {
 	// external_ref yet, or the Linear issue was deleted out-of-band).
 	// Their links are silently skipped; the next sync will retry.
 	NotFound []string
+	// SnapshotWarnings is bd-ajn glue: post-success snapshot patch
+	// failures land here, not in Errors. Distinct severity — a
+	// missed snapshot only costs ONE spurious conflict-gate on the
+	// next sync (because DetectConflicts's first-sync path will
+	// baseline at that point); the API mutation itself succeeded.
+	// Callers should surface these as warnings, not errors.
+	SnapshotWarnings []error
 	// Errors collects per-link failures that did not abort the pass.
 	Errors []error
 }
@@ -246,14 +253,15 @@ func (t *Tracker) ReconcileParents(ctx context.Context, links []ParentLink, dryR
 		if updated != nil {
 			fetched[link.ChildIdentifier] = entry{issue: updated, client: childE.client}
 		}
-		// bd-ajn: patch the child's per-issue snapshot's parent_id so the
-		// next sync doesn't see "Linear changed parent" for the parentId
-		// we just pushed. Best-effort: failures don't abort the reconcile
-		// pass (a missed snapshot will baseline on next sync's first-sync
-		// path; the worst case is one spurious conflict gate).
+		// bd-ajn: patch the child's per-issue snapshot's parent_id so
+		// the next sync doesn't see "Linear changed parent" for the
+		// parentId we just pushed. Best-effort: failures route to
+		// SnapshotWarnings (not Errors) per codex round-1 severity
+		// note — a missed patch only costs one extra conflict-gate
+		// next sync; the API mutation itself succeeded.
 		if link.ChildLocalBeadID != "" {
 			if sErr := t.RecordPostSetParentSnapshot(ctx, link.ChildLocalBeadID, parentE.issue.ID); sErr != nil {
-				stats.Errors = append(stats.Errors,
+				stats.SnapshotWarnings = append(stats.SnapshotWarnings,
 					fmt.Errorf("snapshot patch for %s after parent-set: %w",
 						link.ChildIdentifier, sErr))
 			}

@@ -428,8 +428,7 @@ func (e *Engine) detectFieldScopedConflict(
 	}, nil
 }
 
-// doPull imports issues from the external tracker into beads.
-// doPull imports issues from the external tracker. bd-ajn:
+// doPull imports issues from the external tracker into beads. bd-ajn:
 // pullFieldScopes carries per-issue field restrictions from the
 // conflict resolver. When set for an issue, buildPullIssueUpdates
 // returns ONLY those fields so the pull doesn't clobber locally-
@@ -1429,27 +1428,34 @@ func (e *Engine) resolveFieldScopedConflict(
 		pullFieldScopes[c.IssueID] = pullFields
 	}
 
-	// Step 4: legacy whole-issue compatibility. Until doPush / doPull
-	// are fully field-scoped (P6 / P7), these gate the whole-issue
-	// push/pull paths so the resolution decisions take effect.
+	// Step 4: gate the whole-issue push/pull paths so the resolution
+	// decisions take effect at the engine level.
 	//
 	// Rules:
-	//   - Any pushFields present → force the push path to run for this
-	//     issue (so locally-modified fields propagate).
+	//   - Any pushFields present → force the push path to run for
+	//     this issue (so locally-changed fields propagate).
 	//   - Any pullFields present → allow the pull path to overwrite
-	//     local (so externally-modified fields land).
-	//
-	// In a mixed case (push some, pull some), this currently means
-	// the whole issue is processed by BOTH paths. P6/P7 will narrow
-	// the scope properly; for v1 this is OK because the only mixed
-	// scenarios where it matters are the genuinely-conflicting ones
-	// (covered by Step 2's per-field policy + Step 3's field maps).
+	//     local (so externally-changed fields land).
+	//   - Mixed (both push and pull): set forceIDs +
+	//     allowPullOverwriteIDs but NOT skipIDs. The skipIDs map
+	//     short-circuits the push path entirely before
+	//     pushFieldScopes can dispatch field-scoped — using it for
+	//     the pull side of a mixed conflict would silently skip the
+	//     push side (codex bd-ajn round-1 bug).
+	//   - Pull-only (no pushFields): set skipIDs so the legacy push
+	//     path doesn't fire for this issue at all. The pull side
+	//     handles the work via allowPullOverwriteIDs +
+	//     pullFieldScopes.
 	if len(pushFields) > 0 {
 		forceIDs[c.IssueID] = true
 	}
 	if len(pullFields) > 0 {
-		skipIDs[c.IssueID] = true
 		allowPullOverwriteIDs[c.IssueID] = true
+		if len(pushFields) == 0 {
+			// Pull-only — block the push path. Mixed scenarios skip
+			// this so doPush can run with pushFieldScopes scoping.
+			skipIDs[c.IssueID] = true
+		}
 	}
 }
 

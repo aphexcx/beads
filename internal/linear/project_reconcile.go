@@ -48,6 +48,13 @@ type ProjectMembershipStats struct {
 	NotFound []string
 	// Errors collects per-link failures that did not abort the pass.
 	Errors []error
+	// SnapshotWarnings is bd-ajn glue: post-success snapshot patch
+	// failures land here, not in Errors. Distinct severity — a
+	// missed snapshot only costs ONE spurious conflict-gate on the
+	// next sync (because DetectConflicts's first-sync path will
+	// baseline at that point); the API mutation itself succeeded.
+	// Callers should surface these as warnings, not errors.
+	SnapshotWarnings []error
 }
 
 // ReconcileProjectMembership wires (issue → Project) membership from
@@ -151,11 +158,13 @@ func (t *Tracker) ReconcileProjectMembership(ctx context.Context, links []Projec
 		// bd-ajn: patch the per-issue snapshot's project_id so the next
 		// sync doesn't read this projectId-set as "Linear changed it"
 		// and override unrelated local changes (the migration scenario
-		// the bug ticket describes). Best-effort: failures don't abort
-		// the reconcile — first-sync handling will baseline next sync.
+		// the bug ticket describes). Best-effort: failures route to
+		// SnapshotWarnings (not Errors) per codex round-1 severity
+		// note — a missed patch only costs one extra conflict-gate
+		// next sync; the API mutation itself succeeded.
 		if link.LocalBeadID != "" {
 			if sErr := t.RecordPostAssignSnapshot(ctx, link.LocalBeadID, link.ProjectID); sErr != nil {
-				stats.Errors = append(stats.Errors,
+				stats.SnapshotWarnings = append(stats.SnapshotWarnings,
 					fmt.Errorf("snapshot patch for %s after Project-assign: %w",
 						link.IssueIdentifier, sErr))
 			}

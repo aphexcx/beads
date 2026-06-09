@@ -91,6 +91,15 @@ type State struct {
 	Type string `json:"type"` // "backlog", "unstarted", "started", "completed", "canceled"
 }
 
+// GetID / GetName implement the lightweight extractor interfaces the
+// tracker package probes for in extractStateID / extractStatusName
+// (bd-ajn field-scoped status comparison). Without these the generic
+// tracker layer can't pull Linear's state UUID from a TrackerIssue's
+// State field, and the diff falls into the asymmetric no-flag branch
+// — silently dropping every status conflict.
+func (s *State) GetID() string   { return s.ID }
+func (s *State) GetName() string { return s.Name }
+
 // User represents a user in Linear.
 type User struct {
 	ID          string `json:"id"`

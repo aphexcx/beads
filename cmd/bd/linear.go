@@ -1346,6 +1346,11 @@ func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jso
 	for _, e := range stats.Errors {
 		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: %v", e))
 	}
+	// bd-ajn: snapshot patch failures are separate severity — surface
+	// but don't conflate with API errors.
+	for _, e := range stats.SnapshotWarnings {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile (snapshot): %v", e))
+	}
 }
 
 // buildLinearParentLinks enumerates local beads with a Linear external_ref
@@ -1486,6 +1491,11 @@ func reconcileLinearProjectMembership(ctx context.Context, lt *linear.Tracker, d
 	}
 	for _, e := range stats.Errors {
 		*warnings = append(*warnings, fmt.Sprintf("project reconcile: %v", e))
+	}
+	// bd-ajn: snapshot patch failures are separate severity — surface
+	// but don't conflate with API errors.
+	for _, e := range stats.SnapshotWarnings {
+		*warnings = append(*warnings, fmt.Sprintf("project reconcile (snapshot): %v", e))
 	}
 }
 
