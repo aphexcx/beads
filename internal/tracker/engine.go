@@ -159,6 +159,23 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		opts.Push = true
 	}
 
+	// bd-3p8: hard-fail when a tracker advertises a capability that
+	// REQUIRES a matching store interface, but the configured store
+	// doesn't implement it. Mayor's design principle: capability-
+	// degrade is acceptable for OPTIONAL features (label sync,
+	// comment sync); REQUIRED features (Project pull when
+	// ProjectSyncer is configured, field-scoped conflicts when the
+	// tracker supports them) should hard-error instead of warn —
+	// otherwise the feature ships silently disabled on backends
+	// without the matching impl, exactly the bd-3p8 failure mode.
+	if err := e.checkRequiredStoreCapabilities(); err != nil {
+		result.Success = false
+		result.Error = err.Error()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return result, err
+	}
+
 	// Track IDs to skip/force during push based on conflict resolution
 	skipPushIDs := make(map[string]bool)
 	forcePushIDs := make(map[string]bool)
@@ -1601,6 +1618,43 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 		}
 	}
 	return errCount
+}
+
+// checkRequiredStoreCapabilities (bd-3p8) enforces mayor's design
+// principle: tracker capabilities that REQUIRE a matching store
+// capability must hard-fail at sync-start when the store lacks the
+// impl, not silently degrade to a no-op.
+//
+// Current required pairings:
+//   - Tracker implements PostPullSnapshotter (bd-ajn field-scoped
+//     conflicts) → Store MUST implement LinearIssueSnapshotStore.
+//   - Tracker implements ProjectPuller (bd-6cl pull-side Project
+//     materialization) → Store MUST implement
+//     LinearProjectSnapshotStore.
+//
+// Trackers that don't advertise these capabilities (GitHub, Jira,
+// mocks) pass through unaffected — the check only fires for
+// configured tracker→store mismatches.
+func (e *Engine) checkRequiredStoreCapabilities() error {
+	if _, ok := e.Tracker.(PostPullSnapshotter); ok {
+		if _, storeOK := e.Store.(storage.LinearIssueSnapshotStore); !storeOK {
+			return fmt.Errorf(
+				"%s tracker requires LinearIssueSnapshotStore but the configured "+
+					"storage backend doesn't implement it; field-scoped conflict "+
+					"resolution (bd-ajn) cannot operate safely — see bd-3p8",
+				e.Tracker.DisplayName())
+		}
+	}
+	if _, ok := e.Tracker.(ProjectPuller); ok {
+		if _, storeOK := e.Store.(storage.LinearProjectSnapshotStore); !storeOK {
+			return fmt.Errorf(
+				"%s tracker requires LinearProjectSnapshotStore but the configured "+
+					"storage backend doesn't implement it; pull-side Project "+
+					"materialization (bd-6cl) cannot operate safely — see bd-3p8",
+				e.Tracker.DisplayName())
+		}
+	}
+	return nil
 }
 
 // pulledIssueProjectID extracts the Linear Project UUID from a
