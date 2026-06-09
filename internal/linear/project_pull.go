@@ -1,6 +1,7 @@
 package linear
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -315,3 +316,221 @@ func appendSkip(existing, more string) string {
 // legacy whole-issue fallback for Issues without a snapshot
 // backend).
 var errProjectSnapshotStoreNotSupported = errors.New("storage backend does not expose LinearProjectSnapshotStore")
+
+// PullProjects implements tracker.ProjectPuller. The engine's
+// doPull calls this at the top of its loop (when the tracker is
+// also a ProjectSyncer — Linear satisfies both) to materialize
+// remote Linear Projects as local epics before the per-Issue pull
+// runs.
+//
+// Workflow per Project:
+//  1. Match local epic by external_ref (Project URL → bead lookup)
+//  2. Matched + snapshot exists → resolveProjectPull → apply
+//     Updates → write new snapshot
+//  3. Matched + no snapshot → first-sync soft rollout (baseline,
+//     no apply, log)
+//  4. Unmatched → CREATE local epic (TypeEpic) + write baseline
+//     snapshot
+//
+// Errors from a single Project don't abort the pass; they're
+// collected in stats.Errors. Snapshot-write failures land in
+// stats.SnapshotWarnings (severity-distinct, per bd-ajn pattern).
+//
+// Dry-run: produces all decisions, logs them, but writes nothing
+// to the store.
+func (t *Tracker) PullProjects(ctx context.Context, opts tracker.ProjectPullOptions) (*tracker.ProjectPullStats, error) {
+	stats := &tracker.ProjectPullStats{}
+	if t.store == nil {
+		return stats, fmt.Errorf("PullProjects: tracker has no store configured")
+	}
+	snapStore, snapOK := t.store.(storage.LinearProjectSnapshotStore)
+	if !snapOK {
+		// Backend doesn't support Project snapshots. Per mayor's
+		// bd-6cl Q3 decision (option B), this is a fatal config gap
+		// — the pull is unsafe without snapshots. Return a clear
+		// error so the engine surfaces it as a warning rather than
+		// silently dropping into the broken whole-issue fallback.
+		return stats, errProjectSnapshotStoreNotSupported
+	}
+
+	remoteProjects, err := t.FetchProjects(ctx, "all")
+	if err != nil {
+		return stats, fmt.Errorf("PullProjects: FetchProjects: %w", err)
+	}
+	stats.Fetched = len(remoteProjects)
+	if stats.Fetched == 0 {
+		return stats, nil
+	}
+
+	// Build local-epic-by-Project-URL index. Walk all issues with
+	// external_ref matching a Project URL. Bead lookup is O(N)
+	// over the workspace; acceptable for v1 (rigs have tens to
+	// hundreds of top-level epics, not thousands).
+	localIssues, err := t.store.SearchIssues(ctx, "", types.IssueFilter{})
+	if err != nil {
+		return stats, fmt.Errorf("PullProjects: SearchIssues: %w", err)
+	}
+	localByProjectURL := make(map[string]*types.Issue)
+	for _, issue := range localIssues {
+		if issue == nil || issue.ExternalRef == nil {
+			continue
+		}
+		ref := strings.TrimSpace(*issue.ExternalRef)
+		if ref != "" && IsLinearProjectRef(ref) {
+			localByProjectURL[ref] = issue
+		}
+	}
+
+	syncedAt := time.Now().UTC()
+	for _, remote := range remoteProjects {
+		t.pullOneProject(ctx, remote, localByProjectURL, snapStore, opts, syncedAt, stats)
+	}
+	return stats, nil
+}
+
+// pullOneProject is the per-Project worker — extracted from
+// PullProjects for clarity and unit-testability. Mutates stats in
+// place.
+func (t *Tracker) pullOneProject(
+	ctx context.Context,
+	remote tracker.TrackerProject,
+	localByProjectURL map[string]*types.Issue,
+	snapStore storage.LinearProjectSnapshotStore,
+	opts tracker.ProjectPullOptions,
+	syncedAt time.Time,
+	stats *tracker.ProjectPullStats,
+) {
+	localEpic, matched := localByProjectURL[remote.URL]
+
+	if !matched {
+		// Unmatched: CREATE a new local epic. Snapshot baseline
+		// writes after successful creation.
+		if opts.DryRun {
+			stats.PreviewLines = append(stats.PreviewLines,
+				fmt.Sprintf("[dry-run] Would materialize Linear Project as new local epic: %s (%s)", remote.Name, remote.URL))
+			stats.Created++
+			return
+		}
+		newEpic, err := t.createEpicFromProject(ctx, remote, opts.Actor)
+		if err != nil {
+			stats.Errors = append(stats.Errors,
+				fmt.Errorf("create epic from Project %s: %w", remote.URL, err))
+			return
+		}
+		if sErr := snapStore.UpsertLinearProjectSnapshot(ctx,
+			remoteToSnapshot(newEpic.ID, remote, syncedAt)); sErr != nil {
+			stats.SnapshotWarnings = append(stats.SnapshotWarnings,
+				fmt.Errorf("snapshot baseline for new epic %s (Project %s): %w",
+					newEpic.ID, remote.URL, sErr))
+		}
+		stats.Created++
+		return
+	}
+
+	// Matched: resolve against snapshot + local history.
+	snap, err := snapStore.GetLinearProjectSnapshot(ctx, localEpic.ID)
+	if err != nil {
+		stats.Errors = append(stats.Errors,
+			fmt.Errorf("load snapshot for %s: %w", localEpic.ID, err))
+		return
+	}
+
+	// Local at-sync from dolt_history. nil when issue had no
+	// committed state at lastSync (created since) — resolver
+	// treats that as "every populated field new locally".
+	var localAtSync *types.Issue
+	if !opts.LastSync.IsZero() {
+		localAtSync, err = tracker.LoadLocalStateAtSync(ctx, t.store, localEpic.ID, opts.LastSync)
+		if err != nil && !errors.Is(err, tracker.ErrHistoryNotSupported) {
+			stats.Errors = append(stats.Errors,
+				fmt.Errorf("history lookup for %s: %w", localEpic.ID, err))
+			return
+		}
+	}
+
+	decision := resolveProjectPull(localEpic, remote, localAtSync, snap, opts.Policy, syncedAt)
+
+	if opts.DryRun {
+		if len(decision.Updates) > 0 {
+			stats.PreviewLines = append(stats.PreviewLines,
+				fmt.Sprintf("[dry-run] Would update local epic %s from Linear Project %s (fields: %v)",
+					localEpic.ID, remote.URL, sortedUpdateKeys(decision.Updates)))
+			stats.Updated++
+		} else if decision.SkipReason != "" {
+			stats.PreviewLines = append(stats.PreviewLines,
+				fmt.Sprintf("[dry-run] Project pull %s: %s", localEpic.ID, decision.SkipReason))
+			if strings.Contains(decision.SkipReason, "first sync") {
+				stats.FirstSync++
+			} else {
+				stats.Skipped++
+			}
+		} else {
+			stats.Skipped++
+		}
+		return
+	}
+
+	if len(decision.Updates) > 0 {
+		if uErr := t.store.UpdateIssue(ctx, localEpic.ID, decision.Updates, opts.Actor); uErr != nil {
+			stats.Errors = append(stats.Errors,
+				fmt.Errorf("apply Project pull update for %s: %w", localEpic.ID, uErr))
+			return
+		}
+		stats.Updated++
+	} else if strings.Contains(decision.SkipReason, "first sync") {
+		stats.FirstSync++
+	} else {
+		stats.Skipped++
+	}
+
+	if decision.NewSnapshot != nil {
+		if sErr := snapStore.UpsertLinearProjectSnapshot(ctx, decision.NewSnapshot); sErr != nil {
+			stats.SnapshotWarnings = append(stats.SnapshotWarnings,
+				fmt.Errorf("snapshot refresh for %s: %w", localEpic.ID, sErr))
+		}
+	}
+}
+
+// createEpicFromProject materializes a fresh local epic from a
+// just-fetched Linear Project. Title, description (recombined from
+// content/description per bd-cs1 reversal), status (via reverse
+// map), and external_ref are set. The bead store assigns an ID.
+//
+// Status follows the reverse map: Linear "completed" → closed
+// (no close_reason), "canceled" → closed + close_reason, etc.
+// Q1's close-state preservation doesn't apply here because there's
+// no prior local state to preserve — this is a fresh create.
+func (t *Tracker) createEpicFromProject(ctx context.Context, remote tracker.TrackerProject, actor string) (*types.Issue, error) {
+	mapped := MapProjectStateToBeads(remote.State)
+	ref := remote.URL
+	epic := &types.Issue{
+		Title:       remote.Name,
+		Description: recombineProjectDescription(remote),
+		IssueType:   types.TypeEpic,
+		Status:      mapped.Status,
+		ExternalRef: &ref,
+	}
+	if mapped.CloseReason != "" {
+		epic.CloseReason = mapped.CloseReason
+	}
+	if err := t.store.CreateIssue(ctx, epic, actor); err != nil {
+		return nil, err
+	}
+	return epic, nil
+}
+
+// sortedUpdateKeys returns the keys of an update map in
+// deterministic order for log lines. Pure helper.
+func sortedUpdateKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	// Inline sort.Strings to avoid a sort import for the helper.
+	for i := 1; i < len(keys); i++ {
+		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
+			keys[j-1], keys[j] = keys[j], keys[j-1]
+		}
+	}
+	return keys
+}

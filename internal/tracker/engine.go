@@ -464,6 +464,39 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		}
 	}
 
+	// bd-6cl: pull-side Project materialization. Run BEFORE the
+	// per-Issue pull so that new local epics created here exist
+	// when the post-pull descendant-projectId-wiring pass (P5)
+	// walks the just-pulled Issues. Skipped silently for trackers
+	// that don't implement ProjectPuller (GitHub, Jira, etc.).
+	if pp, ok := e.Tracker.(ProjectPuller); ok {
+		projectOpts := ProjectPullOptions{
+			DryRun: opts.DryRun,
+			Policy: opts.ConflictResolution,
+			Actor:  e.Actor,
+		}
+		if lastSync != nil {
+			projectOpts.LastSync = *lastSync
+		}
+		projectStats, err := pp.PullProjects(ctx, projectOpts)
+		if err != nil {
+			e.warn("Project pull failed: %v", err)
+		} else if projectStats != nil {
+			for _, line := range projectStats.PreviewLines {
+				e.msg("%s", line)
+			}
+			for _, perr := range projectStats.Errors {
+				e.warn("Project pull error: %v", perr)
+			}
+			for _, swarn := range projectStats.SnapshotWarnings {
+				e.warn("Project pull (snapshot): %v", swarn)
+			}
+			stats.Created += projectStats.Created
+			stats.Updated += projectStats.Updated
+			stats.Skipped += projectStats.Skipped
+		}
+	}
+
 	localIssues, err := e.Store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
 		return nil, fmt.Errorf("searching local issues: %w", err)

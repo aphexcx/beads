@@ -29,6 +29,13 @@ import (
 // remote state, and emits NO conflict for that issue this run. The
 // next sync sees a real baseline and field-scoping kicks in.
 
+// LoadLocalStateAtSync is the exported form of loadLocalStateAtSync
+// — same semantics, exposed for cross-package callers (bd-6cl's
+// Linear-side Project pull resolver needs the same history lookup).
+func LoadLocalStateAtSync(ctx context.Context, store storage.Storage, issueID string, lastSync time.Time) (*types.Issue, error) {
+	return loadLocalStateAtSync(ctx, store, issueID, lastSync)
+}
+
 // loadLocalStateAtSync queries dolt_history_issues for the issue's
 // state at the most recent commit before lastSync. Returns
 // (nil, nil) when no such commit exists (issue created after
@@ -69,6 +76,10 @@ func loadLocalStateAtSync(ctx context.Context, store storage.Storage, issueID st
 // errHistoryNotSupported signals a backend without history capability.
 // Callers fall back to whole-issue timestamp resolution.
 var errHistoryNotSupported = errors.New("storage backend does not expose IssueHistoryViewer")
+
+// ErrHistoryNotSupported is the exported sentinel for cross-package
+// callers that need to detect missing history capability (bd-6cl).
+var ErrHistoryNotSupported = errHistoryNotSupported
 
 // diffLocalFields returns the set of fields whose value differs
 // between `current` and `atSync`. When atSync is nil (issue had no
