@@ -1160,7 +1160,15 @@ func (t *Tracker) UpdateIssueFields(ctx context.Context, externalID string, issu
 		case tracker.FieldPriority:
 			updates[key] = PriorityToLinear(issue.Priority, t.config)
 		case tracker.FieldAssignee:
-			updates[key] = issue.Assignee
+			// Linear's assigneeId field requires the user's UUID,
+			// not the bead's assignee string (which is an email or
+			// display name). The existing IssueToTracker path doesn't
+			// push assignee at all for this reason — there's no
+			// user-lookup wired up. Skip silently here too rather
+			// than send the raw string and have Linear reject or
+			// mis-assign (codex bd-ajn round-2 bug 7). When user-
+			// resolution lands, this case can wire to it.
+			continue
 		case tracker.FieldProject, tracker.FieldParent:
 			// These fields aren't pushed through UpdateIssue's main
 			// path — they have dedicated AssignIssueToProject /

@@ -387,9 +387,15 @@ func (e *Engine) detectFieldScopedConflict(
 		// First-sync soft rollout.
 		e.msg("first sync — snapshotting baseline for issue %s (no conflict possible this run)", issue.ID)
 		if writeErr := snapshotter.RecordPullSnapshot(ctx, issue.ID, *extIssue); writeErr != nil {
-			// Don't escalate to legacy path: baseline failure just
-			// means next sync also gets the soft-rollout treatment.
-			e.warn("baseline snapshot write failed for %s: %v", issue.ID, writeErr)
+			// Codex bd-ajn round-2 bug 6: a persistent baseline write
+			// failure would loop forever — every sync sees nil
+			// snapshot, retries, fails, and the user's conflicts are
+			// never surfaced. Escalate to the caller as a real error
+			// so it falls through to legacy whole-issue handling.
+			// That path uses pure timestamp comparison (no snapshot
+			// dependency) and at least gives the conflict a chance
+			// to be detected and resolved under existing behavior.
+			return nil, fmt.Errorf("baseline snapshot write failed for %s: %w", issue.ID, writeErr)
 		}
 		return nil, nil
 	}

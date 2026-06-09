@@ -549,7 +549,21 @@ func (c *Client) UpdateIssue(ctx context.Context, issueID string, updates map[st
 						name
 						type
 					}
+					assignee {
+						id
+						name
+						email
+						displayName
+					}
+					parent {
+						id
+						identifier
+					}
+					project {
+						id
+					}
 					updatedAt
+					completedAt
 				}
 			}
 		}
