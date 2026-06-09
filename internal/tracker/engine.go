@@ -494,7 +494,11 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 			stats.Created += projectStats.Created
 			stats.Updated += projectStats.Updated
-			stats.Skipped += projectStats.Skipped
+			// FirstSync (codex bd-6cl round-1 nit) folds into Skipped
+			// for engine display: from the user's perspective, a
+			// first-sync baseline produced no apply work — it's a
+			// skip with extra observability captured in PreviewLines.
+			stats.Skipped += projectStats.Skipped + projectStats.FirstSync
 			projectIDToLocalEpicID = projectStats.ProjectIDToLocalEpicID
 		}
 	}

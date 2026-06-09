@@ -366,6 +366,12 @@ func (t *Tracker) PullProjects(ctx context.Context, opts tracker.ProjectPullOpti
 	// external_ref matching a Project URL. Bead lookup is O(N)
 	// over the workspace; acceptable for v1 (rigs have tens to
 	// hundreds of top-level epics, not thousands).
+	//
+	// Canonicalize both the indexed ref AND the remote.URL lookup
+	// key (codex bd-6cl round-1 bug 2) so slug renames or trailing
+	// /title differences don't cause a miss → duplicate-epic
+	// creation. CanonicalizeLinearExternalRef strips trailing path
+	// segments and normalizes form so both sides compare equal.
 	localIssues, err := t.store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
 		return stats, fmt.Errorf("PullProjects: SearchIssues: %w", err)
@@ -377,7 +383,11 @@ func (t *Tracker) PullProjects(ctx context.Context, opts tracker.ProjectPullOpti
 		}
 		ref := strings.TrimSpace(*issue.ExternalRef)
 		if ref != "" && IsLinearProjectRef(ref) {
-			localByProjectURL[ref] = issue
+			canonical, ok := CanonicalizeLinearExternalRef(ref)
+			if !ok {
+				canonical = ref // fall back to raw if canonicalize couldn't normalize
+			}
+			localByProjectURL[canonical] = issue
 		}
 	}
 
@@ -401,7 +411,14 @@ func (t *Tracker) pullOneProject(
 	syncedAt time.Time,
 	stats *tracker.ProjectPullStats,
 ) {
-	localEpic, matched := localByProjectURL[remote.URL]
+	// Canonicalize remote.URL the same way the index was built so
+	// the match doesn't miss on a slug or trailing-path difference
+	// (codex bd-6cl round-1 bug 2).
+	lookupKey := remote.URL
+	if canonical, ok := CanonicalizeLinearExternalRef(remote.URL); ok {
+		lookupKey = canonical
+	}
+	localEpic, matched := localByProjectURL[lookupKey]
 
 	if !matched {
 		// Unmatched: CREATE a new local epic. Snapshot baseline
@@ -444,6 +461,16 @@ func (t *Tracker) pullOneProject(
 		stats.Errors = append(stats.Errors,
 			fmt.Errorf("load snapshot for %s: %w", localEpic.ID, err))
 		return
+	}
+
+	// Codex bd-6cl round-1 bug 1: a snapshot pinned to a DIFFERENT
+	// Project UUID than the one we just fetched means the epic was
+	// repointed at a new Linear Project (rare — migration tooling or
+	// manual external_ref rewrite). Trusting the stale snapshot
+	// would produce a spurious diff or skip first-sync incorrectly.
+	// Force the first-sync soft-rollout path by dropping the snap.
+	if snap != nil && snap.ProjectID != "" && remote.ID != "" && snap.ProjectID != remote.ID {
+		snap = nil
 	}
 
 	// Local at-sync from dolt_history. nil when issue had no
