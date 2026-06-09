@@ -469,6 +469,7 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 	// when the post-pull descendant-projectId-wiring pass (P5)
 	// walks the just-pulled Issues. Skipped silently for trackers
 	// that don't implement ProjectPuller (GitHub, Jira, etc.).
+	projectIDToLocalEpicID := map[string]string{}
 	if pp, ok := e.Tracker.(ProjectPuller); ok {
 		projectOpts := ProjectPullOptions{
 			DryRun: opts.DryRun,
@@ -494,6 +495,7 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			stats.Created += projectStats.Created
 			stats.Updated += projectStats.Updated
 			stats.Skipped += projectStats.Skipped
+			projectIDToLocalEpicID = projectStats.ProjectIDToLocalEpicID
 		}
 	}
 
@@ -727,6 +729,25 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
 			if err := e.PullHooks.SyncAttachments(ctx, localID, extIssue.ID); err != nil {
 				e.warn("Attachment sync failed for %s: %v", localID, err)
+			}
+		}
+
+		// bd-6cl: when the just-pulled Issue's remote payload
+		// includes a projectId (Linear sets Metadata["project_id"]
+		// for issues belonging to a Project), wire a parent-child
+		// dep from this issue's bead to the local epic that
+		// materializes that Project. Idempotent — skip if dep
+		// already exists. Skipped on dry-run (no creates ran, the
+		// epic might not exist locally yet). Skipped when the
+		// projectId isn't mapped to a known local epic (out-of-band
+		// Project, or our PullProjects didn't see it for any reason).
+		if !opts.DryRun && localID != "" && len(projectIDToLocalEpicID) > 0 {
+			if pid := pulledIssueProjectID(extIssue); pid != "" {
+				if epicID, ok := projectIDToLocalEpicID[pid]; ok && epicID != "" && epicID != localID {
+					if err := e.ensureParentChildDep(ctx, localID, epicID); err != nil {
+						e.warn("Failed to wire Project parent-child dep for %s → %s: %v", localID, epicID, err)
+					}
+				}
 			}
 		}
 
@@ -1576,6 +1597,54 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 		}
 	}
 	return errCount
+}
+
+// pulledIssueProjectID extracts the Linear Project UUID from a
+// TrackerIssue's Metadata map (set by bd-ajn round-1 wiring in
+// linearToTrackerIssue). Returns "" when the issue has no
+// projectId or the value isn't a string. bd-6cl uses this in the
+// per-Issue pull loop to decide whether to wire a parent-child
+// dep to the materialized local epic.
+func pulledIssueProjectID(ti TrackerIssue) string {
+	if ti.Metadata == nil {
+		return ""
+	}
+	if v, ok := ti.Metadata["project_id"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// ensureParentChildDep adds a parent-child dependency from childID
+// to parentID, idempotently. Skips when the dep already exists
+// (per bead store semantics: AddDependency returns an error on
+// duplicate, which we treat as success). bd-6cl's pull-side
+// descendant wiring calls this for each just-pulled Issue whose
+// Linear projectId matches a materialized local epic.
+func (e *Engine) ensureParentChildDep(ctx context.Context, childID, parentID string) error {
+	// Pre-check: skip the AddDependency call when the dep is
+	// already present locally. Avoids generating an event row +
+	// hides the storage-layer "duplicate dependency" error.
+	existing, err := e.Store.GetDependenciesWithMetadata(ctx, childID)
+	if err != nil {
+		return fmt.Errorf("get dependencies for %s: %w", childID, err)
+	}
+	for _, d := range existing {
+		if d == nil {
+			continue
+		}
+		if d.Issue.ID == parentID && d.DependencyType == types.DepParentChild {
+			return nil // already wired
+		}
+	}
+	dep := &types.Dependency{
+		IssueID:     childID,
+		DependsOnID: parentID,
+		Type:        types.DepParentChild,
+	}
+	return e.Store.AddDependency(ctx, dep, e.Actor)
 }
 
 // buildDescendantSet returns the set of issue IDs consisting of the given parent

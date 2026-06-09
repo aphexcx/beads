@@ -228,6 +228,13 @@ type ProjectPullStats struct {
 	// PreviewLines is dry-run output: per-Project decision summary
 	// the caller can print. Populated only when DryRun is true.
 	PreviewLines []string
+	// ProjectIDToLocalEpicID maps Linear Project UUIDs to the
+	// matched-or-newly-created local epic bead ID. Used by the
+	// engine's post-pull descendant-dep wiring pass to translate
+	// a pulled Issue's projectId metadata into a parent-child dep
+	// target without a second database lookup. Empty in dry-run
+	// (no creates happened).
+	ProjectIDToLocalEpicID map[string]string
 }
 
 // ProjectPullOptions are the runtime knobs the engine passes to a

@@ -382,6 +382,7 @@ func (t *Tracker) PullProjects(ctx context.Context, opts tracker.ProjectPullOpti
 	}
 
 	syncedAt := time.Now().UTC()
+	stats.ProjectIDToLocalEpicID = make(map[string]string, len(remoteProjects))
 	for _, remote := range remoteProjects {
 		t.pullOneProject(ctx, remote, localByProjectURL, snapStore, opts, syncedAt, stats)
 	}
@@ -423,8 +424,18 @@ func (t *Tracker) pullOneProject(
 				fmt.Errorf("snapshot baseline for new epic %s (Project %s): %w",
 					newEpic.ID, remote.URL, sErr))
 		}
+		if remote.ID != "" {
+			stats.ProjectIDToLocalEpicID[remote.ID] = newEpic.ID
+		}
 		stats.Created++
 		return
+	}
+
+	// Matched path always records the mapping so the post-pull
+	// descendant-dep pass can look up the local epic ID from a
+	// pulled Issue's projectId metadata.
+	if remote.ID != "" {
+		stats.ProjectIDToLocalEpicID[remote.ID] = localEpic.ID
 	}
 
 	// Matched: resolve against snapshot + local history.
