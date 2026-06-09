@@ -463,13 +463,19 @@ func (t *Tracker) pullOneProject(
 		return
 	}
 
-	// Codex bd-6cl round-1 bug 1: a snapshot pinned to a DIFFERENT
-	// Project UUID than the one we just fetched means the epic was
-	// repointed at a new Linear Project (rare — migration tooling or
-	// manual external_ref rewrite). Trusting the stale snapshot
-	// would produce a spurious diff or skip first-sync incorrectly.
-	// Force the first-sync soft-rollout path by dropping the snap.
-	if snap != nil && snap.ProjectID != "" && remote.ID != "" && snap.ProjectID != remote.ID {
+	// Codex bd-6cl round-1 bug 1 (tightened in round 2): drop the
+	// snapshot when we can't verify it belongs to the same Project
+	// as remote. Cases:
+	//   - snap.ProjectID is non-empty AND differs from remote.ID
+	//     → epic was repointed; old snapshot is for a different
+	//     Project. Force first-sync soft rollout against the new
+	//     baseline.
+	//   - snap.ProjectID is EMPTY (round-2 nit): old or partial
+	//     write left ProjectID unset. We can't prove the snapshot
+	//     belongs to remote. Same fix — drop it and re-baseline.
+	//   - remote.ID is empty: unusual (server bug?) but the diff
+	//     still works against snap's other fields; leave snap as-is.
+	if snap != nil && remote.ID != "" && (snap.ProjectID == "" || snap.ProjectID != remote.ID) {
 		snap = nil
 	}
 

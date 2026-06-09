@@ -1571,7 +1571,16 @@ func buildLinearProjectMembershipLinks(ctx context.Context, lt *linear.Tracker) 
 			// parent reconciler (bd-ena) handles Issue-parent links.
 			continue
 		}
-		projectID, ok := urlToProjectID[ancestorRef]
+		// Codex bd-6cl round-2 bug 4: canonicalize the bead's
+		// stored external_ref before lookup so a trailing-title-slug
+		// rename on Linear doesn't silently break the resolution.
+		// buildLinearProjectURLIndex also canonicalizes its keys, so
+		// both sides compare in the same shape.
+		lookupKey := ancestorRef
+		if canonical, ok := linear.CanonicalizeLinearExternalRef(ancestorRef); ok {
+			lookupKey = canonical
+		}
+		projectID, ok := urlToProjectID[lookupKey]
 		if !ok || projectID == "" {
 			// Project URL doesn't resolve on Linear (deleted
 			// out-of-band). Silently skip; would be too noisy to
@@ -1602,7 +1611,16 @@ func buildLinearProjectURLIndex(ctx context.Context, lt *linear.Tracker) (map[st
 		if p.URL == "" || p.ID == "" {
 			continue
 		}
-		idx[p.URL] = p.ID
+		// Codex bd-6cl round-2 bug 4: canonicalize the URL so the
+		// lookup at the call site can compare canonicalized
+		// references symmetrically — a bead's stored external_ref
+		// may carry a different trailing title slug than Linear's
+		// current Project URL.
+		key := p.URL
+		if canonical, ok := linear.CanonicalizeLinearExternalRef(p.URL); ok {
+			key = canonical
+		}
+		idx[key] = p.ID
 	}
 	return idx, nil
 }

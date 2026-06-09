@@ -387,8 +387,20 @@ func findLinearProjectByURL(ctx context.Context, lt *linear.Tracker, projectURL 
 	if err != nil {
 		return nil, err
 	}
+	// Codex bd-6cl round-2 bug 4: tolerate a trailing-title-slug
+	// difference between the caller's projectURL (often from a
+	// bead's stored external_ref) and Linear's current Project URL.
+	// Canonicalize both sides before comparing.
+	needle := projectURL
+	if canonical, ok := linear.CanonicalizeLinearExternalRef(projectURL); ok {
+		needle = canonical
+	}
 	for _, p := range projects {
-		if p.URL == projectURL {
+		key := p.URL
+		if canonical, ok := linear.CanonicalizeLinearExternalRef(p.URL); ok {
+			key = canonical
+		}
+		if key == needle {
 			// Note: tracker.TrackerProject doesn't expose the underlying
 			// linear.Project; re-fetch via the Linear-specific client to
 			// get the typed *linear.Project. Cheap (~1 API call).

@@ -3,6 +3,7 @@ package tracker
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -242,10 +243,43 @@ func resolveProjectIDFromRef(ctx context.Context, syncer ProjectSyncer, ref stri
 	if err != nil {
 		return "", err
 	}
+	// Codex bd-6cl round-2 bug 4: tolerate trailing-title-slug
+	// differences between the bead's stored external_ref and
+	// Linear's current Project URL. Linear can rename the slug
+	// portion (the human-readable title at the end of the URL)
+	// without changing the Project identity; matching on raw
+	// URLs would silently miss the update. canonicalizeProjectURL
+	// strips that trailing segment for both sides of the compare.
+	needle := canonicalizeProjectURL(ref)
 	for _, p := range projects {
-		if p.URL == ref {
+		if canonicalizeProjectURL(p.URL) == needle {
 			return p.ID, nil
 		}
 	}
 	return "", nil
+}
+
+// canonicalizeProjectURL strips the trailing human-readable title
+// segment from a Linear-style Project URL so two URLs that differ
+// only in title compare as equal. Pure string transform; no Linear
+// import (this file lives in the tracker package).
+//
+// Linear Project URLs look like:
+//
+//	https://linear.app/<workspace>/project/<slug-id>[/title-slug]
+//
+// We keep everything up to and including <slug-id> and drop any
+// further path segments. URLs that don't contain "/project/" pass
+// through unchanged — the caller's exact-match still works.
+func canonicalizeProjectURL(url string) string {
+	const marker = "/project/"
+	idx := strings.Index(url, marker)
+	if idx < 0 {
+		return url
+	}
+	rest := url[idx+len(marker):]
+	if slash := strings.Index(rest, "/"); slash >= 0 {
+		return url[:idx+len(marker)+slash]
+	}
+	return url
 }
