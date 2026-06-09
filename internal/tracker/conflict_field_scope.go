@@ -137,18 +137,27 @@ func diffExternalFields(extIssue *TrackerIssue, snapshot *storage.LinearIssueSna
 	if extIssue.Description != snapshot.Description {
 		out[FieldDescription] = true
 	}
-	// Status comparison: prefer the stable state_id when both sides
-	// have one (snapshot stores it, extIssue.Raw carries it for
-	// adapters that populate the State field). When state_id isn't
-	// available, fall back to comparing the rendered status name —
-	// best-effort. status_id is the authoritative comparator per
-	// mayor's Q2.
-	if currentStateID := extractStateID(extIssue); currentStateID != "" && snapshot.StateID != "" {
+	// Status comparison: prefer the stable state_id (mayor Q2).
+	// Logic:
+	//   - Both sides have a state_id → compare directly.
+	//   - Both sides lack one → fall back to the rendered status
+	//     name (best-effort).
+	//   - Asymmetric (one has, one doesn't) → don't flag; we lack the
+	//     evidence to claim a difference, and flagging would yield
+	//     spurious "Linear changed status" reads on every sync where
+	//     one side's State field hasn't been populated (common during
+	//     adapter rollouts and on minimal mock data).
+	currentStateID := extractStateID(extIssue)
+	switch {
+	case currentStateID != "" && snapshot.StateID != "":
 		if currentStateID != snapshot.StateID {
 			out[FieldStatus] = true
 		}
-	} else if currentStatus := extractStatusName(extIssue); currentStatus != snapshot.Status {
-		out[FieldStatus] = true
+	case currentStateID == "" && snapshot.StateID == "":
+		if extractStatusName(extIssue) != snapshot.Status {
+			out[FieldStatus] = true
+		}
+		// Asymmetric → no flag.
 	}
 	if extIssue.Priority != snapshot.Priority {
 		out[FieldPriority] = true
