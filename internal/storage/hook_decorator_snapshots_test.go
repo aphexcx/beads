@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -84,12 +83,15 @@ func (s *snapshotCapableStub) DeleteLinearProjectSnapshot(_ context.Context, iss
 // snapshot interfaces — must succeed after the bd-0iv fix.
 func TestHookFiringStore_PreservesSnapshotCapabilities(t *testing.T) {
 	inner := newSnapshotCapableStub()
-	wrapped := NewHookFiringStore(inner, nil)
+	// Use interface-typed local before asserting — matches the
+	// existing pattern in internal/storage/dolt/linear_snapshots_test.go's
+	// TestDoltStoreSatisfiesSnapshotInterfaces (bd-3p8).
+	var s interface{} = NewHookFiringStore(inner, nil)
 
-	if _, ok := interface{}(wrapped).(LinearIssueSnapshotStore); !ok {
+	if _, ok := s.(LinearIssueSnapshotStore); !ok {
 		t.Error("HookFiringStore must expose LinearIssueSnapshotStore from inner *DoltStore (bd-0iv)")
 	}
-	if _, ok := interface{}(wrapped).(LinearProjectSnapshotStore); !ok {
+	if _, ok := s.(LinearProjectSnapshotStore); !ok {
 		t.Error("HookFiringStore must expose LinearProjectSnapshotStore from inner *DoltStore (bd-0iv)")
 	}
 }
@@ -138,6 +140,9 @@ func TestHookFiringStore_SnapshotCallsReachInnerStore(t *testing.T) {
 	}
 	if err := wrapped.DeleteLinearProjectSnapshot(ctx, "ep-1"); err != nil {
 		t.Errorf("DeleteLinearProjectSnapshot via wrapper: %v", err)
+	}
+	if _, ok := inner.projectRows["ep-1"]; ok {
+		t.Errorf("inner project snapshot not deleted: rows=%v", inner.projectRows)
 	}
 
 	// Call ordering sanity — verifies every method exercised hits
@@ -191,7 +196,3 @@ func TestHookFiringStore_NonCapableInnerReturnsError(t *testing.T) {
 		t.Errorf("error should mention the missing interface: %v", err)
 	}
 }
-
-// Silence unused-import lint when the test file doesn't otherwise
-// use errors. errors is reserved here for future extensions.
-var _ = errors.New
