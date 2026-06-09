@@ -665,12 +665,20 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		if pullEqual {
 			// Issue unchanged, but still sync comments/attachments
 			// (they may have been added externally since last sync).
-			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
+			//
+			// bd-p4m round 1: dry-run guard MUST precede these hooks.
+			// SyncComments / SyncAttachments write to the local store
+			// (ImportCommentWithRef + CreateAttachment); firing them
+			// during --dry-run violates the read-only contract. Same
+			// class of bug as the snapshot baseline write this PR
+			// fixed in detectFieldScopedConflict — caught by codex
+			// round-1's wider audit.
+			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" && !opts.DryRun {
 				if err := e.PullHooks.SyncComments(ctx, existing.ID, extIssue.ID); err != nil {
 					e.warn("Comment sync failed for %s: %v", existing.ID, err)
 				}
 			}
-			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
+			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" && !opts.DryRun {
 				if err := e.PullHooks.SyncAttachments(ctx, existing.ID, extIssue.ID); err != nil {
 					e.warn("Attachment sync failed for %s: %v", existing.ID, err)
 				}
