@@ -1044,6 +1044,7 @@ func (t *Tracker) FetchProjects(ctx context.Context, state string) ([]tracker.Tr
 				ID:          p.ID,
 				Name:        p.Name,
 				Description: p.Description,
+				Content:     p.Content, // bd-6cl: needed for pull-side description recombine
 				URL:         p.URL,
 				State:       p.State,
 			}

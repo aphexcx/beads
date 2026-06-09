@@ -1216,6 +1216,46 @@ func MapEpicToProjectState(status types.Status) string {
 	}
 }
 
+// ProjectStateMapping is the result of MapProjectStateToBeads: a
+// bead status plus optional close_reason for terminal states. The
+// pair is returned together because Linear's "canceled" state
+// implies close_reason="canceled" (matching bd-go9's convention for
+// the legacy migration), while "completed" maps to plain closed.
+type ProjectStateMapping struct {
+	Status      types.Status
+	CloseReason string // empty unless mapping a "canceled" Project
+}
+
+// MapProjectStateToBeads is the reverse of MapEpicToProjectState:
+// translates a Linear Project state string into the bead-side
+// status (and close_reason for terminal states). bd-6cl uses this
+// on the pull side when materializing a Project as a local epic.
+//
+// Mapping:
+//   - "completed" → closed, no close_reason (done by design)
+//   - "canceled"  → closed, close_reason="canceled" (matches
+//     bd-go9's retire-by-cancel convention)
+//   - "started"   → in_progress
+//   - "planned" / "paused" / unknown → open
+//
+// Caller (Q1 — pull-side close-state preservation) is responsible
+// for refusing to apply a "this would reopen the bead" mapping
+// when the bead is already closed locally. This function is a
+// pure translator with no policy.
+func MapProjectStateToBeads(projectState string) ProjectStateMapping {
+	switch projectState {
+	case "completed":
+		return ProjectStateMapping{Status: types.StatusClosed}
+	case "canceled":
+		return ProjectStateMapping{Status: types.StatusClosed, CloseReason: "canceled"}
+	case "started":
+		return ProjectStateMapping{Status: types.StatusInProgress}
+	default:
+		// planned, paused, anything unrecognized
+		return ProjectStateMapping{Status: types.StatusOpen}
+	}
+}
+
 // LinearProjectDescriptionMaxChars is the hard upper bound Linear enforces
 // on ProjectCreateInput.description / ProjectUpdateInput.description.
 // Exceeding this returns "Argument Validation Error" from the GraphQL

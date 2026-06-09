@@ -245,9 +245,16 @@ type TrackerProject struct {
 	ID          string
 	Name        string
 	Description string
-	URL         string
-	State       string
-	UpdatedAt   time.Time
+	// Content is the long-form body shown on the Project page itself,
+	// distinct from Description (which has tracker-specific length
+	// limits). For Linear, populated from the GraphQL `content` field
+	// when present. bd-6cl uses this to recombine the bd-cs1 split
+	// (short description plus long content) into a single bead
+	// Description on pull-side round-trip.
+	Content   string
+	URL       string
+	State     string
+	UpdatedAt time.Time
 }
 
 // TrackerComment represents a comment from an external tracker.
