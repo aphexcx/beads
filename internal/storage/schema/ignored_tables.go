@@ -30,6 +30,7 @@ var ignoredMigrations = []ignoredMigration{
 	{version: 27, filter: "wisps"}, // ALTER TABLE wisps ADD COLUMN started_at (skip issues ALTER)
 	{version: 31},                  // CREATE INDEX idx_wisp_events_created_at
 	{version: 35},                  // CREATE TABLE linear_issue_snapshots (bd-ajn)
+	{version: 37},                  // CREATE TABLE linear_project_snapshots (bd-6cl)
 }
 
 var (

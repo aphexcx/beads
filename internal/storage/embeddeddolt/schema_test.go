@@ -61,6 +61,7 @@ func TestSchemaAfterInit(t *testing.T) {
 		"wisp_comments",
 		"schema_migrations",
 		"linear_issue_snapshots",
+		"linear_project_snapshots",
 	}
 
 	rows, err := db.QueryContext(ctx, "SHOW TABLES")
