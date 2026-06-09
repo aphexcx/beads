@@ -949,6 +949,15 @@ func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string,
 		return "", "", err
 	}
 
+	// bd-6cl: persist the Project snapshot baseline for pull-side
+	// field-scoped conflict detection. Without this, the next pull
+	// would see "Linear has this Project" with no baseline and
+	// trigger first-sync soft rollout — no detection on the very
+	// first cycle. Writing here makes the second cycle correct.
+	if err := t.writeProjectSnapshot(ctx, epic.ID, project); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("project snapshot write failed for new epic %s: %v", epic.ID, err)
+	}
+
 	return project.URL, project.ID, nil
 }
 
@@ -986,8 +995,20 @@ func (t *Tracker) UpdateProject(ctx context.Context, projectID string, epic *typ
 		updates["content"] = nil
 	}
 
-	_, err := client.UpdateProject(ctx, projectID, updates)
-	return err
+	updated, err := client.UpdateProject(ctx, projectID, updates)
+	if err != nil {
+		return err
+	}
+
+	// bd-6cl: refresh the snapshot to the post-update Project state.
+	// Without this, the next pull-side diff would see the just-pushed
+	// fields as "Linear changed them" and reverse them through the
+	// conflict resolver. Same correctness invariant as bd-ajn's
+	// post-UpdateIssue snapshot write.
+	if err := t.writeProjectSnapshot(ctx, epic.ID, updated); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("project snapshot write failed for epic %s: %v", epic.ID, err)
+	}
+	return nil
 }
 
 // splitEpicDescriptionForProject splits an epic's description into the
