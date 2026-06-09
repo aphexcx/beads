@@ -1638,19 +1638,24 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 func (e *Engine) checkRequiredStoreCapabilities() error {
 	if _, ok := e.Tracker.(PostPullSnapshotter); ok {
 		if _, storeOK := e.Store.(storage.LinearIssueSnapshotStore); !storeOK {
+			// Lead with the interface name (durable anchor — survives
+			// the bead system's archival cycle). Bead reference is the
+			// secondary historical anchor.
 			return fmt.Errorf(
-				"%s tracker requires LinearIssueSnapshotStore but the configured "+
-					"storage backend doesn't implement it; field-scoped conflict "+
-					"resolution (bd-ajn) cannot operate safely — see bd-3p8",
+				"storage backend does not implement storage.LinearIssueSnapshotStore "+
+					"required by tracker %q (PostPullSnapshotter capability); "+
+					"field-scoped conflict resolution cannot operate safely "+
+					"(historical context: bd-ajn, bd-3p8)",
 				e.Tracker.DisplayName())
 		}
 	}
 	if _, ok := e.Tracker.(ProjectPuller); ok {
 		if _, storeOK := e.Store.(storage.LinearProjectSnapshotStore); !storeOK {
 			return fmt.Errorf(
-				"%s tracker requires LinearProjectSnapshotStore but the configured "+
-					"storage backend doesn't implement it; pull-side Project "+
-					"materialization (bd-6cl) cannot operate safely — see bd-3p8",
+				"storage backend does not implement storage.LinearProjectSnapshotStore "+
+					"required by tracker %q (ProjectPuller capability); "+
+					"pull-side Project materialization cannot operate safely "+
+					"(historical context: bd-6cl, bd-3p8)",
 				e.Tracker.DisplayName())
 		}
 	}

@@ -91,8 +91,13 @@ func TestCheckRequiredStoreCapabilities_FailsOnMissingProjectSnapshotStore(t *te
 	}
 }
 
-// Positive-case coverage: the existing engine_test.go suite
-// constructs full Engines (real Linear tracker + embedded/dolt
-// store) and would fail loudly if checkRequiredStoreCapabilities
-// rejected them — so the success path is locked indirectly. No
-// dedicated test needed here.
+// Positive-case coverage: any test that successfully constructs
+// an Engine where the tracker advertises PostPullSnapshotter /
+// ProjectPuller AND calls Sync would catch a regression where
+// the check rejected a valid pairing. Today engine_test.go
+// uses mockTracker (no snapshot capabilities), so this file's
+// positive path is implicit rather than asserted — rely on the
+// production path (Linear tracker + real backend) to exercise it
+// at runtime. If a future test introduces a snapshot-capable
+// mock tracker, the check passes for it as well unless the test's
+// stub store fails to implement the matching interface.
