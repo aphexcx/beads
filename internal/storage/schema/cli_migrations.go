@@ -38,10 +38,23 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		return cliMigration0046AddIsBlocked
 	case "0049_longtext_large_content_columns.up.sql":
 		return cliMigration0049LongtextLargeContentColumns
+	case "0053_add_comment_external_ref.up.sql":
+		// The source migration guards each ALTER/CREATE INDEX with an
+		// INFORMATION_SCHEMA probe (fork lineage already has the columns),
+		// but the CLI bundle's prepared ALTERs don't apply — use direct DDL
+		// on the fresh schema, which never has these columns yet.
+		return cliMigration0053AddCommentExternalRef
 	default:
 		return sqlText
 	}
 }
+
+const cliMigration0053AddCommentExternalRef = `ALTER TABLE comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '';
+ALTER TABLE comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+CREATE INDEX idx_comments_external_ref ON comments (external_ref);
+ALTER TABLE wisp_comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '';
+ALTER TABLE wisp_comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+CREATE INDEX idx_wisp_comments_external_ref ON wisp_comments (external_ref);`
 
 const cliMigration0008CreateChildCounters = `CREATE TABLE IF NOT EXISTS child_counters (
     parent_id VARCHAR(255) PRIMARY KEY,
