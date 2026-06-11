@@ -97,6 +97,15 @@ type SyncOptions struct {
 	// beads tagged "gt:agent") that shouldn't be exported to the external
 	// tracker. Matched case-sensitively against issue.Labels.
 	ExcludeLabels []string
+	// ExcludeIDPrefix skips issues whose ID starts with this prefix (case-
+	// sensitive). Used to filter workflow-artifact beads (e.g. "hw-mol-")
+	// from external sync. Empty means no prefix filter.
+	ExcludeIDPrefix string
+	// ExcludeIDPatterns skips issues whose ID contains any of these
+	// substrings (case-sensitive, anywhere in the ID). Empty means no
+	// pattern filter. Combined with ExcludeIDPrefix as a union (matches
+	// either rule → excluded).
+	ExcludeIDPatterns []string
 	// ExcludeEphemeral skips ephemeral/wisp issues from push (default behavior in CLI).
 	ExcludeEphemeral bool
 	// ParentID limits push to this beads issue and all its descendants via
@@ -174,7 +183,32 @@ type BatchPushResult struct {
 	Warnings []string
 }
 
+// ConflictField identifies an issue field that can be diffed between
+// the local bead and its external tracker counterpart. bd-ajn's
+// field-scoped conflict detection emits one of these per actual
+// change, replacing the old whole-issue boolean.
+type ConflictField string
+
+const (
+	FieldTitle       ConflictField = "title"
+	FieldDescription ConflictField = "description"
+	FieldStatus      ConflictField = "status"
+	FieldPriority    ConflictField = "priority"
+	FieldAssignee    ConflictField = "assignee"
+	FieldProject     ConflictField = "project"
+	FieldParent      ConflictField = "parent"
+)
+
 // Conflict represents a bidirectional modification conflict.
+//
+// bd-ajn extends the type with per-field diff results. Backends that
+// support snapshot-based detection populate LocalChanged /
+// ExternalChanged / Conflicting; the resolver consumes them to
+// decide push/pull/conflict on a per-field basis. Backends that
+// don't (no snapshot capability, or first-sync window before
+// baselines exist) leave the maps empty and the resolver falls
+// back to whole-issue timestamp behavior — same semantics as before
+// bd-ajn.
 type Conflict struct {
 	IssueID            string    // Beads issue ID
 	LocalUpdated       time.Time // When the local version was last modified
@@ -182,6 +216,22 @@ type Conflict struct {
 	ExternalRef        string    // URL or identifier for the external issue
 	ExternalIdentifier string    // External tracker's identifier (e.g., "TEAM-123")
 	ExternalInternalID string    // External tracker's internal ID (for API calls)
+
+	// bd-ajn field-scoped diff results. Empty maps + empty slice =
+	// fall back to whole-issue timestamp comparison (legacy path,
+	// also used when no snapshot exists yet).
+	LocalChanged    map[ConflictField]bool // fields the LOCAL side moved since lastSync
+	ExternalChanged map[ConflictField]bool // fields the EXTERNAL side moved since lastSync
+	Conflicting     []ConflictField        // intersect(LocalChanged, ExternalChanged)
+}
+
+// HasFieldScopedDiff reports whether this conflict carries snapshot-
+// backed per-field information. When false, the resolver MUST treat
+// the conflict as whole-issue (legacy behavior). Distinguishing the
+// two states explicitly avoids ambiguity when both maps happen to be
+// empty for a genuine "no fields changed" case.
+func (c *Conflict) HasFieldScopedDiff() bool {
+	return c.LocalChanged != nil || c.ExternalChanged != nil
 }
 
 // ConflictResolution specifies how to handle sync conflicts.

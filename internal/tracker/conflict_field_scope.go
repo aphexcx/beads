@@ -1,0 +1,326 @@
+package tracker
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/types"
+)
+
+// bd-ajn: field-scoped conflict detection. Replaces the old whole-
+// issue timestamp comparison with a per-field diff against two
+// snapshots:
+//   - LOCAL side: dolt_history_issues at the most recent commit
+//     before lastSync (the "as-of-lastSync" local state)
+//   - REMOTE side: linear_issue_snapshots (the "as-of-lastSync" remote
+//     state, written by every successful push/pull mutation)
+//
+// A field appears in LocalChanged when its current value differs
+// from its lastSync value. Same for ExternalChanged. Conflicting is
+// the intersection. The resolver (resolveConflictsFieldScoped) maps
+// each set to per-field push/pull/conflict actions.
+//
+// First-sync soft rollout (mayor Q5): when no snapshot exists for an
+// issue, the detector logs a baseline line, snapshots the current
+// remote state, and emits NO conflict for that issue this run. The
+// next sync sees a real baseline and field-scoping kicks in.
+
+// LoadLocalStateAtSync is the exported form of loadLocalStateAtSync
+// — same semantics, exposed for cross-package callers (bd-6cl's
+// Linear-side Project pull resolver needs the same history lookup).
+func LoadLocalStateAtSync(ctx context.Context, store storage.Storage, issueID string, lastSync time.Time) (*types.Issue, error) {
+	return loadLocalStateAtSync(ctx, store, issueID, lastSync)
+}
+
+// loadLocalStateAtSync queries dolt_history_issues for the issue's
+// state at the most recent commit before lastSync. Returns
+// (nil, nil) when no such commit exists (issue created after
+// lastSync — treated as "no prior state" by the caller).
+//
+// Requires the backend to expose a historical query path. Returns a
+// sentinel error when the backend doesn't (mocks in tests); callers
+// fall back to whole-issue timestamp resolution in that case.
+func loadLocalStateAtSync(ctx context.Context, store storage.Storage, issueID string, lastSync time.Time) (*types.Issue, error) {
+	hv, ok := store.(storage.HistoryViewer)
+	if !ok {
+		return nil, errHistoryNotSupported
+	}
+	entries, err := hv.History(ctx, issueID)
+	if err != nil {
+		// Empty history is a common case (issue never committed pre-lastSync);
+		// don't surface as an error.
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("history lookup for %s: %w", issueID, err)
+	}
+	// Entries are ordered newest-first per the HistoryViewer contract.
+	// Find the first entry whose commit time is <= lastSync.
+	for _, e := range entries {
+		if e == nil || e.Issue == nil {
+			continue
+		}
+		if !e.CommitDate.After(lastSync) {
+			return e.Issue, nil
+		}
+	}
+	// All committed versions are post-lastSync (issue created/changed
+	// only after the last sync). Caller treats as "no prior state".
+	return nil, nil
+}
+
+// errHistoryNotSupported signals a backend without history capability.
+// Callers fall back to whole-issue timestamp resolution.
+var errHistoryNotSupported = errors.New("storage backend does not expose IssueHistoryViewer")
+
+// ErrHistoryNotSupported is the exported sentinel for cross-package
+// callers that need to detect missing history capability (bd-6cl).
+var ErrHistoryNotSupported = errHistoryNotSupported
+
+// diffLocalFields returns the set of fields whose value differs
+// between `current` and `atSync`. When atSync is nil (issue had no
+// committed state at lastSync — fresh local creation since), returns
+// all populated fields as "changed" so the push path handles the new
+// record.
+func diffLocalFields(current, atSync *types.Issue) map[ConflictField]bool {
+	out := make(map[ConflictField]bool)
+	if current == nil {
+		return out
+	}
+	if atSync == nil {
+		// Newly created since lastSync — every populated field is "new".
+		if current.Title != "" {
+			out[FieldTitle] = true
+		}
+		if current.Description != "" {
+			out[FieldDescription] = true
+		}
+		out[FieldStatus] = true
+		out[FieldPriority] = true
+		return out
+	}
+	if current.Title != atSync.Title {
+		out[FieldTitle] = true
+	}
+	if current.Description != atSync.Description {
+		out[FieldDescription] = true
+	}
+	if current.Status != atSync.Status {
+		out[FieldStatus] = true
+	}
+	if current.Priority != atSync.Priority {
+		out[FieldPriority] = true
+	}
+	if current.Assignee != atSync.Assignee {
+		out[FieldAssignee] = true
+	}
+	// Project and Parent for local side aren't tracked at the issues-
+	// table level — they're modeled through dependencies. v1 leaves
+	// them out of the local diff; the Linear side captures them via
+	// snapshot. This means a local-only parent/project change won't
+	// register as a "local" change in DetectConflicts — but those
+	// fields are typically owned by the reconciler, not by direct user
+	// edits, so the gap is acceptable for v1. v2 would join against
+	// the dependencies table.
+	return out
+}
+
+// diffExternalFields returns the set of fields whose value on the
+// external tracker (per the just-fetched extIssue) differs from the
+// snapshot (the as-of-lastSync remote state). When snapshot is nil,
+// returns nil to signal "first-sync — no baseline yet"; caller
+// handles the soft-rollout path.
+func diffExternalFields(extIssue *TrackerIssue, snapshot *storage.LinearIssueSnapshot) map[ConflictField]bool {
+	if extIssue == nil {
+		return nil
+	}
+	if snapshot == nil {
+		return nil // first-sync signal
+	}
+	out := make(map[ConflictField]bool)
+	if extIssue.Title != snapshot.Title {
+		out[FieldTitle] = true
+	}
+	if extIssue.Description != snapshot.Description {
+		out[FieldDescription] = true
+	}
+	// Status comparison: prefer the stable state_id (mayor Q2).
+	// Logic:
+	//   - Both sides have a state_id → compare directly.
+	//   - Both sides lack one → fall back to the rendered status
+	//     name (best-effort).
+	//   - Asymmetric (one has, one doesn't) → don't flag; we lack the
+	//     evidence to claim a difference, and flagging would yield
+	//     spurious "Linear changed status" reads on every sync where
+	//     one side's State field hasn't been populated (common during
+	//     adapter rollouts and on minimal mock data).
+	currentStateID := extractStateID(extIssue)
+	switch {
+	case currentStateID != "" && snapshot.StateID != "":
+		if currentStateID != snapshot.StateID {
+			out[FieldStatus] = true
+		}
+	case currentStateID == "" && snapshot.StateID == "":
+		if extractStatusName(extIssue) != snapshot.Status {
+			out[FieldStatus] = true
+		}
+		// Asymmetric → no flag.
+	}
+	if extIssue.Priority != snapshot.Priority {
+		out[FieldPriority] = true
+	}
+	if extIssue.AssigneeID != snapshot.AssigneeID {
+		out[FieldAssignee] = true
+	}
+	if extractProjectID(extIssue) != snapshot.ProjectID {
+		out[FieldProject] = true
+	}
+	if extIssue.ParentInternalID != snapshot.ParentID {
+		out[FieldParent] = true
+	}
+	return out
+}
+
+// extractStateID pulls Linear's workflow-state UUID from a
+// TrackerIssue when the adapter populates extIssue.State as a Linear-
+// flavored object. Returns "" when the field isn't a recognized
+// shape (other adapters, missing Raw, etc.).
+//
+// Uses an interface assertion to stay tracker-package-pure (no
+// linear-package import).
+func extractStateID(ti *TrackerIssue) string {
+	if ti == nil || ti.State == nil {
+		return ""
+	}
+	type idHolder interface {
+		GetID() string
+	}
+	if h, ok := ti.State.(idHolder); ok {
+		return h.GetID()
+	}
+	// Last resort: struct field via map (Linear's State{ID:...} works
+	// via a JSON marshal/unmarshal round-trip but that's expensive).
+	// Adapters that want field-scoped status comparison can implement
+	// the GetID interface on their State type.
+	return ""
+}
+
+// extractStatusName pulls a human-readable state name as a fallback
+// comparator when state_id isn't available on either side.
+func extractStatusName(ti *TrackerIssue) string {
+	if ti == nil || ti.State == nil {
+		return ""
+	}
+	type nameHolder interface {
+		GetName() string
+	}
+	if h, ok := ti.State.(nameHolder); ok {
+		return h.GetName()
+	}
+	return ""
+}
+
+// extractProjectID pulls a project UUID from a TrackerIssue. Today
+// TrackerIssue has no first-class project field; the Linear adapter
+// stores it in Metadata for round-trip preservation. Returns "" when
+// not present.
+func extractProjectID(ti *TrackerIssue) string {
+	if ti == nil || ti.Metadata == nil {
+		return ""
+	}
+	if v, ok := ti.Metadata["project_id"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// pullUpdateFieldMap maps a ConflictField onto the bead-side update-
+// map keys produced by buildPullIssueUpdates. Used by
+// restrictPullUpdatesToFields to filter the whole-issue update map
+// down to just the fields the conflict resolver approved for pull.
+//
+// FieldStatus expands to both "status" and "close_reason" because
+// buildPullIssueUpdates writes close_reason alongside status to
+// preserve Done-vs-Canceled intent. A status pull without close_reason
+// would leave the bead with a stale close_reason on the next push.
+//
+// FieldProject and FieldParent currently map to nothing in the
+// pull-update path — neither field flows through buildPullIssueUpdates
+// (the bead store models them as dependencies, not columns). Their
+// pull is handled separately by the parent/project reconcilers; the
+// pull-side restriction here just filters the issues-table update.
+var pullUpdateFieldMap = map[ConflictField][]string{
+	FieldTitle:       {"title"},
+	FieldDescription: {"description"},
+	FieldStatus:      {"status", "close_reason"},
+	FieldPriority:    {"priority"},
+	FieldAssignee:    {"assignee"},
+}
+
+// restrictPullUpdatesToFields filters the buildPullIssueUpdates map
+// to only the keys corresponding to the approved ConflictFields,
+// plus any housekeeping keys (external_ref) that aren't user fields.
+// Returns a new map; does not mutate the input.
+func restrictPullUpdatesToFields(updates map[string]interface{}, scope map[ConflictField]bool) map[string]interface{} {
+	allow := map[string]bool{
+		"external_ref": true, // always allowed — pull writes the ref on first import
+		"issue_type":   true, // bead-side classification; rarely conflicts, safe to pass through
+	}
+	for f := range scope {
+		for _, key := range pullUpdateFieldMap[f] {
+			allow[key] = true
+		}
+	}
+	out := make(map[string]interface{}, len(updates))
+	for k, v := range updates {
+		if allow[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// conflictFieldKeys returns the sorted-stable slice of fields from a
+// set map. The deterministic order helps tests assert against the
+// payload sent to trackers and keeps any downstream rate-limit
+// retries idempotent.
+func conflictFieldKeys(set map[ConflictField]bool) []ConflictField {
+	if len(set) == 0 {
+		return nil
+	}
+	// Pre-declared order so tests and log lines are stable regardless
+	// of Go's map iteration nondeterminism. Add new ConflictField
+	// values to this list when introducing them.
+	canonical := []ConflictField{
+		FieldTitle, FieldDescription, FieldStatus, FieldPriority,
+		FieldAssignee, FieldProject, FieldParent,
+	}
+	out := make([]ConflictField, 0, len(set))
+	for _, f := range canonical {
+		if set[f] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// computeConflictingFields returns the intersection of two field
+// sets — the fields where BOTH sides moved since lastSync.
+func computeConflictingFields(local, external map[ConflictField]bool) []ConflictField {
+	if len(local) == 0 || len(external) == 0 {
+		return nil
+	}
+	var out []ConflictField
+	for f := range local {
+		if external[f] {
+			out = append(out, f)
+		}
+	}
+	return out
+}

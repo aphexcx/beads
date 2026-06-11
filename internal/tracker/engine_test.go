@@ -1049,7 +1049,7 @@ func TestEngineConflictResolution(t *testing.T) {
 	engine := NewEngine(tracker, store, "test-actor")
 
 	// Detect conflicts
-	conflicts, err := engine.DetectConflicts(ctx)
+	conflicts, err := engine.DetectConflicts(ctx, SyncOptions{})
 	if err != nil {
 		t.Fatalf("DetectConflicts() error: %v", err)
 	}

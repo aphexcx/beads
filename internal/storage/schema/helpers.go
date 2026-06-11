@@ -21,7 +21,15 @@ func EnsureIgnoredTables(ctx context.Context, db DBConn) error {
 	if err != nil {
 		return fmt.Errorf("check local_metadata table: %w", err)
 	}
-	if wispsOK && localOK {
+	snapsOK, err := TableExists(ctx, db, "linear_issue_snapshots")
+	if err != nil {
+		return fmt.Errorf("check linear_issue_snapshots table: %w", err)
+	}
+	projSnapsOK, err := TableExists(ctx, db, "linear_project_snapshots")
+	if err != nil {
+		return fmt.Errorf("check linear_project_snapshots table: %w", err)
+	}
+	if wispsOK && localOK && snapsOK && projSnapsOK {
 		return nil
 	}
 	return CreateIgnoredTables(ctx, db)

@@ -268,6 +268,13 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 		}
 	}
 
+	// bd-ajn: persist the per-issue snapshot baseline for field-scoped
+	// conflict detection on the next sync. The CreateIssue response is
+	// the full post-create Linear state, so we know every field.
+	if err := t.writeIssueSnapshot(ctx, issue.ID, created); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("issue snapshot write failed for new bead %s: %v", issue.ID, err)
+	}
+
 	ti := linearToTrackerIssue(created)
 	return &ti, nil
 }
@@ -360,6 +367,14 @@ func (t *Tracker) UpdateIssueWithRemote(ctx context.Context, externalID string, 
 				t.labelWarnFn("snapshot write failed for %s: %v", issue.ID, err)
 			}
 		}
+	}
+
+	// bd-ajn: refresh the per-issue snapshot to the post-update state.
+	// Without this, the next sync would diff against the pre-update
+	// snapshot and incorrectly see "Linear changed these fields" for
+	// the values we just pushed.
+	if err := t.writeIssueSnapshot(ctx, issue.ID, updated); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("issue snapshot write failed for %s: %v", issue.ID, err)
 	}
 
 	ti := linearToTrackerIssue(updated)
@@ -808,6 +823,19 @@ func linearToTrackerIssue(li *Issue) tracker.TrackerIssue {
 		ti.ParentInternalID = li.Parent.ID
 	}
 
+	// bd-ajn: surface Linear's project UUID via Metadata for the
+	// generic tracker layer's field-scoped diff. The bd-ajn
+	// diffExternalFields path reads Metadata["project_id"] when
+	// comparing against the snapshot's ProjectID column. Without this
+	// wiring, every issue with a Project would falsely flag
+	// FieldProject as changed on every sync.
+	if li.Project != nil && li.Project.ID != "" {
+		if ti.Metadata == nil {
+			ti.Metadata = map[string]interface{}{}
+		}
+		ti.Metadata["project_id"] = li.Project.ID
+	}
+
 	if t, err := time.Parse(time.RFC3339, li.CreatedAt); err == nil {
 		ti.CreatedAt = t
 	}
@@ -903,6 +931,11 @@ func (t *Tracker) FetchAttachments(ctx context.Context, externalIssueID string) 
 
 // CreateProject creates a new Linear project from a beads epic.
 // Implements tracker.ProjectSyncer.
+//
+// Long descriptions are split: the truncated form (≤255 chars per
+// Linear's ProjectCreateInput limit) goes into description; the full
+// text goes into content (no length limit), preserving the bead's
+// authored body on the Project page (bd-cs1).
 func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string, string, error) {
 	client := t.primaryClient()
 	if client == nil {
@@ -910,9 +943,19 @@ func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string,
 	}
 
 	state := MapEpicToProjectState(epic.Status)
-	project, err := client.CreateProject(ctx, epic.Title, epic.Description, state)
+	desc, content := splitEpicDescriptionForProject(epic.Description)
+	project, err := client.CreateProject(ctx, epic.Title, desc, content, state)
 	if err != nil {
 		return "", "", err
+	}
+
+	// bd-6cl: persist the Project snapshot baseline for pull-side
+	// field-scoped conflict detection. Without this, the next pull
+	// would see "Linear has this Project" with no baseline and
+	// trigger first-sync soft rollout — no detection on the very
+	// first cycle. Writing here makes the second cycle correct.
+	if err := t.writeProjectSnapshot(ctx, epic.ID, project); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("project snapshot write failed for new epic %s: %v", epic.ID, err)
 	}
 
 	return project.URL, project.ID, nil
@@ -920,20 +963,64 @@ func (t *Tracker) CreateProject(ctx context.Context, epic *types.Issue) (string,
 
 // UpdateProject updates an existing Linear project from a beads epic.
 // Implements tracker.ProjectSyncer.
+//
+// Long descriptions follow the same description/content split as
+// CreateProject (bd-cs1): truncated summary in description, full text
+// in content. Same Linear-side length limits apply.
+//
+// content is ALWAYS included in the update map — when the bead's
+// description shortened from a long-truncated form to a short non-
+// truncated form, the prior Project.content (rich body from the long
+// run) would otherwise remain stale on Linear. Sending nil tells
+// Linear's GraphQL to clear the field.
 func (t *Tracker) UpdateProject(ctx context.Context, projectID string, epic *types.Issue) error {
 	client := t.primaryClient()
 	if client == nil {
 		return fmt.Errorf("no Linear client available")
 	}
 
+	desc, content := splitEpicDescriptionForProject(epic.Description)
 	updates := map[string]interface{}{
 		"name":        epic.Title,
-		"description": epic.Description,
+		"description": desc,
 		"state":       MapEpicToProjectState(epic.Status),
 	}
+	if content != "" {
+		updates["content"] = content
+	} else {
+		// Explicit clear: a previous long description that left content
+		// populated must not linger if the user shortens the description.
+		// Go nil → JSON null → Linear clears the field. (Same pattern as
+		// clearLinearIssueParent for parentId.)
+		updates["content"] = nil
+	}
 
-	_, err := client.UpdateProject(ctx, projectID, updates)
-	return err
+	updated, err := client.UpdateProject(ctx, projectID, updates)
+	if err != nil {
+		return err
+	}
+
+	// bd-6cl: refresh the snapshot to the post-update Project state.
+	// Without this, the next pull-side diff would see the just-pushed
+	// fields as "Linear changed them" and reverse them through the
+	// conflict resolver. Same correctness invariant as bd-ajn's
+	// post-UpdateIssue snapshot write.
+	if err := t.writeProjectSnapshot(ctx, epic.ID, updated); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("project snapshot write failed for epic %s: %v", epic.ID, err)
+	}
+	return nil
+}
+
+// splitEpicDescriptionForProject splits an epic's description into the
+// short (description) and long (content) forms Linear's Project model
+// expects. When the source fits within Linear's 255-char limit,
+// content is empty so the caller can omit it from the GraphQL input.
+func splitEpicDescriptionForProject(full string) (description, content string) {
+	cut, truncated := TruncateLinearProjectDescription(full)
+	if !truncated {
+		return cut, ""
+	}
+	return cut, full
 }
 
 // FetchProjects retrieves Linear projects and converts them to TrackerProjects.
@@ -957,6 +1044,7 @@ func (t *Tracker) FetchProjects(ctx context.Context, state string) ([]tracker.Tr
 				ID:          p.ID,
 				Name:        p.Name,
 				Description: p.Description,
+				Content:     p.Content, // bd-6cl: needed for pull-side description recombine
 				URL:         p.URL,
 				State:       p.State,
 			}
@@ -972,6 +1060,14 @@ func (t *Tracker) FetchProjects(ctx context.Context, state string) ([]tracker.Tr
 
 // AssignIssueToProject assigns a Linear issue to a project.
 // Implements tracker.ProjectSyncer.
+//
+// bd-ajn: callers that own the local bead ID should call
+// RecordPostAssignSnapshot after this returns nil — that's the
+// snapshot patch that prevents the next sync from seeing the
+// just-pushed projectId as "Linear changed it." The interface
+// signature stays Linear-identifier-only (matches the GraphQL
+// mutation) because some callers (e.g., raw API users) don't have
+// the local ID handy.
 func (t *Tracker) AssignIssueToProject(ctx context.Context, issueExternalID, projectID string) error {
 	client := t.clientForExternalID(ctx, issueExternalID)
 	if client == nil {
@@ -986,6 +1082,9 @@ func (t *Tracker) AssignIssueToProject(ctx context.Context, issueExternalID, pro
 
 // SetIssueParent sets the parent issue for sub-issue nesting in Linear.
 // Implements tracker.ProjectSyncer.
+//
+// bd-ajn: see AssignIssueToProject — callers with the local ID should
+// follow up with RecordPostSetParentSnapshot.
 func (t *Tracker) SetIssueParent(ctx context.Context, issueExternalID, parentExternalID string) error {
 	client := t.clientForExternalID(ctx, issueExternalID)
 	if client == nil {
@@ -996,6 +1095,169 @@ func (t *Tracker) SetIssueParent(ctx context.Context, issueExternalID, parentExt
 		"parentId": parentExternalID,
 	})
 	return err
+}
+
+// RecordPostAssignSnapshot patches the per-issue snapshot's project_id
+// after a successful AssignIssueToProject. Callers invoke this when
+// they have the local bead ID in hand. Silently no-ops when no
+// baseline snapshot exists yet (first-sync soft rollout — see
+// patchIssueSnapshotProjectID).
+//
+// Separate from AssignIssueToProject because the ProjectSyncer
+// interface is Linear-identifier-only; the local bead ID isn't
+// recoverable from a bare identifier without an extra lookup. Callers
+// (migration tool, project reconciler) already have the mapping in
+// scope at the point of the call, so the work falls to them.
+func (t *Tracker) RecordPostAssignSnapshot(ctx context.Context, localBeadID, projectID string) error {
+	return t.patchIssueSnapshotProjectID(ctx, localBeadID, projectID)
+}
+
+// RecordPostSetParentSnapshot patches the per-issue snapshot's
+// parent_id after a successful SetIssueParent. See
+// RecordPostAssignSnapshot for the rationale on why this is a
+// separate call.
+func (t *Tracker) RecordPostSetParentSnapshot(ctx context.Context, localBeadID, parentUUID string) error {
+	return t.patchIssueSnapshotParentID(ctx, localBeadID, parentUUID)
+}
+
+// linearUpdateKeyForField is the per-ConflictField → Linear GraphQL
+// update-map key. Used by UpdateIssueFields to restrict a full
+// IssueToTracker payload down to only the resolver-approved fields.
+//
+// FieldStatus maps to stateId, not the bead's "status" string. The
+// resolution happens inside UpdateIssueFields where state lookup is
+// in scope.
+//
+// FieldProject and FieldParent map to projectId / parentId — but
+// those fields are typically handled by AssignIssueToProject /
+// SetIssueParent, not by UpdateIssue. The mapping is here for
+// completeness; in practice the conflict resolver rarely flags these
+// for field-scoped push because they don't pass through the bead
+// store's issue update path.
+var linearUpdateKeyForField = map[tracker.ConflictField]string{
+	tracker.FieldTitle:       "title",
+	tracker.FieldDescription: "description",
+	tracker.FieldStatus:      "stateId",
+	tracker.FieldPriority:    "priority",
+	tracker.FieldAssignee:    "assigneeId",
+	tracker.FieldProject:     "projectId",
+	tracker.FieldParent:      "parentId",
+}
+
+// UpdateIssueFields implements tracker.FieldScopedUpdater. Builds a
+// full update payload via the field mapper, then filters to only the
+// requested ConflictFields. Status updates additionally resolve a
+// stateId via findStateIDForIssue (same as UpdateIssueWithRemote's
+// resolve path).
+//
+// Labels are NOT touched here. Label sync is independent of the
+// other-fields conflict resolver — it has its own per-issue
+// reconciler. Routing labels through this path would re-trigger the
+// reconciler unnecessarily and duplicate the snapshot write below.
+//
+// After successful push, persists the issue snapshot with the
+// post-update remote state — same as UpdateIssueWithRemote.
+func (t *Tracker) UpdateIssueFields(ctx context.Context, externalID string, issue *types.Issue, remote *tracker.TrackerIssue, fields []tracker.ConflictField) (*tracker.TrackerIssue, error) {
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("UpdateIssueFields: empty field list")
+	}
+
+	client := t.clientForExternalID(ctx, externalID)
+	if client == nil {
+		return nil, fmt.Errorf("cannot determine Linear team for issue %s", externalID)
+	}
+
+	// Build the field-restricted payload directly from issue state.
+	updates := make(map[string]interface{}, len(fields))
+	for _, f := range fields {
+		key, ok := linearUpdateKeyForField[f]
+		if !ok {
+			continue // unknown field — skip rather than error
+		}
+		switch f {
+		case tracker.FieldTitle:
+			updates[key] = issue.Title
+		case tracker.FieldDescription:
+			updates[key] = issue.Description
+		case tracker.FieldPriority:
+			updates[key] = PriorityToLinear(issue.Priority, t.config)
+		case tracker.FieldAssignee:
+			// Linear's assigneeId field requires the user's UUID,
+			// not the bead's assignee string (which is an email or
+			// display name). The existing IssueToTracker path doesn't
+			// push assignee at all for this reason — there's no
+			// user-lookup wired up. Skip silently here too rather
+			// than send the raw string and have Linear reject or
+			// mis-assign (codex bd-ajn round-2 bug 7). When user-
+			// resolution lands, this case can wire to it.
+			continue
+		case tracker.FieldProject, tracker.FieldParent:
+			// These fields aren't pushed through UpdateIssue's main
+			// path — they have dedicated AssignIssueToProject /
+			// SetIssueParent endpoints. Skip silently; reconcilers
+			// own them.
+			continue
+		case tracker.FieldStatus:
+			// State requires a Linear state UUID lookup. Skip when
+			// the remote already matches local (mirrors the
+			// remoteStatusMatchesLocal logic in UpdateIssueWithRemote)
+			// to preserve remote-owned states like "In Review".
+			if t.remoteStatusMatchesLocal(remote, issue) {
+				continue
+			}
+			stateID, err := t.findStateIDForIssue(ctx, client, issue)
+			if err != nil {
+				return nil, fmt.Errorf("finding state for status %s: %w", issue.Status, err)
+			}
+			if stateID != "" {
+				updates[key] = stateID
+			}
+		}
+	}
+
+	if len(updates) == 0 {
+		// All requested fields filtered out (e.g., status preserved
+		// + no other fields). Treat as a no-op push — the caller's
+		// pre-fetched remote already matches what we'd send.
+		ti := *remote
+		return &ti, nil
+	}
+
+	updated, err := client.UpdateIssue(ctx, externalID, updates)
+	if err != nil {
+		return nil, err
+	}
+
+	// bd-ajn: refresh the snapshot to the post-update state, same as
+	// UpdateIssueWithRemote does for the full-issue path.
+	if err := t.writeIssueSnapshot(ctx, issue.ID, updated); err != nil && t.labelWarnFn != nil {
+		t.labelWarnFn("issue snapshot write failed for %s after field-scoped update: %v", issue.ID, err)
+	}
+
+	ti := linearToTrackerIssue(updated)
+	return &ti, nil
+}
+
+// RecordPullSnapshot implements tracker.PostPullSnapshotter. Called
+// by the engine after each successful pull-side import or update so
+// the snapshot reflects the just-pulled Linear state. Without this,
+// the next bidirectional sync would diff against the pre-pull
+// snapshot and incorrectly see "Linear changed these fields" for the
+// fields we just pulled into local.
+//
+// Derives the snapshot from `fetched.Raw` (which linearToTrackerIssue
+// sets to the source *Issue), preserving Linear UUIDs that the
+// TrackerIssue abstraction loses (state_id, project_id, etc.). When
+// Raw isn't a *Issue (mock trackers, non-Linear adapters slipping
+// through), silently no-ops — the snapshot machinery is best-effort
+// at this layer; DetectConflicts's first-sync path handles missing
+// snapshots safely.
+func (t *Tracker) RecordPullSnapshot(ctx context.Context, localBeadID string, fetched tracker.TrackerIssue) error {
+	li, ok := fetched.Raw.(*Issue)
+	if !ok || li == nil {
+		return nil
+	}
+	return t.writeIssueSnapshot(ctx, localBeadID, li)
 }
 
 // IsProjectRef checks if an external_ref is a Linear project URL.

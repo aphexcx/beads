@@ -300,6 +300,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 			}
 		}
 	}
+	applyLinearExcludeIDConfig(ctx, store, &opts)
 	if !includeEphemeral {
 		opts.ExcludeEphemeral = true
 	}
@@ -339,6 +340,32 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
 		os.Exit(1)
+	}
+
+	// Post-sync: reconcile parent-child relationships into Linear's parent
+	// field. The per-issue create/update path can't always set parentId
+	// (children are sometimes pushed before parents have an external_ref),
+	// and previously-pushed orphan trees need a backfill. This pass is
+	// idempotent — no API mutation when remote parent already matches.
+	//
+	// In dry-run mode the pass still runs (read-only fetches) so the user
+	// gets a preview of which parents would be set; the IssueUpdate
+	// mutation is skipped per-link.
+	//
+	// Skipped on scoped syncs (--parent / --type / --exclude-type / --issue-id)
+	// since the reconciler walks ALL local beads with external_refs.
+	//
+	// `effectivePush` mirrors engine.Sync's bidirectional default so
+	// `bd linear sync --dry-run` (no direction flag) still previews the
+	// reconcile. opts.Push isn't readable after engine.Sync (passed by value).
+	effectivePush := push || (!push && !pull)
+	if effectivePush && result.Success && !syncIsScoped(&opts) {
+		reconcileLinearParents(ctx, lt, dryRun, jsonOutput, &result.Warnings)
+		// bd-1ay: separate pass for Project membership. Runs after
+		// the parent reconciler (since bd-9w3's buildLinearParentLinks
+		// silently skips Project-URL parents — those links are this
+		// pass's responsibility). Same scoped-sync skip applies.
+		reconcileLinearProjectMembership(ctx, lt, dryRun, jsonOutput, &result.Warnings)
 	}
 
 	// Output results
@@ -1208,4 +1235,435 @@ func pullHasLabelDelta(lt *linear.Tracker, local *types.Issue, remote *types.Iss
 		}
 	}
 	return false
+}
+
+// linearConfigReader is the minimal slice of storage.Storage that the
+// linear-config helpers depend on. Lets tests inject a fake without
+// spinning up a Dolt server.
+type linearConfigReader interface {
+	GetConfig(ctx context.Context, key string) (string, error)
+}
+
+// applyLinearExcludeIDConfig reads linear.exclude_id_prefix and
+// linear.exclude_id_patterns from the given config reader and applies them
+// to opts. Push-direction-only filters; see the help text on linearSyncCmd.
+//
+// Empty values are no-ops. Patterns are comma-split, trimmed, with empty
+// entries dropped. If reader is nil (no store configured), this is a no-op.
+func applyLinearExcludeIDConfig(ctx context.Context, reader linearConfigReader, opts *tracker.SyncOptions) {
+	if reader == nil || opts == nil {
+		return
+	}
+	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_prefix"); v != "" {
+		opts.ExcludeIDPrefix = strings.TrimSpace(v)
+	}
+	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_patterns"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				opts.ExcludeIDPatterns = append(opts.ExcludeIDPatterns, p)
+			}
+		}
+	}
+}
+
+// syncIsScoped returns true when the user explicitly constrained THIS
+// invocation to a specific subset of beads (via --parent, --issues, or
+// --type). The parent reconcile pass is skipped on scoped syncs because
+// it walks the full local tree, which could mutate Linear-side state
+// outside the scope the user asked for.
+//
+// Notably ExcludeTypes is NOT a scoping signal: it merges with persistent
+// config (linear.exclude_types), and rigs that set it default-on (e.g.
+// "molecule,event") would otherwise have the reconcile pass permanently
+// disabled — bd-9w3 root cause. Reconcile only ever touches the parent
+// field on the child issue, so excluding types from push doesn't really
+// conflict with wiring up parent-child for the remaining types.
+//
+// TypeFilter IS kept as a scoping signal because --type is set only via
+// the CLI flag for this invocation; the user's intent to push a specific
+// subset is explicit.
+func syncIsScoped(opts *tracker.SyncOptions) bool {
+	if opts == nil {
+		return false
+	}
+	if opts.ParentID != "" || len(opts.IssueIDs) > 0 {
+		return true
+	}
+	if len(opts.TypeFilter) > 0 {
+		return true
+	}
+	return false
+}
+
+// reconcileLinearParents runs as a post-sync pass to wire parent-child bead
+// dependencies into Linear's parent issue field. Idempotent — no API call
+// when the remote parent already matches.
+//
+// In dry-run mode the read-only fetches still run and the per-link mutation
+// plan is printed as [dry-run] lines, but no IssueUpdate is issued. Lets
+// users preview the orphan-repair scope before committing to a wet sync.
+//
+// Human-readable output is suppressed when jsonOutput is true so the
+// caller's JSON serialization (in runLinearSync's output section) isn't
+// polluted with stray fmt.Printf lines. Warnings and errors still go
+// through the warnings slice, which IS surfaced in JSON output via
+// SyncResult.Warnings.
+func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jsonOutput bool, warnings *[]string) {
+	if lt == nil || store == nil {
+		return
+	}
+	links, err := buildLinearParentLinks(ctx, lt)
+	if err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: building link set failed: %v", err))
+		return
+	}
+	if len(links) == 0 {
+		return
+	}
+	stats, err := lt.ReconcileParents(ctx, links, dryRun)
+	// Print mutation summary; suppress when --json is requested so the
+	// JSON envelope stays clean.
+	if stats != nil && !jsonOutput {
+		if dryRun {
+			if stats.WouldUpdate > 0 {
+				fmt.Printf("[dry-run] Would reconcile %d Linear parent link%s\n",
+					stats.WouldUpdate, plural(stats.WouldUpdate))
+				for _, link := range stats.Mutations {
+					fmt.Printf("[dry-run] Would set parent of %s → %s\n",
+						link.ChildIdentifier, link.ParentIdentifier)
+				}
+			}
+		} else if stats.Updated > 0 {
+			fmt.Printf("✓ Reconciled %d Linear parent link%s\n",
+				stats.Updated, plural(stats.Updated))
+		}
+	}
+	if err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: %v", err))
+		return
+	}
+	for _, e := range stats.Errors {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: %v", e))
+	}
+	// bd-ajn: snapshot patch failures are separate severity — surface
+	// but don't conflate with API errors.
+	for _, e := range stats.SnapshotWarnings {
+		*warnings = append(*warnings, fmt.Sprintf("parent reconcile (snapshot): %v", e))
+	}
+}
+
+// buildLinearParentLinks enumerates local beads with a Linear external_ref
+// and a parent-child dependency to a parent that also has a Linear
+// external_ref. Beads whose parent isn't yet synced to Linear are silently
+// skipped — they'll get picked up on a subsequent sync.
+//
+// bd-go9 carve-out: when the parent's external_ref is a Linear Project URL
+// (set by `bd linear migrate-epic-to-project`), the parent isn't an Issue
+// and setting parentId on the child would be semantically wrong (and the
+// Linear API would reject it). Such links are silently skipped here.
+// The projectId-reconcile loop that mirrors this for the Project case is
+// bd-1ay scope; in the meantime, the migration tool itself sets projectId
+// on the descendants at conversion time.
+func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.ParentLink, error) {
+	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	if err != nil {
+		return nil, err
+	}
+	type refInfo struct {
+		identifier string
+		isProject  bool
+	}
+	idToInfo := make(map[string]refInfo, len(issues))
+	for _, issue := range issues {
+		if issue.ExternalRef == nil {
+			continue
+		}
+		ref := strings.TrimSpace(*issue.ExternalRef)
+		if !lt.IsExternalRef(ref) {
+			continue
+		}
+		ident := lt.ExtractIdentifier(ref)
+		if ident == "" {
+			continue
+		}
+		idToInfo[issue.ID] = refInfo{
+			identifier: ident,
+			isProject:  lt.IsProjectRef(ref),
+		}
+	}
+	if len(idToInfo) == 0 {
+		return nil, nil
+	}
+	links := make([]linear.ParentLink, 0)
+	for _, issue := range issues {
+		childInfo, ok := idToInfo[issue.ID]
+		if !ok {
+			continue
+		}
+		if childInfo.isProject {
+			// A child that is itself a Project is invalid for parentId
+			// assignment — skip defensively. (Shouldn't occur in normal
+			// trees; only matters if a Project bead ends up with a
+			// parent-child dep, which the migration tool doesn't create.)
+			continue
+		}
+		deps, err := store.GetDependenciesWithMetadata(ctx, issue.ID)
+		if err != nil {
+			return nil, fmt.Errorf("loading deps for %s: %w", issue.ID, err)
+		}
+		for _, d := range deps {
+			if d == nil || d.DependencyType != types.DepParentChild {
+				continue
+			}
+			parentInfo, ok := idToInfo[d.Issue.ID]
+			if !ok {
+				continue
+			}
+			if parentInfo.isProject {
+				// Parent has been migrated to a Linear Project — the
+				// child's relationship is via projectId, not parentId.
+				// Migration tool set it; bd-1ay will reconcile it on
+				// ongoing sync.
+				continue
+			}
+			links = append(links, linear.ParentLink{
+				ChildIdentifier:  childInfo.identifier,
+				ParentIdentifier: parentInfo.identifier,
+				ChildLocalBeadID: issue.ID, // bd-ajn: lets reconciler patch snapshot post-success
+			})
+		}
+	}
+	return links, nil
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// reconcileLinearProjectMembership runs as a post-sync pass to wire
+// non-epic descendants' projectId field to their nearest top-level-
+// epic ancestor's Linear Project. Bd-1ay's symmetric counterpart to
+// the parent reconciler (bd-ena): parents are Issues → parentId via
+// ReconcileParents; parents are Projects → projectId via this pass.
+//
+// Idempotent: only fires IssueUpdate when remote projectId differs
+// from the desired Project. Dry-run prints per-link preview lines;
+// suppressed under --json so the output envelope stays clean.
+//
+// Skipped on the same scoped-sync conditions as the parent reconciler
+// (called only when !syncIsScoped(&opts)).
+func reconcileLinearProjectMembership(ctx context.Context, lt *linear.Tracker, dryRun, jsonOutput bool, warnings *[]string) {
+	if lt == nil || store == nil {
+		return
+	}
+	links, err := buildLinearProjectMembershipLinks(ctx, lt)
+	if err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("project reconcile: building link set failed: %v", err))
+		return
+	}
+	if len(links) == 0 {
+		return
+	}
+	stats, err := lt.ReconcileProjectMembership(ctx, links, dryRun)
+	// Print mutation summary; suppress when --json is requested.
+	if stats != nil && !jsonOutput {
+		if dryRun {
+			if stats.WouldUpdate > 0 {
+				fmt.Printf("[dry-run] Would reconcile %d Linear Project membership link%s\n",
+					stats.WouldUpdate, plural(stats.WouldUpdate))
+				for _, link := range stats.Mutations {
+					fmt.Printf("[dry-run] Would assign %s to Project %s\n",
+						link.IssueIdentifier, link.ProjectID)
+				}
+			}
+		} else if stats.Updated > 0 {
+			fmt.Printf("✓ Reconciled %d Linear Project membership link%s\n",
+				stats.Updated, plural(stats.Updated))
+		}
+	}
+	if err != nil {
+		*warnings = append(*warnings, fmt.Sprintf("project reconcile: %v", err))
+		return
+	}
+	for _, e := range stats.Errors {
+		*warnings = append(*warnings, fmt.Sprintf("project reconcile: %v", e))
+	}
+	// bd-ajn: snapshot patch failures are separate severity — surface
+	// but don't conflate with API errors.
+	for _, e := range stats.SnapshotWarnings {
+		*warnings = append(*warnings, fmt.Sprintf("project reconcile (snapshot): %v", e))
+	}
+}
+
+// buildLinearProjectMembershipLinks enumerates non-epic beads with a
+// Linear Issue external_ref whose nearest top-level-epic ancestor has
+// a Linear Project external_ref. For each such (issue, project) pair,
+// emits a ProjectMembershipLink. Walks parent-child deps to find the
+// ancestor.
+//
+// Linear Project URLs on the ancestor are resolved to UUIDs via a
+// single FetchProjects call (one round-trip regardless of tree size).
+// Issues whose ancestor's Project URL no longer resolves on Linear
+// (deleted out-of-band) are silently skipped — surfaced as a warning
+// via the reconciler if the user re-runs.
+//
+// Beads without a Linear Issue external_ref are skipped (same shape
+// as ReconcileParents — bd-1ay-pull-side (bd-6cl) will handle them).
+func buildLinearProjectMembershipLinks(ctx context.Context, lt *linear.Tracker) ([]linear.ProjectMembershipLink, error) {
+	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	if err != nil {
+		return nil, err
+	}
+	// Index beads by ID for O(1) ancestor walk.
+	byID := make(map[string]*types.Issue, len(issues))
+	for _, issue := range issues {
+		if issue != nil {
+			byID[issue.ID] = issue
+		}
+	}
+	// Resolve all Project URLs once up front. Map URL → UUID.
+	urlToProjectID, err := buildLinearProjectURLIndex(ctx, lt)
+	if err != nil {
+		return nil, err
+	}
+
+	links := make([]linear.ProjectMembershipLink, 0)
+	for _, issue := range issues {
+		if issue == nil || issue.IssueType == types.TypeEpic {
+			// Epics themselves don't get projectId; their CHILDREN do.
+			continue
+		}
+		if issue.ExternalRef == nil {
+			continue
+		}
+		ref := strings.TrimSpace(*issue.ExternalRef)
+		if !lt.IsExternalRef(ref) || lt.IsProjectRef(ref) {
+			// Skip non-Linear refs and Project refs (the latter would
+			// mean a non-epic with a Project external_ref, which is
+			// a state inconsistency the migration tool wouldn't produce).
+			continue
+		}
+		ident := lt.ExtractIdentifier(ref)
+		if ident == "" {
+			continue
+		}
+		// Walk up parent-child chain to find the nearest top-level epic.
+		ancestorBeadID, walkErr := findNearestTopLevelEpicAncestor(ctx, byID, issue.ID)
+		if walkErr != nil {
+			return nil, fmt.Errorf("walking ancestors of %s: %w", issue.ID, walkErr)
+		}
+		if ancestorBeadID == "" {
+			continue
+		}
+		ancestor := byID[ancestorBeadID]
+		if ancestor == nil || ancestor.ExternalRef == nil {
+			continue
+		}
+		ancestorRef := strings.TrimSpace(*ancestor.ExternalRef)
+		if !lt.IsProjectRef(ancestorRef) {
+			// Ancestor epic isn't (yet) a Linear Project — either it's
+			// still an Issue (bd-go9 hasn't been run) or it's never
+			// been pushed. Reconciler doesn't fire for these; the
+			// parent reconciler (bd-ena) handles Issue-parent links.
+			continue
+		}
+		// Codex bd-6cl round-2 bug 4: canonicalize the bead's
+		// stored external_ref before lookup so a trailing-title-slug
+		// rename on Linear doesn't silently break the resolution.
+		// buildLinearProjectURLIndex also canonicalizes its keys, so
+		// both sides compare in the same shape.
+		lookupKey := ancestorRef
+		if canonical, ok := linear.CanonicalizeLinearExternalRef(ancestorRef); ok {
+			lookupKey = canonical
+		}
+		projectID, ok := urlToProjectID[lookupKey]
+		if !ok || projectID == "" {
+			// Project URL doesn't resolve on Linear (deleted
+			// out-of-band). Silently skip; would be too noisy to
+			// warn on every such issue.
+			continue
+		}
+		links = append(links, linear.ProjectMembershipLink{
+			IssueIdentifier: ident,
+			ProjectID:       projectID,
+			LocalBeadID:     issue.ID, // bd-ajn: lets reconciler patch snapshot post-success
+		})
+	}
+	return links, nil
+}
+
+// buildLinearProjectURLIndex fetches all Linear Projects once and
+// returns a URL → UUID map. Cached per reconcile invocation; used by
+// buildLinearProjectMembershipLinks to translate epic external_refs
+// (which are URLs) into the UUIDs that IssueUpdate's projectId field
+// requires.
+func buildLinearProjectURLIndex(ctx context.Context, lt *linear.Tracker) (map[string]string, error) {
+	projects, err := lt.FetchProjects(ctx, "all")
+	if err != nil {
+		return nil, fmt.Errorf("fetching Linear projects: %w", err)
+	}
+	idx := make(map[string]string, len(projects))
+	for _, p := range projects {
+		if p.URL == "" || p.ID == "" {
+			continue
+		}
+		// Codex bd-6cl round-2 bug 4: canonicalize the URL so the
+		// lookup at the call site can compare canonicalized
+		// references symmetrically — a bead's stored external_ref
+		// may carry a different trailing title slug than Linear's
+		// current Project URL.
+		key := p.URL
+		if canonical, ok := linear.CanonicalizeLinearExternalRef(p.URL); ok {
+			key = canonical
+		}
+		idx[key] = p.ID
+	}
+	return idx, nil
+}
+
+// findNearestTopLevelEpicAncestor walks UP the parent-child dep chain
+// from issueID until reaching either (a) a bead with no parent — return
+// it iff it's an epic; or (b) cycle-detection bailout (defensive). Per
+// bd-1ay design, ALL descendants of a top-level epic land in the same
+// Project, not their immediate sub-epic. So we walk past intermediate
+// epics too.
+//
+// Returns "" when the chain leads to a non-epic root (i.e., no epic
+// anywhere in the ancestor chain).
+func findNearestTopLevelEpicAncestor(ctx context.Context, byID map[string]*types.Issue, issueID string) (string, error) {
+	current := issueID
+	visited := map[string]bool{current: true}
+	for {
+		deps, err := store.GetDependenciesWithMetadata(ctx, current)
+		if err != nil {
+			return "", err
+		}
+		var parentID string
+		for _, d := range deps {
+			if d == nil || d.DependencyType != types.DepParentChild {
+				continue
+			}
+			parentID = d.Issue.ID
+			break
+		}
+		if parentID == "" {
+			// Reached the root. Top-level only if it's an epic.
+			currentBead := byID[current]
+			if currentBead != nil && currentBead.IssueType == types.TypeEpic {
+				return current, nil
+			}
+			return "", nil
+		}
+		if visited[parentID] {
+			// Cycle (shouldn't happen for valid parent-child trees, but
+			// don't loop forever). Treat as no top-level epic.
+			return "", nil
+		}
+		visited[parentID] = true
+		current = parentID
+	}
 }

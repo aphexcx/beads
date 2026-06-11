@@ -200,14 +200,129 @@ type ProjectSyncer interface {
 	ExtractProjectID(ref string) string
 }
 
+// ProjectPullStats summarizes a pull-side Project materialization
+// pass (bd-6cl). Engine surfaces the counts in the overall pull
+// summary; Errors / SnapshotWarnings are surfaced as sync warnings.
+type ProjectPullStats struct {
+	// Fetched is the count of Linear Projects returned by
+	// FetchProjects. Always populated.
+	Fetched int
+	// Created is the count of NEW local epics materialized from
+	// Linear Projects (no prior local match by external_ref).
+	Created int
+	// Updated is the count of existing local epics whose fields
+	// changed as a result of the pull-side resolution.
+	Updated int
+	// Skipped is the count of Projects where the resolver produced
+	// no Updates (no change, first-sync, or close-state preserved).
+	Skipped int
+	// FirstSync is the count of Projects that hit the first-sync
+	// soft rollout (snapshot baseline written, no apply).
+	FirstSync int
+	// Errors is non-fatal per-Project failures.
+	Errors []error
+	// SnapshotWarnings is bd-6cl glue for snapshot-write failures
+	// (severity-distinct from API errors, same convention as
+	// bd-ajn's reconciler stats).
+	SnapshotWarnings []error
+	// PreviewLines is dry-run output: per-Project decision summary
+	// the caller can print. Populated only when DryRun is true.
+	PreviewLines []string
+	// ProjectIDToLocalEpicID maps Linear Project UUIDs to the
+	// matched-or-newly-created local epic bead ID. Used by the
+	// engine's post-pull descendant-dep wiring pass to translate
+	// a pulled Issue's projectId metadata into a parent-child dep
+	// target without a second database lookup. Empty in dry-run
+	// (no creates happened).
+	ProjectIDToLocalEpicID map[string]string
+}
+
+// ProjectPullOptions are the runtime knobs the engine passes to a
+// ProjectPuller. Kept minimal; can grow as needed.
+type ProjectPullOptions struct {
+	// DryRun, when true, runs the resolve logic but does NOT write
+	// any local mutations or snapshot rows. Decisions are logged
+	// via the tracker's existing warn/msg callbacks.
+	DryRun bool
+	// Policy is the ConflictResolution to apply when the resolver
+	// finds true conflicts (both sides moved the same field since
+	// lastSync).
+	Policy ConflictResolution
+	// LastSync is the engine's cluster cursor — used by the
+	// resolver to query dolt_history_issues for local-at-sync
+	// state. Zero value means "no prior sync, treat everything as
+	// new" (every populated field flags as changed locally).
+	LastSync time.Time
+	// Actor is the bead-store actor string for change attribution
+	// on materialized creates / updates.
+	Actor string
+}
+
+// ProjectPuller is the bd-6cl pull-side capability for trackers
+// that materialize remote Projects as local epics. The engine's
+// doPull calls PullProjects at the top of its loop when the
+// tracker implements this interface. Trackers without it (GitHub,
+// Jira, etc.) silently skip the Project-pull phase — same graceful-
+// degradation pattern as ProjectSyncer / PostPullSnapshotter.
+type ProjectPuller interface {
+	PullProjects(ctx context.Context, opts ProjectPullOptions) (*ProjectPullStats, error)
+}
+
+// FieldScopedUpdater is the bd-ajn capability for trackers that
+// support partial-field issue updates. When the conflict resolver
+// determines that only a subset of fields should propagate to the
+// external tracker (LocalChanged \ Conflicting, plus
+// Conflicting-fields-the-policy-resolved-to-local), the engine calls
+// UpdateIssueFields with the explicit field list — instead of the
+// full UpdateIssue, which would also push fields the user didn't
+// touch and potentially clobber concurrent remote changes.
+//
+// fields is the list of ConflictField values to include in the
+// update payload. Adapters are expected to ignore unknown values and
+// to no-op when fields is empty (caller error guard).
+//
+// remote, when non-nil, is the engine's already-fetched current
+// remote — same threading as RemoteAwareUpdater so the adapter can
+// preserve remote-owned state on fields it would otherwise
+// re-resolve from local context.
+type FieldScopedUpdater interface {
+	UpdateIssueFields(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue, fields []ConflictField) (*TrackerIssue, error)
+}
+
+// PostPullSnapshotter is the bd-ajn capability for trackers that
+// maintain a per-issue snapshot used by field-scoped conflict
+// detection. The engine calls RecordPullSnapshot after each
+// successful pull-side import or update so the snapshot row reflects
+// the just-pulled remote state.
+//
+// Implementations should derive snapshot fields from `fetched` (and
+// fetched.Raw when richer data is needed). When the tracker can't
+// snapshot a given issue — wrong adapter type, missing fields,
+// transient store error — they should return nil (best-effort write,
+// next sync will re-baseline via DetectConflicts's first-sync path)
+// or a wrapped error that the engine surfaces as a warning. The
+// engine treats failures as non-fatal because the pull itself has
+// already succeeded; a missed snapshot only costs one spurious
+// conflict-gate next sync.
+type PostPullSnapshotter interface {
+	RecordPullSnapshot(ctx context.Context, localBeadID string, fetched TrackerIssue) error
+}
+
 // TrackerProject represents a project from an external tracker.
 type TrackerProject struct {
 	ID          string
 	Name        string
 	Description string
-	URL         string
-	State       string
-	UpdatedAt   time.Time
+	// Content is the long-form body shown on the Project page itself,
+	// distinct from Description (which has tracker-specific length
+	// limits). For Linear, populated from the GraphQL `content` field
+	// when present. bd-6cl uses this to recombine the bd-cs1 split
+	// (short description plus long content) into a single bead
+	// Description on pull-side round-trip.
+	Content   string
+	URL       string
+	State     string
+	UpdatedAt time.Time
 }
 
 // TrackerComment represents a comment from an external tracker.

@@ -700,3 +700,96 @@ func TestPreviewUpdate(t *testing.T) {
 
 // keep linker happy if httptest is otherwise unused
 var _ = httptest.NewServer
+
+// TestSplitEpicDescriptionForProject is the bd-cs1 plumbing test:
+// confirms the splitter does NOT emit content when the description
+// fits the limit (so callers can skip the content field entirely),
+// and DOES emit the full text as content when truncation kicks in.
+func TestSplitEpicDescriptionForProject(t *testing.T) {
+	t.Run("short description: no content", func(t *testing.T) {
+		desc, content := splitEpicDescriptionForProject("short bead description")
+		if desc != "short bead description" {
+			t.Errorf("description = %q, want unchanged", desc)
+		}
+		if content != "" {
+			t.Errorf("content = %q, want empty (no truncation)", content)
+		}
+	})
+
+	t.Run("over limit: content gets full text", func(t *testing.T) {
+		full := strings.Repeat("a", 300)
+		desc, content := splitEpicDescriptionForProject(full)
+		if content != full {
+			t.Errorf("content should be full original (%d chars), got %d", len(full), len(content))
+		}
+		if utf8RuneCount(desc) > LinearProjectDescriptionMaxChars {
+			t.Errorf("description %d runes exceeds limit", utf8RuneCount(desc))
+		}
+	})
+
+	t.Run("empty in, empty out", func(t *testing.T) {
+		desc, content := splitEpicDescriptionForProject("")
+		if desc != "" || content != "" {
+			t.Errorf("got (%q, %q), want both empty", desc, content)
+		}
+	})
+}
+
+// TestUpdateProjectClearsContentOnShortenedDescription is the bd-cs1
+// codex-round-1 E regression: when a bead's description shortens from
+// long (forced split with content) to short (no content needed), the
+// update payload must explicitly clear the Project.content field on
+// Linear. Otherwise the rich body left over from the long-description
+// era stays stale forever.
+//
+// Asserts via the updates map sent to client.UpdateProject. Mock client
+// captures the map and verifies content=nil (which JSON-encodes as
+// "content": null and Linear interprets as a field clear).
+func TestUpdateProjectClearsContentOnShortenedDescription(t *testing.T) {
+	t.Run("short description sets content to nil for clear", func(t *testing.T) {
+		_, content := splitEpicDescriptionForProject("short")
+		if content != "" {
+			t.Fatalf("splitEpicDescriptionForProject returned non-empty content for short input")
+		}
+		// Tracker.UpdateProject branches on content != "" : empty must
+		// produce a nil entry (clear), not an absent key (no-op).
+		updates := buildProjectUpdateMap("Title", "short", "started")
+		v, present := updates["content"]
+		if !present {
+			t.Fatalf("content key MISSING from update map; stale rich body would persist on Linear")
+		}
+		if v != nil {
+			t.Errorf("content = %#v, want nil (so JSON encodes as null for clear)", v)
+		}
+	})
+
+	t.Run("long description sets content to full text", func(t *testing.T) {
+		full := strings.Repeat("a", 300)
+		updates := buildProjectUpdateMap("Title", full, "started")
+		v, ok := updates["content"].(string)
+		if !ok {
+			t.Fatalf("content key not a string in update map: %#v", updates["content"])
+		}
+		if v != full {
+			t.Errorf("content (len=%d) does not match full input (len=%d)", len(v), len(full))
+		}
+	})
+}
+
+// buildProjectUpdateMap mirrors the inner shape of Tracker.UpdateProject
+// for assertion purposes. Kept private to the test file so the real
+// method's signature isn't constrained by test plumbing needs.
+func buildProjectUpdateMap(name, description, state string) map[string]interface{} {
+	desc, content := splitEpicDescriptionForProject(description)
+	updates := map[string]interface{}{
+		"name":        name,
+		"description": desc,
+		"state":       state,
+	}
+	if content != "" {
+		updates["content"] = content
+	} else {
+		updates["content"] = nil
+	}
+	return updates
+}

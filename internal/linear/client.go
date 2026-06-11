@@ -29,6 +29,7 @@ const projectsQuery = `
 				id
 				name
 				description
+				content
 				slugId
 				url
 				state
@@ -86,6 +87,9 @@ const issuesQuery = `
 				parent {
 					id
 					identifier
+				}
+				project {
+					id
 				}
 				relations {
 					nodes {
@@ -545,7 +549,21 @@ func (c *Client) UpdateIssue(ctx context.Context, issueID string, updates map[st
 						name
 						type
 					}
+					assignee {
+						id
+						name
+						email
+						displayName
+					}
+					parent {
+						id
+						identifier
+					}
+					project {
+						id
+					}
 					updatedAt
+					completedAt
 				}
 			}
 		}
@@ -605,6 +623,13 @@ func (c *Client) FetchIssueByIdentifier(ctx context.Context, identifier string) 
 							id
 							name
 						}
+					}
+					parent {
+						id
+						identifier
+					}
+					project {
+						id
 					}
 					createdAt
 					updatedAt
@@ -1264,7 +1289,16 @@ func (c *Client) FetchProjects(ctx context.Context, state string) ([]Project, er
 }
 
 // CreateProject creates a new project in Linear.
-func (c *Client) CreateProject(ctx context.Context, name, description, state string) (*Project, error) {
+// CreateProject creates a new Linear project. description is the short
+// summary (≤255 chars; Linear validates server-side) shown in compact
+// project views. content is the full rich body shown on the project
+// page itself — no length limit. Pass empty content to omit it.
+//
+// Callers with a description that exceeds Linear's 255-char ceiling
+// should pre-truncate via TruncateLinearProjectDescription and pass the
+// full text as content. bd-cs1: passing >255 chars in description
+// returns "Argument Validation Error" from Linear's GraphQL.
+func (c *Client) CreateProject(ctx context.Context, name, description, content, state string) (*Project, error) {
 	query := `
 		mutation CreateProject($input: ProjectCreateInput!) {
 			projectCreate(input: $input) {
@@ -1273,6 +1307,7 @@ func (c *Client) CreateProject(ctx context.Context, name, description, state str
 					id
 					name
 					description
+					content
 					slugId
 					url
 					state
@@ -1290,6 +1325,9 @@ func (c *Client) CreateProject(ctx context.Context, name, description, state str
 		"description": description,
 	}
 
+	if content != "" {
+		input["content"] = content
+	}
 	if state != "" {
 		input["state"] = state
 	}
@@ -1373,6 +1411,7 @@ func (c *Client) UpdateProject(ctx context.Context, projectID string, updates ma
 					id
 					name
 					description
+					content
 					slugId
 					url
 					state

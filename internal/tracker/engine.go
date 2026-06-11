@@ -3,6 +3,7 @@ package tracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -158,26 +159,52 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		opts.Push = true
 	}
 
+	// bd-3p8: hard-fail when a tracker advertises a capability that
+	// REQUIRES a matching store interface, but the configured store
+	// doesn't implement it. Mayor's design principle: capability-
+	// degrade is acceptable for OPTIONAL features (label sync,
+	// comment sync); REQUIRED features (Project pull when
+	// ProjectSyncer is configured, field-scoped conflicts when the
+	// tracker supports them) should hard-error instead of warn —
+	// otherwise the feature ships silently disabled on backends
+	// without the matching impl, exactly the bd-3p8 failure mode.
+	if err := e.checkRequiredStoreCapabilities(); err != nil {
+		result.Success = false
+		result.Error = err.Error()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return result, err
+	}
+
 	// Track IDs to skip/force during push based on conflict resolution
 	skipPushIDs := make(map[string]bool)
 	forcePushIDs := make(map[string]bool)
 
 	allowPullOverwriteIDs := make(map[string]bool)
 
+	// bd-ajn field-scoped per-issue field maps. Keyed by issue.ID;
+	// each inner map lists the ConflictFields to push or pull. Empty
+	// (or missing entry) means "no scoping — push/pull whole issue"
+	// for legacy compatibility.
+	pushFieldScopes := make(map[string]map[ConflictField]bool)
+	pullFieldScopes := make(map[string]map[ConflictField]bool)
+
 	// Phase 1: Detect conflicts (only for bidirectional sync)
 	if opts.Pull && opts.Push {
-		conflicts, err := e.DetectConflicts(ctx)
+		conflicts, err := e.DetectConflicts(ctx, opts)
 		if err != nil {
 			e.warn("Failed to detect conflicts: %v", err)
 		} else if len(conflicts) > 0 {
 			result.Stats.Conflicts = len(conflicts)
-			e.resolveConflicts(opts, conflicts, skipPushIDs, forcePushIDs, allowPullOverwriteIDs)
+			e.resolveConflictsWithFieldScopes(opts, conflicts,
+				skipPushIDs, forcePushIDs, allowPullOverwriteIDs,
+				pushFieldScopes, pullFieldScopes)
 		}
 	}
 
 	// Phase 2: Pull
 	if opts.Pull {
-		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs)
+		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs, pullFieldScopes)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("pull failed: %v", err)
@@ -195,7 +222,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 
 	// Phase 3: Push
 	if opts.Push {
-		pushStats, err := e.doPush(ctx, opts, skipPushIDs, forcePushIDs)
+		pushStats, err := e.doPush(ctx, opts, skipPushIDs, forcePushIDs, pushFieldScopes)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("push failed: %v", err)
@@ -237,9 +264,24 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	return result, nil
 }
 
-// DetectConflicts identifies issues that were modified both locally and externally
-// since the last sync.
-func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
+// DetectConflicts identifies issues that need cross-side attention since
+// the last sync. bd-ajn extended this from whole-issue timestamp
+// comparison to per-field diff backed by snapshots:
+//
+//   - LOCAL side: dolt_history_issues for state at lastSync
+//   - REMOTE side: linear_issue_snapshots (LinearIssueSnapshotStore)
+//
+// The resulting Conflict carries LocalChanged / ExternalChanged /
+// Conflicting field maps. resolveConflicts consumes them to dispatch
+// per-field push / pull / true-conflict actions.
+//
+// Falls back to whole-issue timestamp behavior when:
+//   - The storage backend doesn't expose HistoryViewer
+//   - The tracker doesn't expose a snapshot store
+//   - The snapshot row doesn't exist yet (first-sync soft rollout —
+//     mayor's Q5: baseline + emit no conflict, next sync gets the
+//     real field-scoped path)
+func (e *Engine) DetectConflicts(ctx context.Context, opts SyncOptions) ([]Conflict, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.detect_conflicts",
 		trace.WithAttributes(attribute.String("sync.tracker", e.Tracker.DisplayName())),
 	)
@@ -264,6 +306,11 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 		return nil, fmt.Errorf("searching issues: %w", err)
 	}
 
+	// bd-ajn: check capability surface once up front so the per-issue
+	// loop doesn't repeat type assertions.
+	snapStore, snapStoreOK := e.Store.(storage.LinearIssueSnapshotStore)
+	snapshotter, snapshotterOK := e.Tracker.(PostPullSnapshotter)
+
 	var conflicts []Conflict
 	for _, issue := range issues {
 		extRef := derefStr(issue.ExternalRef)
@@ -271,22 +318,50 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 			continue
 		}
 
-		// Check if locally modified since last sync
-		if issue.UpdatedAt.Before(lastSync) || issue.UpdatedAt.Equal(lastSync) {
+		localChanged := issue.UpdatedAt.After(lastSync)
+
+		// Whole-issue fast-skip: no local change AND we'll only know
+		// about external changes after fetching. The old code skipped
+		// here unconditionally; field-scoping needs to fetch even when
+		// !localChanged because the external side may have changed
+		// fields we still want to pull. The conservative compromise:
+		// keep the fast-skip when neither snapshot infra is available
+		// (legacy behavior preserved).
+		if !localChanged && !(snapStoreOK && snapshotterOK) {
 			continue
 		}
 
-		// Fetch external version to check if also modified
+		// Fetch external version
 		extID := e.Tracker.ExtractIdentifier(extRef)
 		if extID == "" {
 			continue
 		}
-
 		extIssue, err := e.Tracker.FetchIssue(ctx, extID)
 		if err != nil || extIssue == nil {
 			continue
 		}
 
+		// Try field-scoped path. Falls through to whole-issue logic on
+		// any of the documented fallback conditions.
+		if snapStoreOK && snapshotterOK {
+			emitted, fieldErr := e.detectFieldScopedConflict(ctx, issue, extIssue, extRef, lastSync, snapStore, snapshotter, opts.DryRun)
+			if fieldErr == nil {
+				if emitted != nil {
+					conflicts = append(conflicts, *emitted)
+				}
+				continue
+			}
+			// Field-scoped detection error → fall through to legacy.
+			e.warn("Field-scoped conflict detection failed for %s; falling back to whole-issue: %v", issue.ID, fieldErr)
+		}
+
+		// Legacy whole-issue timestamp path. Reached when the backend
+		// doesn't expose snapshot infra OR when field-scoped detection
+		// errored. Preserves pre-bd-ajn behavior for trackers that
+		// haven't opted into the snapshot pattern.
+		if !localChanged {
+			continue
+		}
 		if extIssue.UpdatedAt.After(lastSync) {
 			conflicts = append(conflicts, Conflict{
 				IssueID:            issue.ID,
@@ -303,8 +378,100 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 	return conflicts, nil
 }
 
-// doPull imports issues from the external tracker into beads.
-func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs map[string]bool) (*PullStats, error) {
+// detectFieldScopedConflict runs the per-field diff for a single
+// issue. Returns (conflict, nil) when a conflict should be emitted,
+// (nil, nil) when no action is needed (no changes on either side),
+// or (nil, err) to signal the caller to fall back to whole-issue
+// logic.
+//
+// First-sync soft rollout (mayor's Q5): a missing snapshot triggers
+// a baseline write + log line, and we return (nil, nil) — no
+// conflict this run, next sync gets real field-scoping.
+//
+// bd-p4m: dryRun gates the baseline write. In dry-run mode we
+// preview the would-be write but do NOT touch the snapshot table —
+// otherwise --dry-run consumes the soft-rollout grace period and
+// the next wet-run takes a different code path than it would have
+// without the dry-run. Dry-run must be a pure preview.
+func (e *Engine) detectFieldScopedConflict(
+	ctx context.Context,
+	issue *types.Issue,
+	extIssue *TrackerIssue,
+	extRef string,
+	lastSync time.Time,
+	snapStore storage.LinearIssueSnapshotStore,
+	snapshotter PostPullSnapshotter,
+	dryRun bool,
+) (*Conflict, error) {
+	snap, err := snapStore.GetLinearIssueSnapshot(ctx, issue.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read snapshot: %w", err)
+	}
+	if snap == nil {
+		// First-sync soft rollout.
+		if dryRun {
+			// bd-p4m: preview only; don't write. Skipping the write
+			// preserves dry-run idempotency AND keeps the soft-
+			// rollout grace period available for the next wet-run.
+			e.msg("[dry-run] Would snapshot baseline for issue %s (no conflict possible this run)", issue.ID)
+			return nil, nil
+		}
+		e.msg("first sync — snapshotting baseline for issue %s (no conflict possible this run)", issue.ID)
+		if writeErr := snapshotter.RecordPullSnapshot(ctx, issue.ID, *extIssue); writeErr != nil {
+			// Codex bd-ajn round-2 bug 6: a persistent baseline write
+			// failure would loop forever — every sync sees nil
+			// snapshot, retries, fails, and the user's conflicts are
+			// never surfaced. Escalate to the caller as a real error
+			// so it falls through to legacy whole-issue handling.
+			// That path uses pure timestamp comparison (no snapshot
+			// dependency) and at least gives the conflict a chance
+			// to be detected and resolved under existing behavior.
+			return nil, fmt.Errorf("baseline snapshot write failed for %s: %w", issue.ID, writeErr)
+		}
+		return nil, nil
+	}
+
+	// Local-side state at lastSync via dolt_history. nil result means
+	// the issue had no committed state at lastSync (created since);
+	// diffLocalFields treats that as "all populated fields new".
+	localAtSync, err := loadLocalStateAtSync(ctx, e.Store, issue.ID, lastSync)
+	if err != nil {
+		if errors.Is(err, errHistoryNotSupported) {
+			// Backend without history capability — signal fallback.
+			return nil, err
+		}
+		return nil, fmt.Errorf("load local state at sync: %w", err)
+	}
+
+	localChanged := diffLocalFields(issue, localAtSync)
+	externalChanged := diffExternalFields(extIssue, snap)
+	conflicting := computeConflictingFields(localChanged, externalChanged)
+
+	// No changes on either side → no work for the resolver.
+	if len(localChanged) == 0 && len(externalChanged) == 0 {
+		return nil, nil
+	}
+
+	return &Conflict{
+		IssueID:            issue.ID,
+		LocalUpdated:       issue.UpdatedAt,
+		ExternalUpdated:    extIssue.UpdatedAt,
+		ExternalRef:        extRef,
+		ExternalIdentifier: extIssue.Identifier,
+		ExternalInternalID: extIssue.ID,
+		LocalChanged:       localChanged,
+		ExternalChanged:    externalChanged,
+		Conflicting:        conflicting,
+	}, nil
+}
+
+// doPull imports issues from the external tracker into beads. bd-ajn:
+// pullFieldScopes carries per-issue field restrictions from the
+// conflict resolver. When set for an issue, buildPullIssueUpdates
+// returns ONLY those fields so the pull doesn't clobber locally-
+// changed fields that aren't part of the resolver's pull set.
+// Empty / missing entry → whole-issue update (legacy path).
+func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs map[string]bool, pullFieldScopes map[string]map[ConflictField]bool) (*PullStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.pull",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -325,6 +492,45 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			lastSync = &t
 			stats.Incremental = true
 			stats.SyncedSince = lastSyncStr
+		}
+	}
+
+	// bd-6cl: pull-side Project materialization. Run BEFORE the
+	// per-Issue pull so that new local epics created here exist
+	// when the post-pull descendant-projectId-wiring pass (P5)
+	// walks the just-pulled Issues. Skipped silently for trackers
+	// that don't implement ProjectPuller (GitHub, Jira, etc.).
+	projectIDToLocalEpicID := map[string]string{}
+	if pp, ok := e.Tracker.(ProjectPuller); ok {
+		projectOpts := ProjectPullOptions{
+			DryRun: opts.DryRun,
+			Policy: opts.ConflictResolution,
+			Actor:  e.Actor,
+		}
+		if lastSync != nil {
+			projectOpts.LastSync = *lastSync
+		}
+		projectStats, err := pp.PullProjects(ctx, projectOpts)
+		if err != nil {
+			e.warn("Project pull failed: %v", err)
+		} else if projectStats != nil {
+			for _, line := range projectStats.PreviewLines {
+				e.msg("%s", line)
+			}
+			for _, perr := range projectStats.Errors {
+				e.warn("Project pull error: %v", perr)
+			}
+			for _, swarn := range projectStats.SnapshotWarnings {
+				e.warn("Project pull (snapshot): %v", swarn)
+			}
+			stats.Created += projectStats.Created
+			stats.Updated += projectStats.Updated
+			// FirstSync (codex bd-6cl round-1 nit) folds into Skipped
+			// for engine display: from the user's perspective, a
+			// first-sync baseline produced no apply work — it's a
+			// skip with extra observability captured in PreviewLines.
+			stats.Skipped += projectStats.Skipped + projectStats.FirstSync
+			projectIDToLocalEpicID = projectStats.ProjectIDToLocalEpicID
 		}
 	}
 
@@ -459,12 +665,20 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		if pullEqual {
 			// Issue unchanged, but still sync comments/attachments
 			// (they may have been added externally since last sync).
-			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
+			//
+			// bd-p4m round 1: dry-run guard MUST precede these hooks.
+			// SyncComments / SyncAttachments write to the local store
+			// (ImportCommentWithRef + CreateAttachment); firing them
+			// during --dry-run violates the read-only contract. Same
+			// class of bug as the snapshot baseline write this PR
+			// fixed in detectFieldScopedConflict — caught by codex
+			// round-1's wider audit.
+			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" && !opts.DryRun {
 				if err := e.PullHooks.SyncComments(ctx, existing.ID, extIssue.ID); err != nil {
 					e.warn("Comment sync failed for %s: %v", existing.ID, err)
 				}
 			}
-			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
+			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" && !opts.DryRun {
 				if err := e.PullHooks.SyncAttachments(ctx, existing.ID, extIssue.ID); err != nil {
 					e.warn("Attachment sync failed for %s: %v", existing.ID, err)
 				}
@@ -496,6 +710,13 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			}
 
 			updates := buildPullIssueUpdates(existing, conv.Issue, ref)
+			if scope := pullFieldScopes[existing.ID]; len(scope) > 0 {
+				// bd-ajn field-scoped pull: keep only the resolver-
+				// approved fields + ref (which is metadata, not a
+				// user-editable field). external_ref keys stay because
+				// pull is the path that backfills them.
+				updates = restrictPullUpdatesToFields(updates, scope)
+			}
 			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
 				updates["metadata"] = raw
 			}
@@ -531,6 +752,18 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		if existing != nil {
 			localID = existing.ID
 		}
+		// bd-ajn: record the per-issue snapshot for trackers that
+		// support PostPullSnapshotter. Captures the just-pulled remote
+		// state so the NEXT DetectConflicts run can correctly diff
+		// "did Linear change this field?" without confusing pulled
+		// state with newly-changed remote state. Best-effort: a
+		// failure here surfaces as a warning but does not abort
+		// import.
+		if snapshotter, ok := e.Tracker.(PostPullSnapshotter); ok && localID != "" {
+			if err := snapshotter.RecordPullSnapshot(ctx, localID, extIssue); err != nil {
+				e.warn("Snapshot write failed for %s after pull: %v", localID, err)
+			}
+		}
 		if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
 			if err := e.PullHooks.SyncComments(ctx, localID, extIssue.ID); err != nil {
 				e.warn("Comment sync failed for %s: %v", localID, err)
@@ -539,6 +772,25 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
 			if err := e.PullHooks.SyncAttachments(ctx, localID, extIssue.ID); err != nil {
 				e.warn("Attachment sync failed for %s: %v", localID, err)
+			}
+		}
+
+		// bd-6cl: when the just-pulled Issue's remote payload
+		// includes a projectId (Linear sets Metadata["project_id"]
+		// for issues belonging to a Project), wire a parent-child
+		// dep from this issue's bead to the local epic that
+		// materializes that Project. Idempotent — skip if dep
+		// already exists. Skipped on dry-run (no creates ran, the
+		// epic might not exist locally yet). Skipped when the
+		// projectId isn't mapped to a known local epic (out-of-band
+		// Project, or our PullProjects didn't see it for any reason).
+		if !opts.DryRun && localID != "" && len(projectIDToLocalEpicID) > 0 {
+			if pid := pulledIssueProjectID(extIssue); pid != "" {
+				if epicID, ok := projectIDToLocalEpicID[pid]; ok && epicID != "" && epicID != localID {
+					if err := e.ensureParentChildDep(ctx, localID, epicID); err != nil {
+						e.warn("Failed to wire Project parent-child dep for %s → %s: %v", localID, epicID, err)
+					}
+				}
 			}
 		}
 
@@ -728,7 +980,15 @@ func parseSyncTime(value string) (time.Time, error) {
 }
 
 // doPush exports beads issues to the external tracker.
-func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs map[string]bool) (*PushStats, error) {
+//
+// bd-ajn: pushFieldScopes carries per-issue field restrictions
+// produced by resolveConflictsWithFieldScopes. When pushFieldScopes
+// has an entry for an issue and the tracker implements
+// FieldScopedUpdater, only those fields are sent in the update —
+// preventing whole-issue overwrites that would clobber concurrent
+// remote changes to fields the local side didn't touch. Trackers
+// without FieldScopedUpdater fall back to full-issue UpdateIssue.
+func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs map[string]bool, pushFieldScopes map[string]map[ConflictField]bool) (*PushStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.push",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -748,6 +1008,19 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		if err != nil {
 			return nil, fmt.Errorf("building state cache: %w", err)
 		}
+	}
+
+	// bd-1ay: Epic-sync pass. For trackers implementing ProjectSyncer
+	// (Linear), ensure each top-level epic has a Linear Project. doPush's
+	// per-issue loop below uses epicProjectMap to skip those epics so
+	// they don't double-create as Issues.
+	//
+	// Scoped to top-level epics with empty or Project-URL external_ref;
+	// Issue-URL external_refs are left to the bd-go9 migration tool.
+	// Skipped silently for trackers that don't implement ProjectSyncer.
+	epicProjectMap, err := e.doEpicSync(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("epic-sync: %w", err)
 	}
 
 	// Fetch local issues
@@ -777,6 +1050,15 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 	}
 
+	// bd-1ay TODO (forward-risk note from codex round 2): the
+	// BatchPushTracker fast path below bypasses the per-issue loop
+	// where epicProjectMap is consulted. Linear (the only ProjectSyncer
+	// today) does NOT implement BatchPushTracker, so this is safe right
+	// now. If a future ProjectSyncer adapter ALSO implements
+	// BatchPushTracker, the batch path would need an epic-skip layer
+	// at the collectBatchPushIssues stage (parallel to the existing
+	// per-issue filter), or epic Projects would double-create as Issues
+	// in the batch.
 	if batchTracker, ok := e.Tracker.(BatchPushTracker); ok {
 		pushIssues, skipped := e.collectBatchPushIssues(issues, opts, descendantSet, skipIDs, forceIDs)
 		stats.Skipped += skipped
@@ -834,6 +1116,16 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 		// Skip filtered types/states/ephemeral
 		if !e.shouldPushIssue(issue, opts) {
+			stats.Skipped++
+			continue
+		}
+
+		// bd-1ay: top-level epics handled as Projects by doEpicSync are
+		// skipped here so they don't double-create as Issues. The
+		// post-sync ReconcileProjectMembership pass (Linear-specific,
+		// fired from cmd/bd/linear.go) walks descendants and assigns
+		// them to the right Project via projectId.
+		if _, isEpicProject := epicProjectMap[issue.ID]; isEpicProject {
 			stats.Skipped++
 			continue
 		}
@@ -989,13 +1281,26 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				continue
 			}
 
-			// Prefer RemoteAwareUpdater when available — passes the fetched remote
-			// so the tracker can preserve remote-owned state.
+			// Prefer FieldScopedUpdater + RemoteAwareUpdater when both
+			// the scope is set and the tracker supports field scoping
+			// (bd-ajn). Otherwise fall through to the legacy ordering:
+			// RemoteAwareUpdater preferred over plain UpdateIssue.
 			var updateErr error
-			if rau, ok := e.Tracker.(RemoteAwareUpdater); ok {
-				_, updateErr = rau.UpdateIssueWithRemote(ctx, extID, pushIssue, fetchedExt)
-			} else {
-				_, updateErr = e.Tracker.UpdateIssue(ctx, extID, pushIssue)
+			scope := pushFieldScopes[issue.ID]
+			fsu, fsuOK := e.Tracker.(FieldScopedUpdater)
+			switch {
+			case len(scope) > 0 && fsuOK:
+				// Field-scoped path: only the conflict-resolver-approved
+				// fields go to Linear. Other fields (which may have been
+				// touched on Linear's side without local change) stay
+				// untouched.
+				_, updateErr = fsu.UpdateIssueFields(ctx, extID, pushIssue, fetchedExt, conflictFieldKeys(scope))
+			default:
+				if rau, ok := e.Tracker.(RemoteAwareUpdater); ok {
+					_, updateErr = rau.UpdateIssueWithRemote(ctx, extID, pushIssue, fetchedExt)
+				} else {
+					_, updateErr = e.Tracker.UpdateIssue(ctx, extID, pushIssue)
+				}
 			}
 			if updateErr != nil {
 				e.warn("Failed to update %s in %s: %v", issue.ID, e.Tracker.DisplayName(), updateErr)
@@ -1101,8 +1406,50 @@ func (e *Engine) renderBatchDryRun(issues []*types.Issue, result *BatchPushResul
 }
 
 // resolveConflicts applies the configured conflict resolution strategy.
+//
+// bd-ajn: each conflict is now per-field-aware. When the conflict
+// carries field-scoped diff data (HasFieldScopedDiff), this routine
+// emits per-field decisions:
+//
+//   - Field in LocalChanged only → push that field (no skip, no force
+//     at the whole-issue level — the push path field-scopes itself
+//     via pushFieldScopes)
+//   - Field in ExternalChanged only → pull that field (pullFieldScopes
+//     tells the pull path which fields to apply)
+//   - Field in Conflicting → policy decides (ConflictLocal /
+//     ConflictExternal / ConflictTimestamp at whole-issue scope, since
+//     Linear doesn't expose per-field updatedAt — mayor's Q7
+//     acknowledgment).
+//
+// When the conflict lacks field-scoped data (legacy path —
+// HasFieldScopedDiff returns false), falls through to the old
+// whole-issue logic for backward compatibility.
+//
+// The field-scope maps are nil-safe — callers (doPush, doPull) check
+// presence before consuming.
 func (e *Engine) resolveConflicts(opts SyncOptions, conflicts []Conflict, skipIDs, forceIDs, allowPullOverwriteIDs map[string]bool) {
+	e.resolveConflictsWithFieldScopes(opts, conflicts, skipIDs, forceIDs, allowPullOverwriteIDs, nil, nil)
+}
+
+// resolveConflictsWithFieldScopes is the field-aware extension.
+// pushFieldScopes and pullFieldScopes, when non-nil, are populated
+// with per-field action maps. Tests and the field-scoped doPush /
+// doPull paths consume these; the legacy wrapper (resolveConflicts)
+// passes nil and ignores them.
+func (e *Engine) resolveConflictsWithFieldScopes(
+	opts SyncOptions,
+	conflicts []Conflict,
+	skipIDs, forceIDs, allowPullOverwriteIDs map[string]bool,
+	pushFieldScopes, pullFieldScopes map[string]map[ConflictField]bool,
+) {
 	for _, c := range conflicts {
+		if c.HasFieldScopedDiff() {
+			e.resolveFieldScopedConflict(opts, c, skipIDs, forceIDs, allowPullOverwriteIDs, pushFieldScopes, pullFieldScopes)
+			continue
+		}
+
+		// Legacy whole-issue path (no snapshot infra, or first-sync
+		// fallback).
 		switch opts.ConflictResolution {
 		case ConflictLocal:
 			forceIDs[c.IssueID] = true
@@ -1122,6 +1469,95 @@ func (e *Engine) resolveConflicts(opts SyncOptions, conflicts []Conflict, skipID
 				allowPullOverwriteIDs[c.IssueID] = true
 				e.msg("Conflict on %s: external is newer, importing", c.IssueID)
 			}
+		}
+	}
+}
+
+// resolveFieldScopedConflict dispatches per-field decisions for a
+// single conflict that carries snapshot-backed diff data.
+func (e *Engine) resolveFieldScopedConflict(
+	opts SyncOptions,
+	c Conflict,
+	skipIDs, forceIDs, allowPullOverwriteIDs map[string]bool,
+	pushFieldScopes, pullFieldScopes map[string]map[ConflictField]bool,
+) {
+	// Step 1: auto-merge non-conflicting fields.
+	//   - LocalChanged \ Conflicting → push these fields
+	//   - ExternalChanged \ Conflicting → pull these fields
+	conflictSet := make(map[ConflictField]bool, len(c.Conflicting))
+	for _, f := range c.Conflicting {
+		conflictSet[f] = true
+	}
+	pushFields := make(map[ConflictField]bool)
+	pullFields := make(map[ConflictField]bool)
+	for f := range c.LocalChanged {
+		if !conflictSet[f] {
+			pushFields[f] = true
+		}
+	}
+	for f := range c.ExternalChanged {
+		if !conflictSet[f] {
+			pullFields[f] = true
+		}
+	}
+
+	// Step 2: dispatch the truly-conflicting fields per policy.
+	for _, f := range c.Conflicting {
+		var winner string // for logging only
+		switch opts.ConflictResolution {
+		case ConflictLocal:
+			pushFields[f] = true
+			winner = "local"
+		case ConflictExternal:
+			pullFields[f] = true
+			winner = "external"
+		default: // timestamp — falls back to whole-issue updatedAt per Q7
+			if c.LocalUpdated.After(c.ExternalUpdated) {
+				pushFields[f] = true
+				winner = "local (newer)"
+			} else {
+				pullFields[f] = true
+				winner = "external (newer)"
+			}
+		}
+		e.msg("Conflict on %s.%s: keeping %s version", c.IssueID, f, winner)
+	}
+
+	// Step 3: publish to the caller's scope maps (when provided).
+	if pushFieldScopes != nil && len(pushFields) > 0 {
+		pushFieldScopes[c.IssueID] = pushFields
+	}
+	if pullFieldScopes != nil && len(pullFields) > 0 {
+		pullFieldScopes[c.IssueID] = pullFields
+	}
+
+	// Step 4: gate the whole-issue push/pull paths so the resolution
+	// decisions take effect at the engine level.
+	//
+	// Rules:
+	//   - Any pushFields present → force the push path to run for
+	//     this issue (so locally-changed fields propagate).
+	//   - Any pullFields present → allow the pull path to overwrite
+	//     local (so externally-changed fields land).
+	//   - Mixed (both push and pull): set forceIDs +
+	//     allowPullOverwriteIDs but NOT skipIDs. The skipIDs map
+	//     short-circuits the push path entirely before
+	//     pushFieldScopes can dispatch field-scoped — using it for
+	//     the pull side of a mixed conflict would silently skip the
+	//     push side (codex bd-ajn round-1 bug).
+	//   - Pull-only (no pushFields): set skipIDs so the legacy push
+	//     path doesn't fire for this issue at all. The pull side
+	//     handles the work via allowPullOverwriteIDs +
+	//     pullFieldScopes.
+	if len(pushFields) > 0 {
+		forceIDs[c.IssueID] = true
+	}
+	if len(pullFields) > 0 {
+		allowPullOverwriteIDs[c.IssueID] = true
+		if len(pushFields) == 0 {
+			// Pull-only — block the push path. Mixed scenarios skip
+			// this so doPush can run with pushFieldScopes scoping.
+			skipIDs[c.IssueID] = true
 		}
 	}
 }
@@ -1153,6 +1589,16 @@ func (e *Engine) reimportIssue(ctx context.Context, c Conflict) {
 
 	if err := e.Store.UpdateIssue(ctx, c.IssueID, updates, e.Actor); err != nil {
 		e.warn("Failed to update %s during reimport: %v", c.IssueID, err)
+		return
+	}
+	// bd-ajn: refresh the snapshot to the just-pulled state, matching
+	// the doPull import path. Without this, the next sync would see
+	// stale snapshot fields as "Linear changed them" after a
+	// conflict-resolution import.
+	if snapshotter, ok := e.Tracker.(PostPullSnapshotter); ok {
+		if err := snapshotter.RecordPullSnapshot(ctx, c.IssueID, *extIssue); err != nil {
+			e.warn("Snapshot write failed for %s after reimport: %v", c.IssueID, err)
+		}
 	}
 }
 
@@ -1194,6 +1640,96 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 		}
 	}
 	return errCount
+}
+
+// checkRequiredStoreCapabilities (bd-3p8) enforces mayor's design
+// principle: tracker capabilities that REQUIRE a matching store
+// capability must hard-fail at sync-start when the store lacks the
+// impl, not silently degrade to a no-op.
+//
+// Current required pairings:
+//   - Tracker implements PostPullSnapshotter (bd-ajn field-scoped
+//     conflicts) → Store MUST implement LinearIssueSnapshotStore.
+//   - Tracker implements ProjectPuller (bd-6cl pull-side Project
+//     materialization) → Store MUST implement
+//     LinearProjectSnapshotStore.
+//
+// Trackers that don't advertise these capabilities (GitHub, Jira,
+// mocks) pass through unaffected — the check only fires for
+// configured tracker→store mismatches.
+func (e *Engine) checkRequiredStoreCapabilities() error {
+	if _, ok := e.Tracker.(PostPullSnapshotter); ok {
+		if _, storeOK := e.Store.(storage.LinearIssueSnapshotStore); !storeOK {
+			// Lead with the interface name (durable anchor — survives
+			// the bead system's archival cycle). Bead reference is the
+			// secondary historical anchor.
+			return fmt.Errorf(
+				"storage backend does not implement storage.LinearIssueSnapshotStore "+
+					"required by tracker %q (PostPullSnapshotter capability); "+
+					"field-scoped conflict resolution cannot operate safely "+
+					"(historical context: bd-ajn, bd-3p8)",
+				e.Tracker.DisplayName())
+		}
+	}
+	if _, ok := e.Tracker.(ProjectPuller); ok {
+		if _, storeOK := e.Store.(storage.LinearProjectSnapshotStore); !storeOK {
+			return fmt.Errorf(
+				"storage backend does not implement storage.LinearProjectSnapshotStore "+
+					"required by tracker %q (ProjectPuller capability); "+
+					"pull-side Project materialization cannot operate safely "+
+					"(historical context: bd-6cl, bd-3p8)",
+				e.Tracker.DisplayName())
+		}
+	}
+	return nil
+}
+
+// pulledIssueProjectID extracts the Linear Project UUID from a
+// TrackerIssue's Metadata map (set by bd-ajn round-1 wiring in
+// linearToTrackerIssue). Returns "" when the issue has no
+// projectId or the value isn't a string. bd-6cl uses this in the
+// per-Issue pull loop to decide whether to wire a parent-child
+// dep to the materialized local epic.
+func pulledIssueProjectID(ti TrackerIssue) string {
+	if ti.Metadata == nil {
+		return ""
+	}
+	if v, ok := ti.Metadata["project_id"]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// ensureParentChildDep adds a parent-child dependency from childID
+// to parentID, idempotently. Skips when the dep already exists
+// (per bead store semantics: AddDependency returns an error on
+// duplicate, which we treat as success). bd-6cl's pull-side
+// descendant wiring calls this for each just-pulled Issue whose
+// Linear projectId matches a materialized local epic.
+func (e *Engine) ensureParentChildDep(ctx context.Context, childID, parentID string) error {
+	// Pre-check: skip the AddDependency call when the dep is
+	// already present locally. Avoids generating an event row +
+	// hides the storage-layer "duplicate dependency" error.
+	existing, err := e.Store.GetDependenciesWithMetadata(ctx, childID)
+	if err != nil {
+		return fmt.Errorf("get dependencies for %s: %w", childID, err)
+	}
+	for _, d := range existing {
+		if d == nil {
+			continue
+		}
+		if d.Issue.ID == parentID && d.DependencyType == types.DepParentChild {
+			return nil // already wired
+		}
+	}
+	dep := &types.Dependency{
+		IssueID:     childID,
+		DependsOnID: parentID,
+		Type:        types.DepParentChild,
+	}
+	return e.Store.AddDependency(ctx, dep, e.Actor)
 }
 
 // buildDescendantSet returns the set of issue IDs consisting of the given parent
@@ -1252,6 +1788,20 @@ func (e *Engine) shouldPushIssue(issue *types.Issue, opts SyncOptions) bool {
 			if label == ex {
 				return false
 			}
+		}
+	}
+
+	// ExcludeIDPrefix: case-sensitive prefix match on the bead ID. Filters
+	// workflow-artifact beads (e.g. "hw-mol-foo") from external sync without
+	// requiring them to share a type or label.
+	if opts.ExcludeIDPrefix != "" && strings.HasPrefix(issue.ID, opts.ExcludeIDPrefix) {
+		return false
+	}
+	// ExcludeIDPatterns: case-sensitive substring match anywhere in the ID.
+	// Union with ExcludeIDPrefix — matching either rule excludes the issue.
+	for _, p := range opts.ExcludeIDPatterns {
+		if p != "" && strings.Contains(issue.ID, p) {
+			return false
 		}
 	}
 

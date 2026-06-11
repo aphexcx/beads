@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/steveyegge/beads/internal/idgen"
 	"github.com/steveyegge/beads/internal/types"
@@ -1213,4 +1214,85 @@ func MapEpicToProjectState(status types.Status) string {
 	default:
 		return "planned"
 	}
+}
+
+// ProjectStateMapping is the result of MapProjectStateToBeads: a
+// bead status plus optional close_reason for terminal states. The
+// pair is returned together because Linear's "canceled" state
+// implies close_reason="canceled" (matching bd-go9's convention for
+// the legacy migration), while "completed" maps to plain closed.
+type ProjectStateMapping struct {
+	Status      types.Status
+	CloseReason string // empty unless mapping a "canceled" Project
+}
+
+// MapProjectStateToBeads is the reverse of MapEpicToProjectState:
+// translates a Linear Project state string into the bead-side
+// status (and close_reason for terminal states). bd-6cl uses this
+// on the pull side when materializing a Project as a local epic.
+//
+// Mapping:
+//   - "completed" → closed, no close_reason (done by design)
+//   - "canceled"  → closed, close_reason="canceled" (matches
+//     bd-go9's retire-by-cancel convention)
+//   - "started"   → in_progress
+//   - "planned" / "paused" / unknown → open
+//
+// Caller (Q1 — pull-side close-state preservation) is responsible
+// for refusing to apply a "this would reopen the bead" mapping
+// when the bead is already closed locally. This function is a
+// pure translator with no policy.
+func MapProjectStateToBeads(projectState string) ProjectStateMapping {
+	switch projectState {
+	case "completed":
+		return ProjectStateMapping{Status: types.StatusClosed}
+	case "canceled":
+		return ProjectStateMapping{Status: types.StatusClosed, CloseReason: "canceled"}
+	case "started":
+		return ProjectStateMapping{Status: types.StatusInProgress}
+	default:
+		// planned, paused, anything unrecognized
+		return ProjectStateMapping{Status: types.StatusOpen}
+	}
+}
+
+// LinearProjectDescriptionMaxChars is the hard upper bound Linear enforces
+// on ProjectCreateInput.description / ProjectUpdateInput.description.
+// Exceeding this returns "Argument Validation Error" from the GraphQL
+// endpoint with "description must be shorter than or equal to 255
+// characters." Linear's content field has no such limit — for long bead
+// descriptions, callers should truncate description for the summary and
+// pass the full text via the content field.
+const LinearProjectDescriptionMaxChars = 255
+
+// TruncateLinearProjectDescription returns a copy of s that fits within
+// Linear's ProjectCreate/UpdateInput.description 255-char ceiling.
+//
+// Counts characters (runes), not bytes — Linear's limit is character-
+// based, and a byte-based cut could break a multi-byte UTF-8 sequence
+// and produce invalid output.
+//
+// When truncation is needed: prefers cutting at a word boundary (space
+// or newline) within the last 30 runes of the budget. Appends a "…"
+// marker so readers know the text was truncated. The marker counts
+// against the 255-char ceiling.
+//
+// Returns (cut, wasTruncated). wasTruncated lets callers conditionally
+// stash the full text in Project.content.
+func TruncateLinearProjectDescription(s string) (string, bool) {
+	const marker = "…"
+	if utf8.RuneCountInString(s) <= LinearProjectDescriptionMaxChars {
+		return s, false
+	}
+	runes := []rune(s)
+	// Budget: ceiling minus marker (1 rune).
+	maxBefore := LinearProjectDescriptionMaxChars - utf8.RuneCountInString(marker)
+	// Look for a clean word boundary in the last 30 runes of the budget.
+	const searchWindow = 30
+	for i := maxBefore; i > maxBefore-searchWindow && i > 0; i-- {
+		if runes[i] == ' ' || runes[i] == '\n' {
+			return string(runes[:i]) + marker, true
+		}
+	}
+	return string(runes[:maxBefore]) + marker, true
 }
