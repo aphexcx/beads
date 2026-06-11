@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -463,6 +464,14 @@ func TestDepAddFlagAliases(t *testing.T) {
 	if !strings.Contains(longDesc, "--depends-on") {
 		t.Error("Expected Long description to mention --depends-on flag")
 	}
+	if fileFlag := depAddCmd.Flags().Lookup("file"); fileFlag == nil {
+		t.Fatal("depAddCmd should have --file flag")
+	} else if fileFlag.DefValue != "" {
+		t.Errorf("Expected default file='', got %q", fileFlag.DefValue)
+	}
+	if !strings.Contains(longDesc, "--file") {
+		t.Error("Expected Long description to mention --file flag")
+	}
 }
 
 func TestDepBlocksFlag(t *testing.T) {
@@ -906,6 +915,59 @@ func TestFormatTreeNode(t *testing.T) {
 	})
 }
 
+func TestFormatTreeNodeShowsDependencyType(t *testing.T) {
+	tests := []struct {
+		name string
+		node *types.TreeNode
+		want string
+	}{
+		{
+			name: "blocks edge",
+			node: &types.TreeNode{
+				Issue:          types.Issue{ID: "BD-2", Title: "Blocked task", Status: types.StatusOpen, Priority: 1},
+				Depth:          1,
+				ParentID:       "BD-1",
+				EdgeFromParent: types.DepBlocks,
+			},
+			want: "[blocks]",
+		},
+		{
+			name: "parent-child edge",
+			node: &types.TreeNode{
+				Issue:          types.Issue{ID: "BD-3", Title: "Child task", Status: types.StatusOpen, Priority: 2},
+				Depth:          1,
+				ParentID:       "BD-1",
+				EdgeFromParent: types.DepParentChild,
+			},
+			want: "[parent-child]",
+		},
+		{
+			name: "root has no edge label",
+			node: &types.TreeNode{
+				Issue:          types.Issue{ID: "BD-1", Title: "Root", Status: types.StatusOpen, Priority: 0},
+				Depth:          0,
+				EdgeFromParent: types.DepBlocks,
+			},
+			want: "[blocks]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatTreeNode(tt.node, false)
+			if tt.node.Depth == 0 {
+				if strings.Contains(got, tt.want) {
+					t.Fatalf("root node should not show dependency label %q: %s", tt.want, got)
+				}
+				return
+			}
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("formatTreeNode() = %q, want dependency label %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRenderTreeOutput(t *testing.T) {
 	// Test tree with proper connectors
 	tree := []*types.TreeNode{
@@ -955,6 +1017,73 @@ func TestRenderTreeOutput(t *testing.T) {
 		if !strings.Contains(output, node.ID) {
 			t.Errorf("Expected node %s in output, got:\n%s", node.ID, output)
 		}
+	}
+}
+
+func TestRenderTreeOutputShowsDependencyTypeLabelsInMixedGraph(t *testing.T) {
+	downTree := []*types.TreeNode{
+		{
+			Issue:    types.Issue{ID: "BD-root", Title: "Root", Status: types.StatusOpen, Priority: 1},
+			Depth:    0,
+			ParentID: "",
+		},
+		{
+			Issue:          types.Issue{ID: "BD-child", Title: "Child", Status: types.StatusOpen, Priority: 2},
+			Depth:          1,
+			ParentID:       "BD-root",
+			EdgeFromParent: types.DepParentChild,
+		},
+	}
+	upTree := []*types.TreeNode{
+		{
+			Issue:    types.Issue{ID: "BD-root", Title: "Root", Status: types.StatusOpen, Priority: 1},
+			Depth:    0,
+			ParentID: "",
+		},
+		{
+			Issue:          types.Issue{ID: "BD-dependent", Title: "Dependent", Status: types.StatusOpen, Priority: 3},
+			Depth:          1,
+			ParentID:       "BD-root",
+			EdgeFromParent: types.DepBlocks,
+		},
+	}
+	tree := mergeBidirectionalTrees(downTree, upTree, "BD-root")
+
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	renderTree(tree, 3, "both")
+
+	w.Close()
+	os.Stdout = old
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	for _, want := range []string{"BD-dependent", "[blocks]", "BD-child", "[parent-child]"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected mixed graph output to contain %q, got:\n%s", want, output)
+		}
+	}
+}
+
+func TestTreeNodeJSONIncludesEdgeFromParent(t *testing.T) {
+	node := types.TreeNode{
+		Issue:          types.Issue{ID: "BD-child", Title: "Child", Status: types.StatusOpen, Priority: 2},
+		Depth:          1,
+		ParentID:       "BD-root",
+		EdgeFromParent: types.DepParentChild,
+	}
+
+	got, err := json.Marshal(node)
+	if err != nil {
+		t.Fatalf("json.Marshal(TreeNode): %v", err)
+	}
+
+	if !strings.Contains(string(got), `"edge_from_parent":"parent-child"`) {
+		t.Fatalf("TreeNode JSON missing edge_from_parent: %s", got)
 	}
 }
 

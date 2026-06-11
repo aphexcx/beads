@@ -25,6 +25,20 @@ A beads release involves multiple distribution channels:
 3. **PyPI** - Python MCP server (`beads-mcp`)
 4. **npm** - Node.js package for Claude Code for Web (`@beads/bd`)
 
+### The Easy Way (Recommended)
+
+For routine releases, use the fully automated release script:
+
+```bash
+./scripts/release.sh 0.22.0
+```
+
+This handles version bump, tests, git tag, Homebrew update, and local
+installation in one shot. See [scripts/README.md](scripts/README.md#releasesh--the-easy-button)
+for details. The rest of this document is the manual / step-by-step process,
+useful for understanding what `release.sh` does and for handling edge cases
+(hotfixes, rollbacks, manual PyPI/npm publishes).
+
 ## Prerequisites
 
 ### Required Tools
@@ -38,6 +52,9 @@ A beads release involves multiple distribution channels:
 ### Required Access
 
 - GitHub: Write access to repository and ability to create releases
+- GitHub: Ability to create protected `v*` release tags. The repository should
+  restrict `refs/tags/v*` creation, updates, and deletion to trusted release
+  maintainers.
 - PyPI: Maintainer access to `beads-mcp` package
 - npm: Member of `@beads` organization
 
@@ -136,8 +153,9 @@ This updates:
 - `cmd/bd/version.go` - CLI version constant
 - `integrations/beads-mcp/pyproject.toml` - MCP server version
 - `integrations/beads-mcp/src/beads_mcp/__init__.py` - MCP Python version
-- `claude-plugin/.claude-plugin/plugin.json` - Plugin version
-- `.claude-plugin/marketplace.json` - Marketplace version
+- `plugins/beads/.claude-plugin/plugin.json` - Claude plugin version
+- `plugins/beads/.codex-plugin/plugin.json` - Codex plugin version
+- `.claude-plugin/marketplace.json` - Claude marketplace version
 - `npm-package/package.json` - npm package version
 - `cmd/bd/templates/hooks/*` - Git hook versions
 - `README.md` - Documentation version
@@ -150,6 +168,18 @@ The `--commit --tag --push` flags will:
 3. Push both commit and tag to origin
 
 This triggers GitHub Actions to build release artifacts automatically.
+
+The tag workflow re-runs release-critical package gates before publishing:
+
+- `make ci-package-mcp` builds and validates the MCP package, then the PyPI job
+  publishes the validated `dist/*` artifact from that gate.
+- `make ci-package-npm` validates the npm wrapper package before npm publish.
+- `make ci-website` validates the release docs/website build before GoReleaser
+  publishes GitHub release assets.
+
+The npm publish job also waits for the macOS release assets, because the npm
+`postinstall` script downloads platform-specific archives from the GitHub
+release.
 
 **Recommended workflow:**
 
@@ -164,6 +194,10 @@ git tag -a v0.22.0 -m "Release v0.22.0"
 git push origin main
 git push origin v0.22.0
 ```
+
+The release workflow is intentionally gated to `refs/tags/v*`. A manual
+workflow dispatch from a branch will skip publishing jobs; manual reruns must
+select the release tag.
 
 **Alternative (step-by-step):**
 
@@ -303,24 +337,46 @@ pip install beads-mcp==0.22.0
 python -m beads_mcp --version
 ```
 
-## 5. Claude Code Marketplace Update
+## 5. Plugin Marketplace Update
 
-Update the Claude Code marketplace metadata files:
+Update the plugin marketplace metadata files:
 
 ```bash
 # Update .claude-plugin/marketplace.json
 # Change version to match current release
 vim .claude-plugin/marketplace.json
 
-# Update claude-plugin/.claude-plugin/plugin.json if needed
-vim claude-plugin/.claude-plugin/plugin.json
+# Update plugins/beads/.claude-plugin/plugin.json if needed
+vim plugins/beads/.claude-plugin/plugin.json
+
+# Update plugins/beads/.codex-plugin/plugin.json if needed
+vim plugins/beads/.codex-plugin/plugin.json
 
 # Commit changes
-git add .claude-plugin/ claude-plugin/.claude-plugin/
-git commit -m "chore: Update Claude Code marketplace to v0.22.0"
+git add .claude-plugin/ plugins/beads/.claude-plugin/ plugins/beads/.codex-plugin/
+git commit -m "chore: Update plugin marketplaces to v0.22.0"
 ```
 
-**Note:** These files define how beads appears in Claude Code's plugin marketplace. Version should match the release version.
+**Note:** These files define how beads appears in Claude Code and Codex plugin marketplaces. Version should match the release version.
+
+### Documentation Site (Docusaurus)
+
+The published docs at GitHub Pages are versioned. Unreleased edits live in
+`website/docs/` (**Next**); each release should add a snapshot:
+
+```bash
+cd website
+npm ci
+npm run docusaurus docs:version X.Y.Z
+```
+
+Then set `lastVersion` in `website/docusaurus.config.ts` to `X.Y.Z` so
+visitors default to the latest stable docs (not **Next**).
+
+Commit `website/versioned_docs/`, `website/versioned_sidebars/`, and
+`website/versions.json` with the release. The
+`scripts/generate-llms-full.sh` script pulls from the latest entry in
+`versions.json` so `llms-full.txt` stays aligned with that snapshot.
 
 ## 6. npm Package Release
 

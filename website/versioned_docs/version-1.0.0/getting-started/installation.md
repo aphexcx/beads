@@ -36,7 +36,15 @@ npm install -g @beads/bd
 
 ### macOS
 
-Homebrew is recommended. Alternatively: `go install github.com/steveyegge/beads/cmd/bd@latest` (requires CGO dependencies - see [Building from source](#building-from-source) below).
+Homebrew is recommended. If you specifically need `go install`, use one of the supported modes below.
+
+```bash
+# Server-mode only
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+
+# Embedded-capable
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
+```
 
 ### Linux
 
@@ -57,18 +65,18 @@ If you see `bd: command not found`, ensure your install location is in PATH. For
 
 ## Building from Source
 
-Building from source or using `go install` requires CGO dependencies:
+Building from source requires Go, git, and a C compiler for embedded Dolt. ICU headers are not required; builds use `gms_pure_go`.
 
 | Platform | Command |
 |----------|---------|
-| macOS | `brew install icu4c zstd` |
-| Debian/Ubuntu | `sudo apt-get install -y libicu-dev libzstd-dev` |
-| Fedora/RHEL | `sudo dnf install -y libicu-devel libzstd-devel` |
+| macOS | `brew install zstd` |
+| Debian/Ubuntu | `sudo apt-get install -y libzstd-dev` |
+| Fedora/RHEL | `sudo dnf install -y libzstd-devel` |
 
 ```bash
 git clone https://github.com/gastownhall/beads
 cd beads
-go build -o bd ./cmd/bd
+make build
 ```
 
 See [CONTRIBUTING.md](https://github.com/gastownhall/beads/blob/main/CONTRIBUTING.md) for full developer setup.
@@ -77,5 +85,7 @@ See [CONTRIBUTING.md](https://github.com/gastownhall/beads/blob/main/CONTRIBUTIN
 
 1. **Initialize a project**: `cd your-project && bd init`
 2. **Learn the basics**: [Quick Start](/getting-started/quickstart)
-3. **Configure your editor**: [IDE Setup](/getting-started/ide-setup)
+3. **Configure your agent**: `bd init` creates or updates `AGENTS.md` by default; run `bd setup --list` for integrations like `bd setup codex`, `bd setup factory`, `bd setup claude`, and `bd setup mux`
 4. **Upgrading later**: [Upgrading](/getting-started/upgrading)
+
+Use `bd onboard` only as the manual snippet fallback for unsupported agents, custom instruction files, or existing projects where you cannot rerun `bd init`/`bd setup`.

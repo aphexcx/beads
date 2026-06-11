@@ -30,8 +30,7 @@
           }
         );
     in rec {
-      icu = nixpkgs.icu77;
-      packages = forAllSystems (args: import ./packages.nix (args // { inherit icu; }));
+      packages = forAllSystems (args: import ./packages.nix args);
 
       apps = forAllSystems (
         { self, system, ... }:
@@ -49,7 +48,7 @@
         {
           default = pkgs.mkShell {
             buildInputs = with pkgs; [
-              go
+              go_1_26
               git
               gopls
               gotools

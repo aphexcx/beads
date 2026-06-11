@@ -199,6 +199,46 @@ func TestCheckBeadGate_TargetClosed(t *testing.T) {
 	t.Skip("SQLite-specific: created SQLite DB directly; full integration testing requires routes.jsonl + Dolt rig infrastructure")
 }
 
+func TestCheckGHPRUsesStateWithoutMergedField(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake gh shell script uses POSIX sh")
+	}
+
+	binDir := t.TempDir()
+	fakeGH := filepath.Join(binDir, "gh")
+	script := `#!/bin/sh
+case "$*" in
+  *merged*)
+    echo "unexpected merged field" >&2
+    exit 9
+    ;;
+esac
+printf '{"state":"MERGED","title":"Fix gate"}'
+`
+	if err := os.WriteFile(fakeGH, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	resolved, escalated, reason, err := checkGHPR(&types.Issue{
+		IssueType: "gate",
+		AwaitType: "gh:pr",
+		AwaitID:   "3488",
+	})
+	if err != nil {
+		t.Fatalf("checkGHPR returned error: %v", err)
+	}
+	if !resolved {
+		t.Fatal("expected merged PR to resolve")
+	}
+	if escalated {
+		t.Fatal("did not expect merged PR to escalate")
+	}
+	if !gateTestContains(reason, "was merged") {
+		t.Fatalf("reason = %q, want merged message", reason)
+	}
+}
+
 func TestIsNumericID(t *testing.T) {
 	tests := []struct {
 		input string
@@ -645,6 +685,96 @@ func TestWorkflowNameMatches(t *testing.T) {
 					tt.hint, tt.workflowName, tt.runName, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCheckGHPR_StateHandling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX-sh fake binary; skipping on Windows")
+	}
+
+	tests := []struct {
+		name           string
+		ghJSON         string
+		wantResolved   bool
+		wantEscalated  bool
+		reasonContains string
+	}{
+		{
+			name:           "MERGED resolves gate",
+			ghJSON:         `{"state":"MERGED","title":"Add feature X"}`,
+			wantResolved:   true,
+			wantEscalated:  false,
+			reasonContains: "was merged",
+		},
+		{
+			name:           "CLOSED escalates without merge",
+			ghJSON:         `{"state":"CLOSED","title":"Stale PR"}`,
+			wantResolved:   false,
+			wantEscalated:  true,
+			reasonContains: "closed without merging",
+		},
+		{
+			name:           "OPEN leaves gate pending",
+			ghJSON:         `{"state":"OPEN","title":"WIP"}`,
+			wantResolved:   false,
+			wantEscalated:  false,
+			reasonContains: "still open",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			installFakeGHScript(t, tt.ghJSON)
+			gate := &types.Issue{AwaitID: "https://github.com/org/repo/pull/1"}
+			resolved, escalated, reason, err := checkGHPR(gate)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if resolved != tt.wantResolved {
+				t.Errorf("resolved = %v, want %v", resolved, tt.wantResolved)
+			}
+			if escalated != tt.wantEscalated {
+				t.Errorf("escalated = %v, want %v", escalated, tt.wantEscalated)
+			}
+			if !gateTestContainsIgnoreCase(reason, tt.reasonContains) {
+				t.Errorf("reason %q does not contain %q", reason, tt.reasonContains)
+			}
+		})
+	}
+}
+
+func TestCheckGHPR_NoMergedFieldRequested(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX-sh fake binary; skipping on Windows")
+	}
+
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "gh")
+	// Fake gh that fails if "merged" appears anywhere in args
+	script := `#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in
+    *merged*) echo "ERROR: 'merged' field must not be requested" >&2; exit 1;;
+  esac
+done
+echo '{"state":"MERGED","title":"Test PR"}'
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	gate := &types.Issue{AwaitID: "https://github.com/org/repo/pull/99"}
+	resolved, _, reason, err := checkGHPR(gate)
+	if err != nil {
+		t.Fatalf("checkGHPR failed (likely requested 'merged' field): %v", err)
+	}
+	if !resolved {
+		t.Errorf("expected resolved=true for MERGED state")
+	}
+	if !gateTestContainsIgnoreCase(reason, "was merged") {
+		t.Errorf("reason %q should contain 'was merged'", reason)
 	}
 }
 

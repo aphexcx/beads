@@ -66,7 +66,7 @@ Examples:
 			}
 
 			cutoffDays := gcOlderThan
-			cutoffTime := time.Now().AddDate(0, 0, -cutoffDays)
+			cutoffTime := time.Now().UTC().AddDate(0, 0, -cutoffDays)
 			statusClosed := types.StatusClosed
 			filter := types.IssueFilter{
 				Status:       &statusClosed,
@@ -78,14 +78,9 @@ Examples:
 				FatalError("searching closed issues: %v", err)
 			}
 
-			// Filter out pinned issues
-			filtered := make([]*types.Issue, 0, len(closedIssues))
-			for _, issue := range closedIssues {
-				if !issue.Pinned {
-					filtered = append(filtered, issue)
-				}
-			}
-			closedIssues = filtered
+			var stats closedDeletionCandidateStats
+			closedIssues, stats = filterClosedDeletionCandidates(closedIssues, &cutoffTime)
+			warnClosedDeletionSafetySkips(stats)
 
 			if len(closedIssues) == 0 {
 				detail := fmt.Sprintf("  No closed issues older than %d days", cutoffDays)
@@ -122,11 +117,8 @@ Examples:
 					}
 					results = append(results, phaseResult{name: "Decay", detail: fmt.Sprintf("%d issues deleted", deleted)})
 
-					// Embedded mode: flush Dolt commit after deletes.
-					if isEmbeddedMode() && deleted > 0 && store != nil {
-						if _, err := store.CommitPending(ctx, actor); err != nil {
-							WarnError("failed to commit after decay: %v", err)
-						}
+					if deleted > 0 {
+						commandDidWrite.Store(true)
 					}
 				}
 			}

@@ -8,7 +8,7 @@ This document contains detailed operational instructions for AI agents working o
 
 ### Code Standards
 
-- **Go version**: 1.24+
+- **Go version**: see `go.mod` for the required version (currently 1.26+)
 - **Linting**: `golangci-lint run ./...` (baseline warnings documented in [docs/LINTING.md](docs/LINTING.md))
 - **Testing**: All new features need tests (`make test` for the normal local/CI path, `make test-icu-path` only when intentionally exercising the opt-in ICU regex path)
 - **Documentation**: Update relevant .md files
@@ -63,6 +63,12 @@ into temp repos and produce flaky test behavior.
 
 **Warning:** bd will warn you when creating issues with "Test" prefix in the production database. Always use `BEADS_DB` for manual testing.
 
+**Tmpfs hosts:** the `cmd/bd` test suite creates an isolated `$HOME` and several
+test binaries under `$TMPDIR`. They are normally cleaned by the test process,
+but a SIGKILLed or OOMed run can leave orphans behind. On hosts where `/tmp`
+is tmpfs (e.g. Fedora Atomic / Bluefin), run `make clean-test-tmp` between
+test runs if `du -sh /tmp/beads-* /tmp/bd-*` shows accumulation. See bd-3q2u.
+
 ### Before Committing
 
 1. **Run tests**: `make test` (or `./scripts/test.sh`)
@@ -86,14 +92,14 @@ This enables `bd doctor` to detect **orphaned issues** - work that was committed
 
 bd uses **Dolt** as its primary database. Changes are committed to Dolt history automatically (one Dolt commit per write command).
 
-**Install git hooks** for automatic sync:
+**Install git hooks** for commit integration and legacy fallback behavior:
 ```bash
 bd hooks install
 ```
 
 ### Git Integration
 
-**Dolt sync**: Dolt handles sync natively via `bd dolt push` / `bd dolt pull`. No JSONL export/import needed.
+**Dolt sync**: Dolt handles sync natively via `bd dolt push` / `bd dolt pull`. No export/import round-trip needed for normal sync.
 
 **Protected branches**: Dolt stores data under `refs/dolt/data`, separate from standard Git refs. See [docs/PROTECTED_BRANCHES.md](docs/PROTECTED_BRANCHES.md).
 
@@ -113,9 +119,25 @@ defer to the standard PR flow to keep changes reviewable.
 - When handling external contributor PRs, use fix-merge: checkout the PR
   branch locally, fix/rebase onto main, merge via PR, then close the PR
 
+### Maintainer PR Guidelines
+
+Before triaging, reviewing, landing, closing, or otherwise maintaining PRs,
+read [PR_MAINTAINER_GUIDELINES.md](PR_MAINTAINER_GUIDELINES.md). The
+maintainer policy is to maximize community throughput: find useful contributor
+value, absorb or transform it locally when practical, preserve attribution, and
+use request-changes only as a last resort.
+
 ### External Contributor PRs: Check Before You Build
 
 **Read [CONTRIBUTING.md](CONTRIBUTING.md)** — it contains promises we've made to contributors. Violating them damages trust and community.
+
+Run the read-only preflight before implementing related work, opening a PR, or
+merging/closing a PR:
+
+```bash
+scripts/pr-preflight.sh --search "<topic keywords>" --repo gastownhall/beads
+scripts/pr-preflight.sh <pr-number> --repo gastownhall/beads
+```
 
 **Before implementing any feature or fix, check for existing open PRs on the same topic:**
 
@@ -132,7 +154,8 @@ gh pr list --repo gastownhall/beads --state open --search "<topic keywords>" --j
 
 If you must rewrite (e.g., fundamentally different approach needed), explain why on the original PR and credit the contributor's design/tests in your commits.
 
-This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked.
+Do not rely on auto-discovery of CONTRIBUTING.md; the preflight is the agent
+gate for PR handling.
 
 ## Landing the Plane
 
@@ -142,7 +165,7 @@ This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked
 
 1. **File beads issues for any remaining work** that needs follow-up
 2. **Ensure all quality gates pass** (only if code changes were made):
-   - Run `make lint` or `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
+   - Run `golangci-lint run ./...` (if pre-commit installed: `pre-commit run --all-files`)
    - Run `make test` (and `make test-icu-path` only if you intentionally need the ICU regex path)
    - File P0 issues if quality gates are broken
 3. **Update beads issues** - close finished work, update status
@@ -185,7 +208,7 @@ This is enforced by pre-use hooks. If you try `gh pr create`, it will be blocked
 bd create "Add integration tests for sync" -t task -p 2 --json
 
 # 2. Run quality gates (only if code changes were made)
-go test -short ./...
+make test
 golangci-lint run ./...
 
 # 3. Close finished issues
@@ -229,6 +252,28 @@ bd update <id> --notes "additional notes"
 bd update <id> --acceptance "acceptance criteria"
 ```
 
+**Read execution metadata before prose.** When enacting a bd issue, inspect the
+structured metadata before using description or notes to choose execution mode,
+delegation, model, reasoning level, or parallel group:
+
+```bash
+bd show <id> --json | jq '.[0] | {id,title,metadata,description,notes}'
+```
+
+The execution metadata keys are:
+
+- `execution_agent_type`
+- `execution_suggested_model`
+- `execution_reasoning_effort`
+- `execution_mode`
+- `execution_parallel_group`
+
+When these keys are present, treat them as the authoritative execution hints.
+Use `description` for the work scope and `notes` for rationale or fallback
+context. Parent/orchestrator agents must read these fields before spawning
+subagents because a running subagent cannot change its model or reasoning effort
+after launch.
+
 **Use stdin for descriptions with special characters** (backticks, `!`, nested quotes):
 ```bash
 # Pipe via stdin to avoid shell escaping issues
@@ -257,11 +302,102 @@ bd dolt push
 This installs:
 
 - **pre-commit** — Commits pending Dolt changes
-- **post-merge** — Pulls remote Dolt changes after git merge
+- **post-merge** — Runs chained hooks and a legacy JSONL import fallback only when no Dolt remote is configured
 
 **Note:** Hooks are embedded in the bd binary and work for all bd users (not just source repo users).
 
 ## Common Development Tasks
+
+### Visual Design System
+
+When adding CLI output features, follow these design principles for consistent,
+cognitively friendly visuals.
+
+#### No Emoji-Style Icons
+
+Do not use large colored emoji icons like red/orange/yellow/blue/white circles
+for priorities or status. They cause cognitive overload and break visual
+consistency.
+
+Use small Unicode symbols with semantic colors applied via lipgloss:
+
+- Status: `○ ◐ ● ✓ ❄`
+- Priority: `●` (filled circle with color)
+
+#### Status Icons
+
+Use these symbols consistently across all commands:
+
+```text
+○ open        - Available to work (white/default)
+◐ in_progress - Currently being worked (yellow)
+● blocked     - Waiting on dependencies (red)
+✓ closed      - Completed (muted gray)
+❄ deferred    - Scheduled for later (blue/muted)
+```
+
+#### Priority Icons and Colors
+
+Format priority as `● P0` (filled circle icon plus label, colored by priority):
+
+- `● P0`: Red + bold (critical)
+- `● P1`: Orange (high)
+- `● P2-P4`: Default text (normal)
+
+#### Issue Type Colors
+
+- `bug`: Red (problems need attention)
+- `epic`: Purple (larger scope)
+- Others: Default text
+
+#### Design Principles
+
+1. Small Unicode symbols only; avoid emoji blobs.
+2. Semantic colors only for actionable items; do not color everything.
+3. Closed items fade using muted gray.
+4. Prefer icons over text labels for scanability.
+5. Keep icons consistent across list, graph, show, and related commands.
+6. Use tree connectors (`├──`, `└──`, `│`) for hierarchies.
+7. Reduce cognitive noise; do not show `needs:1` when it is just the parent epic.
+
+#### Semantic Styles
+
+Use exported styles from `internal/ui/styles.go`:
+
+```go
+// Status styles
+ui.StatusInProgressStyle  // Yellow - active work
+ui.StatusBlockedStyle     // Red - needs attention
+ui.StatusClosedStyle      // Muted gray - done
+
+// Priority styles
+ui.PriorityP0Style        // Red + bold
+ui.PriorityP1Style        // Orange
+
+// Type styles
+ui.TypeBugStyle           // Red
+ui.TypeEpicStyle          // Purple
+
+// General styles
+ui.PassStyle, ui.WarnStyle, ui.FailStyle
+ui.MutedStyle, ui.AccentStyle
+ui.RenderMuted(text), ui.RenderAccent(text)
+```
+
+Example:
+
+```go
+switch issue.Status {
+case types.StatusOpen:
+    icon = "○"
+case types.StatusInProgress:
+    icon = ui.StatusInProgressStyle.Render("◐")
+case types.StatusBlocked:
+    icon = ui.StatusBlockedStyle.Render("●")
+case types.StatusClosed:
+    icon = ui.StatusClosedStyle.Render("✓")
+}
+```
 
 ### CLI Design Principles
 
@@ -317,7 +453,7 @@ make test
 make test-icu-path
 
 # Coverage run
-go test -coverprofile=coverage.out ./...
+go test -tags gms_pure_go -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
 # Verify installed binary
@@ -370,8 +506,9 @@ git push origin main
 **Files updated automatically:**
 
 - `cmd/bd/version.go` - CLI version
-- `claude-plugin/.claude-plugin/plugin.json` - Plugin version
-- `.claude-plugin/marketplace.json` - Marketplace version
+- `plugins/beads/.claude-plugin/plugin.json` - Claude plugin version
+- `plugins/beads/.codex-plugin/plugin.json` - Codex plugin version
+- `.claude-plugin/marketplace.json` - Claude marketplace version
 - `integrations/beads-mcp/pyproject.toml` - MCP server version
 - `README.md` - Documentation version
 - `PLUGIN.md` - Version requirements
@@ -401,7 +538,7 @@ This handles the entire release workflow automatically, including waiting ~5 min
 6. Update Homebrew: `./scripts/update-homebrew.sh <version>` (waits for GitHub Actions)
 7. Verify: `brew update && brew upgrade beads && bd version`
 
-See [docs/RELEASING.md](docs/RELEASING.md) for complete manual instructions.
+See [RELEASING.md](RELEASING.md) for complete manual instructions.
 
 ## Checking GitHub Issues and PRs
 
@@ -440,13 +577,12 @@ gh issue view 201
 
 - Check existing issues: `bd list`
 - Look at recent commits: `git log --oneline -20`
-- Read the docs: README.md, ADVANCED.md, EXTENDING.md
+- Read the docs: README.md, ADVANCED.md, docs/CONFIG.md
 - Create an issue if unsure: `bd create "Question: ..." -t task -p 2`
 
 ## Important Files
 
 - **README.md** - Main documentation (keep this updated!)
-- **EXTENDING.md** - Database extension guide
 - **ADVANCED.md** - Advanced features (rename, merge, compaction)
 - **CONTRIBUTING.md** - Contribution guidelines
 - **SECURITY.md** - Security policy

@@ -417,3 +417,237 @@ func TestFindBeadsDir_WorktreeNoDatabaseAnywhereFallsBackToLocal(t *testing.T) {
 			result, worktreeBeadsDir)
 	}
 }
+
+// TestFindDatabasePath_WorktreeServerModeSharesMainRepo verifies that
+// FindDatabasePath in a worktree with inherited server-mode metadata.json
+// resolves to the main repo's .beads/dolt — NOT the worktree's metadata-only
+// .beads/dolt. Without this, each worktree spawns its own dolt sql-server
+// against an empty data directory, fails to find the project database, and
+// leaves orphaned server processes.
+//
+// Regression test for the "worktree server mode duplicate server" bug.
+func TestFindDatabasePath_WorktreeServerModeSharesMainRepo(t *testing.T) {
+	originalEnvDir := os.Getenv("BEADS_DIR")
+	originalEnvDB := os.Getenv("BEADS_DB")
+	defer func() {
+		if originalEnvDir != "" {
+			os.Setenv("BEADS_DIR", originalEnvDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		if originalEnvDB != "" {
+			os.Setenv("BEADS_DB", originalEnvDB)
+		} else {
+			os.Unsetenv("BEADS_DB")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+	os.Unsetenv("BEADS_DB")
+
+	tmpDir, err := os.MkdirTemp("", "beads-worktree-server-mode-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+		}
+	}
+
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	runGit(mainRepoDir, "config", "user.email", "test@example.com")
+	runGit(mainRepoDir, "config", "user.name", "Test User")
+
+	// Simulate a server-mode beads install: metadata.json has dolt_mode=server,
+	// and the main repo has a dolt/ data directory (created by bd init --server).
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(mainBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mainDoltDir := filepath.Join(mainBeadsDir, "dolt")
+	if err := os.MkdirAll(mainDoltDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustWrite := func(path, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Server-mode metadata — the key trigger for the bug.
+	mustWrite(filepath.Join(mainBeadsDir, "metadata.json"),
+		`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"test_project","project_id":"aaaa-bbbb"}`)
+	mustWrite(filepath.Join(mainBeadsDir, "config.yaml"), "issue-prefix: \"tp\"\n")
+	// .gitignore excludes the dolt data dir (as real projects do)
+	mustWrite(filepath.Join(mainBeadsDir, ".gitignore"), "dolt/\nembeddeddolt/\n*.db\ndolt-server.*\n")
+
+	mustWrite(filepath.Join(mainRepoDir, "README.md"), "# Test\n")
+	runGit(mainRepoDir, "add", "README.md", ".beads/metadata.json", ".beads/config.yaml", ".beads/.gitignore")
+	runGit(mainRepoDir, "commit", "-m", "initial with server-mode beads")
+
+	// Create a worktree — git checks out the tracked .beads/ files
+	// (metadata.json, config.yaml, .gitignore) but NOT the gitignored dolt/ dir.
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	runGit(mainRepoDir, "worktree", "add", worktreeDir, "HEAD")
+	defer func() {
+		cmd := exec.Command("git", "worktree", "remove", "--force", worktreeDir)
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}()
+
+	// Sanity checks: worktree has metadata but no dolt/ dir.
+	worktreeBeadsDir := filepath.Join(worktreeDir, ".beads")
+	if _, err := os.Stat(filepath.Join(worktreeBeadsDir, "metadata.json")); err != nil {
+		t.Fatalf("precondition: worktree should have inherited metadata.json, got: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(worktreeBeadsDir, "dolt")); err == nil {
+		t.Fatalf("precondition: worktree's dolt/ should be gitignored, but it exists")
+	}
+
+	t.Chdir(worktreeDir)
+	git.ResetCaches()
+
+	// FindDatabasePath must resolve to the main repo's dolt dir, not the worktree's.
+	result := FindDatabasePath()
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	mainDoltResolved, _ := filepath.EvalSymlinks(mainDoltDir)
+	worktreeDoltDir := filepath.Join(worktreeBeadsDir, "dolt")
+
+	if resultResolved == worktreeDoltDir {
+		t.Fatalf("FindDatabasePath() returned worktree's .beads/dolt (%q); "+
+			"expected main repo's .beads/dolt (%q). "+
+			"This is the duplicate-server bug: the worktree's inherited "+
+			"server-mode metadata causes a separate dolt server to spawn "+
+			"against an empty data directory.",
+			result, mainDoltDir)
+	}
+	if resultResolved != mainDoltResolved {
+		t.Errorf("FindDatabasePath() = %q, want main repo dolt dir %q", result, mainDoltDir)
+	}
+
+	// Also verify FindBeadsDir resolves to the main repo's .beads.
+	beadsDirResult := FindBeadsDir()
+	beadsDirResolved, _ := filepath.EvalSymlinks(beadsDirResult)
+	mainBeadsDirResolved, _ := filepath.EvalSymlinks(mainBeadsDir)
+	if beadsDirResolved != mainBeadsDirResolved {
+		t.Errorf("FindBeadsDir() = %q, want main repo .beads %q", beadsDirResult, mainBeadsDir)
+	}
+}
+
+// TestFindDatabasePath_WorktreeServerModeFromSubdir is the same scenario as
+// TestFindDatabasePath_WorktreeServerModeSharesMainRepo but with the CWD set
+// to a subdirectory of the worktree rather than the worktree root. This
+// exercises the walk-up and worktree-specific code paths (as opposed to the
+// CWD check which only fires at the worktree root).
+func TestFindDatabasePath_WorktreeServerModeFromSubdir(t *testing.T) {
+	originalEnvDir := os.Getenv("BEADS_DIR")
+	originalEnvDB := os.Getenv("BEADS_DB")
+	defer func() {
+		if originalEnvDir != "" {
+			os.Setenv("BEADS_DIR", originalEnvDir)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+		if originalEnvDB != "" {
+			os.Setenv("BEADS_DB", originalEnvDB)
+		} else {
+			os.Unsetenv("BEADS_DB")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+	os.Unsetenv("BEADS_DB")
+
+	tmpDir, err := os.MkdirTemp("", "beads-worktree-server-subdir-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+		}
+	}
+
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	runGit(mainRepoDir, "config", "user.email", "test@example.com")
+	runGit(mainRepoDir, "config", "user.name", "Test User")
+
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(mainBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mainDoltDir := filepath.Join(mainBeadsDir, "dolt")
+	if err := os.MkdirAll(mainDoltDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	mustWrite := func(path, body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(filepath.Join(mainBeadsDir, "metadata.json"),
+		`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"test_project"}`)
+	mustWrite(filepath.Join(mainBeadsDir, "config.yaml"), "issue-prefix: \"tp\"\n")
+	mustWrite(filepath.Join(mainBeadsDir, ".gitignore"), "dolt/\nembeddeddolt/\n*.db\ndolt-server.*\n")
+
+	mustWrite(filepath.Join(mainRepoDir, "README.md"), "# Test\n")
+	runGit(mainRepoDir, "add", "README.md", ".beads/metadata.json", ".beads/config.yaml", ".beads/.gitignore")
+	runGit(mainRepoDir, "commit", "-m", "initial")
+
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	runGit(mainRepoDir, "worktree", "add", worktreeDir, "HEAD")
+	defer func() {
+		cmd := exec.Command("git", "worktree", "remove", "--force", worktreeDir)
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}()
+
+	// CWD is a subdirectory of the worktree — tests the worktree-specific
+	// code path rather than the CWD check.
+	subDir := filepath.Join(worktreeDir, "src", "pkg")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(subDir)
+	git.ResetCaches()
+
+	result := FindDatabasePath()
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	mainDoltResolved, _ := filepath.EvalSymlinks(mainDoltDir)
+
+	if resultResolved != mainDoltResolved {
+		t.Errorf("FindDatabasePath() from subdir = %q, want main repo dolt dir %q", result, mainDoltDir)
+	}
+}

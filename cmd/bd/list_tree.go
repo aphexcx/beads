@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 // buildIssueTree builds parent-child tree structure from issues
@@ -43,6 +44,15 @@ func buildIssueTreeWithDeps(issues []*types.Issue, allDeps map[string][]*types.D
 				child, childOk := issueMap[issueID]
 				_, parentOk := issueMap[parentID]
 				if !childOk || !parentOk {
+					continue
+				}
+
+				// relates-to is a loose graph link, not a hierarchical edge:
+				// treating it as parent-child causes incorrect nesting and, when
+				// bidirectional, marks both endpoints as children of each other
+				// — collapsing them out of the root set and silently dropping
+				// whole subtrees from `bd list`. See gastownhall/beads#3936.
+				if dep.Type == types.DepRelatesTo {
 					continue
 				}
 
@@ -105,7 +115,7 @@ func compareIssuesByPriority(a, b *types.Issue) int {
 		return result
 	}
 	// Secondary: ID for deterministic order when priorities match
-	return cmp.Compare(a.ID, b.ID)
+	return utils.NaturalCompareIDs(a.ID, b.ID)
 }
 
 // printPrettyTree recursively prints the issue tree

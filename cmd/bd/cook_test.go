@@ -116,6 +116,43 @@ func TestSubstituteFormulaVars(t *testing.T) {
 	}
 }
 
+func TestSubstituteFormulaVars_GateFields(t *testing.T) {
+	f := &formula.Formula{
+		Steps: []*formula.Step{
+			{
+				ID: "wait-for-pr",
+				Gate: &formula.Gate{
+					Type:    "gh:{{kind}}",
+					ID:      "{{legacy_id}}",
+					AwaitID: "{{pr}}",
+					Timeout: "{{timeout}}",
+				},
+			},
+		},
+	}
+
+	substituteFormulaVars(f, map[string]string{
+		"kind":      "pr",
+		"legacy_id": "legacy-42",
+		"pr":        "https://github.com/org/repo/pull/123",
+		"timeout":   "1h",
+	})
+
+	gate := f.Steps[0].Gate
+	if gate.Type != "gh:pr" {
+		t.Errorf("Gate.Type = %q, want gh:pr", gate.Type)
+	}
+	if gate.ID != "legacy-42" {
+		t.Errorf("Gate.ID = %q, want legacy-42", gate.ID)
+	}
+	if gate.AwaitID != "https://github.com/org/repo/pull/123" {
+		t.Errorf("Gate.AwaitID = %q, want expanded PR URL", gate.AwaitID)
+	}
+	if gate.Timeout != "1h" {
+		t.Errorf("Gate.Timeout = %q, want 1h", gate.Timeout)
+	}
+}
+
 // TestSubstituteStepVarsRecursive tests deep nesting works correctly
 func TestSubstituteStepVarsRecursive(t *testing.T) {
 	steps := []*formula.Step{
@@ -206,7 +243,7 @@ func TestCreateGateIssue(t *testing.T) {
 		wantAwaitID   string
 	}{
 		{
-			name: "gh:run gate with ID",
+			name: "gh:run gate with legacy ID",
 			step: &formula.Step{
 				ID:    "await-ci",
 				Title: "Wait for CI",
@@ -220,6 +257,22 @@ func TestCreateGateIssue(t *testing.T) {
 			wantTitle:     "Gate: gh:run release-build",
 			wantAwaitType: "gh:run",
 			wantAwaitID:   "release-build",
+		},
+		{
+			name: "gh:pr gate with await_id",
+			step: &formula.Step{
+				ID:    "await-pr",
+				Title: "Wait for PR",
+				Gate: &formula.Gate{
+					Type:    "gh:pr",
+					AwaitID: "https://github.com/org/repo/pull/123",
+				},
+			},
+			parentID:      "mol-feature",
+			wantID:        "mol-feature.gate-await-pr",
+			wantTitle:     "Gate: gh:pr https://github.com/org/repo/pull/123",
+			wantAwaitType: "gh:pr",
+			wantAwaitID:   "https://github.com/org/repo/pull/123",
 		},
 		{
 			name: "gh:pr gate without ID",

@@ -168,7 +168,7 @@ Force: Delete and orphan dependents
 		// Actually delete — all writes in a single transaction
 		updatedIssueCount := 0
 		totalDepsRemoved := 0
-		deleteErr := transact(ctx, activeStore, fmt.Sprintf("bd: delete %s", issueID), func(tx storage.Transaction) error {
+		deleteErr := transactHonoringAutoCommit(ctx, activeStore, fmt.Sprintf("bd: delete %s", issueID), func(tx storage.Transaction) error {
 			// 1. Update text references in connected issues
 			for id, connIssue := range connectedIssues {
 				updates := make(map[string]interface{})
@@ -215,12 +215,7 @@ Force: Delete and orphan dependents
 			FatalError("deleting issue: %v", deleteErr)
 		}
 
-		// Embedded mode: flush Dolt commit.
-		if isEmbeddedMode() && store != nil {
-			if _, err := store.CommitPending(ctx, actor); err != nil {
-				FatalError("failed to commit: %v", err)
-			}
-		}
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			outputJSON(map[string]interface{}{
@@ -348,12 +343,7 @@ func deleteBatch(_ *cobra.Command, issueIDs []string, force bool, dryRun bool, c
 	// Update text references in connected issues (using pre-collected issues)
 	updatedCount := updateTextReferencesInIssues(ctx, issueIDs, connectedIssues)
 
-	// Embedded mode: flush Dolt commit.
-	if isEmbeddedMode() && store != nil {
-		if _, err := store.CommitPending(ctx, actor); err != nil {
-			FatalError("failed to commit: %v", err)
-		}
-	}
+	commandDidWrite.Store(true)
 
 	// Output results
 	if jsonOutput {
@@ -489,12 +479,7 @@ func deleteBatchFallback(issueIDs []string, force bool, dryRun bool, cascade boo
 	// Update text references in connected issues
 	updatedCount := updateTextReferencesInIssues(ctx, issueIDs, connectedIssues)
 
-	// Embedded mode: flush Dolt commit.
-	if isEmbeddedMode() && store != nil {
-		if _, err := store.CommitPending(ctx, getActorWithGit()); err != nil {
-			FatalError("failed to commit: %v", err)
-		}
-	}
+	commandDidWrite.Store(true)
 
 	// Output results
 	if jsonOutput {

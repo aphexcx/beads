@@ -210,6 +210,42 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.0.5",
+		Date:    "2026-05-28",
+		Changes: []string{
+			"CHANGE: dependencies.depends_on_id is now a STORED generated column — writes must target exactly one of depends_on_issue_id/depends_on_wisp_id/depends_on_external (enforced by ck_dep_one_target); inserting into depends_on_id fails. Migrations 0041–0042 are intentionally irreversible (restore from a prior Dolt commit to roll back).",
+			"CHANGE: JSONL auto-export and auto-staging are now opt-in — set export.auto=true and export.git-add=true to keep the old behavior. Dolt is the canonical store; use bd dolt push/pull for sync and bd backup for restorable backups.",
+			"CHANGE: Foreign keys with ON DELETE/UPDATE CASCADE now span issue and wisp tables, so parent delete/rename cascades automatically.",
+			"NEW: dolt.mode config key (server|embedded) with validation; bd init warns on ambiguous configs and hard-fails when dolt.host/dolt.port are set without server mode.",
+			"NEW: forward schema-skew guard hard-fails when a binary opens a database migrated to a newer schema than it understands.",
+			"NEW: bd list --skip-labels toggle; bd show --json count-only details with opt-in streamed payloads.",
+			"FIX: bd close supports per-id reasons and idempotent re-close; bd create --defer <future> creates a deferred issue; bd create commits labels atomically.",
+			"FIX: migrations run on a connection with no read timeout; duplicate migration version numbers hard-fail instead of silently under-applying.",
+		},
+	},
+	{
+		Version: "1.0.4",
+		Date:    "2026-05-07",
+		Changes: []string{
+			"NEW: bd init-safety plus --reinit-local/--discard-remote make remote-history destructive init paths explicit, with stable refusal exit codes 10/11/12",
+			"CHANGE: bd init --force is now local-only and deprecated in favor of --reinit-local; use --discard-remote only when intentionally replacing remote Dolt history",
+			"CHANGE: beads.OpenBestAvailable now returns (Storage, error); SDK callers must drop the removed Unlocker return value",
+			"FIX: bd close now uses routed ID resolution in contributor auto-routing workspaces, matching show/update behavior",
+			"FIX: Dolt-in-git internal refs/dolt/data pushes skip git hooks to avoid hook recursion",
+			"FIX: release workflow and packaging paths hardened for the v1.0.4 release attempt, including checked-in formula adoption and pure-Go test helper coverage",
+		},
+	},
+	{
+		Version: "1.0.3",
+		Date:    "2026-04-24",
+		Changes: []string{
+			"FIX: go install @latest — new release tag removes the go.mod replace directives that made v1.0.1 and v1.0.2 uninstallable via go install",
+			"FIX: npm macOS installs — release archives are flat so npm postinstall finds the bd binary at the archive root",
+			"FIX: Windows install — make install removes stale extensionless bd before installing bd.exe so old binaries do not shadow the new executable",
+			"FIX: Windows test portability and embedded pre-commit export cwd handling",
+		},
+	},
+	{
 		Version: "1.0.2",
 		Date:    "2026-04-15",
 		Changes: []string{

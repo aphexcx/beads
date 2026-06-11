@@ -21,7 +21,7 @@ creating significant portability problems:
 | Linux | Binaries dynamically link a specific `libicui18n.so.NN` version; crash on distros with a different ICU version |
 | macOS | ICU is keg-only in Homebrew; `go install` fails without manual `CGO_CFLAGS`/`CGO_LDFLAGS` |
 | Windows | ICU C headers (`unicode/uregex.h`) not available; `go install` and CGO builds fail |
-| `go install` | Users cannot pass `-tags gms_pure_go` to `go install pkg@latest` |
+| `go install` | The module cannot make plain `go install pkg@latest` use `-tags gms_pure_go` automatically |
 
 ## How It Works
 
@@ -52,7 +52,8 @@ Every build path that produces a binary for users must include `-tags gms_pure_g
 | Release builds | `.goreleaser.yml` (all build targets) |
 | Install script | `scripts/install.sh` |
 | Windows installer | `install.ps1` |
-| CI test matrix | `.github/workflows/ci.yml` (Linux, macOS, Windows) |
+| PR CI | `.github/workflows/pr.yml`, `.github/workflows/pr-risk.yml` |
+| Main CI test matrix | `.github/workflows/main.yml` (Linux, macOS, Windows) |
 | macOS release | `.github/workflows/release.yml` |
 | Migration tests | `.github/workflows/migration-test.yml` |
 | Nightly tests | `.github/workflows/nightly.yml` |
@@ -83,8 +84,8 @@ passes the tag inline (`-tags gms_pure_go`).
 
 ### Source-time guard: `scripts/check-build-tags.sh`
 
-CI runs `scripts/check-build-tags.sh` on every PR (see `check-build-tags`
-job in `.github/workflows/ci.yml`). It fails if any tracked shell script,
+CI runs `scripts/check-build-tags.sh` on every PR (see the `Check build-tag
+policy` job in `.github/workflows/pr.yml`). It fails if any tracked shell script,
 CI workflow, git hook, or the Makefile contains a
 `go build|test|run|generate|install` invocation that:
 
@@ -172,5 +173,5 @@ No fork, no replace directive, no upstream patch required. The tradeoff is that 
 ## See Also
 
 - [INSTALLING.md](INSTALLING.md) -- user-facing build dependency docs
-- [DOLT-BACKEND.md](DOLT-BACKEND.md) -- embedded Dolt architecture
+- [DOLT.md](DOLT.md) -- embedded Dolt architecture
 - [CONTRIBUTING.md](../CONTRIBUTING.md) -- contributor guidelines

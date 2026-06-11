@@ -1,15 +1,50 @@
 # Agent Instructions
 
+<!-- bd-doctor-divergence: ok -->
+
 See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full instructions.
 
 This file exists for compatibility with tools that look for AGENTS.md.
+
+The marker above tells `bd doctor` that the intentional divergence between
+this file and `CLAUDE.md` (different audiences, different reading orders) is
+expected and should not be flagged.
 
 ## Key Sections
 
 - **Issue Tracking** - How to use bd for work management
 - **Development Guidelines** - Code standards and testing
+- **Project Scope** - Read [docs/PROJECT_CHARTER.md](docs/PROJECT_CHARTER.md) before adding new feature surface area
 - **Visual Design System** - Status icons, colors, and semantic styling for CLI output
 - **Contributor Protection** - Read [CONTRIBUTING.md](CONTRIBUTING.md) before handling external PRs
+- **Maintainer PR Guidelines** - Read [PR_MAINTAINER_GUIDELINES.md](PR_MAINTAINER_GUIDELINES.md) before triaging, landing, or closing PRs
+
+## Project Scope
+
+Before adding new feature surface area, read
+[docs/PROJECT_CHARTER.md](docs/PROJECT_CHARTER.md). Beads owns issue tracking
+primitives and should not encode orchestration-layer policy, become a storage
+engine, or casually expand the database schema when metadata would work.
+
+## PR Safety for Agents
+
+Before triaging, reviewing, landing, closing, or otherwise maintaining PRs, read
+[PR_MAINTAINER_GUIDELINES.md](PR_MAINTAINER_GUIDELINES.md). The maintainer
+policy is to maximize community throughput: find useful contributor value,
+absorb or transform it locally when practical, preserve attribution, and use
+request-changes only as a last resort.
+
+Before implementing work, opening a PR, or merging/closing a PR, run the PR
+preflight:
+```bash
+scripts/pr-preflight.sh --search "<topic keywords>" --repo gastownhall/beads
+scripts/pr-preflight.sh <pr-number> --repo gastownhall/beads
+```
+
+External contributor PRs have priority. Review and build on their branch when
+possible, preserve their tests and attribution, and never close or supersede
+their PR silently. If a rewrite is unavoidable, explain why on the original PR
+and credit their design/tests.
 
 ## Visual Design Anti-Patterns
 
@@ -20,6 +55,16 @@ This file exists for compatibility with tools that look for AGENTS.md.
 - Priority: `● P0` (filled circle with color)
 
 See [AGENT_INSTRUCTIONS.md](AGENT_INSTRUCTIONS.md) for full development guidelines.
+
+## Storage Boundary
+
+The canonical storage boundary is in
+[docs/PROJECT_CHARTER.md](docs/PROJECT_CHARTER.md#storage-boundary). In short:
+Beads talks to storage through a driver interface (`dolthub/driver` for Dolt).
+Do not add beads-side flocks, engine introspection, storage-specific retry or
+crash-recovery logic, or public SDK return types that leak driver internals.
+If the boundary is too narrow, widen the interface or route the issue to the
+driver instead of patching around it in beads.
 
 ## Agent Warning: Interactive Commands
 
@@ -160,11 +205,16 @@ bd close bd-42 --reason "Completed" --json
 ### Workflow for AI Agents
 
 1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task atomically**: `bd update <id> --claim`
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
+2. **Read execution metadata first**: before deciding local vs delegated work, model, or reasoning level, inspect structured metadata:
+   ```bash
+   bd show <id> --json | jq '.[0] | {id,title,metadata,description,notes}'
+   ```
+   The execution metadata keys `execution_agent_type`, `execution_suggested_model`, `execution_reasoning_effort`, `execution_mode`, and `execution_parallel_group` are authoritative hints when present. Use description and notes as fallback context.
+3. **Claim your task atomically**: `bd update <id> --claim`
+4. **Work on it**: Implement, test, document
+5. **Discover new work?** Create linked issue:
    - `bd create "Found bug" --description="Details about what was found" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
+6. **Complete**: `bd close <id> --reason "Done"`
 
 ### Auto-Sync
 

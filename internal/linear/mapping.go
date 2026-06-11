@@ -318,6 +318,10 @@ func DefaultMappingConfig() *MappingConfig {
 			"chore":       "chore",
 			"maintenance": "chore",
 			"task":        "task",
+			"decision":    "decision",
+			"spike":       "spike",
+			"story":       "story",
+			"milestone":   "milestone",
 		},
 		// Linear relation types to Beads dependency types
 		RelationMap: map[string]string{
@@ -699,14 +703,14 @@ func ParseBeadsStatus(s string) types.Status {
 		return types.StatusInProgress
 	case "blocked":
 		return types.StatusBlocked
+	case "closed", "done":
+		return types.StatusClosed
 	case "deferred":
 		return types.StatusDeferred
 	case "pinned":
 		return types.StatusPinned
 	case "hooked":
 		return types.StatusHooked
-	case "closed":
-		return types.StatusClosed
 	default:
 		return types.StatusOpen
 	}
@@ -941,8 +945,12 @@ func LabelToIssueType(labels *Labels, config *MappingConfig) types.IssueType {
 			return ParseIssueType(issueType)
 		}
 
-		// Check if label contains any mapped keyword
+		// Check if label contains any broad legacy keyword. New issue types are
+		// exact-only to avoid labels like "history" being inferred as "story".
 		for keyword, issueType := range config.LabelTypeMap {
+			if !allowsSubstringLabelType(keyword, issueType) {
+				continue
+			}
 			if strings.Contains(labelName, keyword) {
 				return ParseIssueType(issueType)
 			}
@@ -950,6 +958,20 @@ func LabelToIssueType(labels *Labels, config *MappingConfig) types.IssueType {
 	}
 
 	return types.TypeTask // Default
+}
+
+func allowsSubstringLabelType(keyword, issueType string) bool {
+	switch keyword {
+	case "decision", "spike", "story", "milestone":
+		return false
+	}
+
+	switch ParseIssueType(issueType) {
+	case types.TypeDecision, types.TypeSpike, types.TypeStory, types.TypeMilestone:
+		return false
+	default:
+		return true
+	}
 }
 
 // ParseIssueType converts an issue type string to types.IssueType.
@@ -965,6 +987,14 @@ func ParseIssueType(s string) types.IssueType {
 		return types.TypeEpic
 	case "chore":
 		return types.TypeChore
+	case "decision":
+		return types.TypeDecision
+	case "spike":
+		return types.TypeSpike
+	case "story":
+		return types.TypeStory
+	case "milestone":
+		return types.TypeMilestone
 	default:
 		return types.TypeTask
 	}
@@ -1052,6 +1082,7 @@ func IssueToBeads(li *Issue, config *MappingConfig) *IssueConversion {
 			FromLinearID: li.Identifier,
 			ToLinearID:   li.Parent.Identifier,
 			Type:         "parent-child",
+			Source:       DependencySourceParent,
 		})
 	}
 
@@ -1066,6 +1097,7 @@ func IssueToBeads(li *Issue, config *MappingConfig) *IssueConversion {
 					FromLinearID: li.Identifier,
 					ToLinearID:   rel.RelatedIssue.Identifier,
 					Type:         depType,
+					Source:       DependencySourceRelation,
 				})
 				continue
 			}
@@ -1076,6 +1108,7 @@ func IssueToBeads(li *Issue, config *MappingConfig) *IssueConversion {
 					FromLinearID: rel.RelatedIssue.Identifier,
 					ToLinearID:   li.Identifier,
 					Type:         depType,
+					Source:       DependencySourceRelation,
 				})
 				continue
 			}
@@ -1085,6 +1118,7 @@ func IssueToBeads(li *Issue, config *MappingConfig) *IssueConversion {
 				FromLinearID: li.Identifier,
 				ToLinearID:   rel.RelatedIssue.Identifier,
 				Type:         depType,
+				Source:       DependencySourceRelation,
 			})
 		}
 	}

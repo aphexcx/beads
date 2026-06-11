@@ -4,7 +4,7 @@
 // This package exports only the essential types and functions needed for
 // Go-based extensions that want to use bd's storage layer programmatically.
 //
-// For detailed guidance on extending bd, see EXTENDING.md.
+// For a working extension example, see examples/bd-example-extension-go.
 package beads
 
 import (
@@ -516,6 +516,67 @@ func FindDatabasePath() string {
 	return ""
 }
 
+// FindBeadsDirFrom finds the effective .beads/ directory as if discovery
+// started from startDir, without changing the process working directory.
+func FindBeadsDirFrom(startDir string) string {
+	if startDir == "" {
+		return ""
+	}
+
+	info, err := os.Stat(startDir)
+	if err != nil || !info.IsDir() {
+		return ""
+	}
+
+	startDir = utils.CanonicalizePath(startDir)
+	repoRoot := ""
+	if out, err := gitOutput(startDir, "rev-parse", "--show-toplevel"); err == nil {
+		repoRoot = utils.CanonicalizePath(out)
+	}
+	fallbackBeadsDir := ""
+	fallbackHasDB := false
+	if repoRoot != "" {
+		fallbackBeadsDir = worktreeFallbackBeadsDirForRepo(repoRoot)
+		if fallbackBeadsDir != "" {
+			if fbInfo, err := os.Stat(fallbackBeadsDir); err == nil && fbInfo.IsDir() {
+				fallbackHasDB = hasBeadsDatabase(FollowRedirect(fallbackBeadsDir))
+			}
+		}
+	}
+
+	for dir := startDir; dir != "/" && dir != "."; {
+		beadsDir := filepath.Join(dir, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			resolved := FollowRedirect(beadsDir)
+			isWorktreeRoot := repoRoot != "" && utils.PathsEqual(dir, repoRoot)
+			if isWorktreeRoot && fallbackHasDB && !hasBeadsDatabase(resolved) {
+				// A worktree root can contain tracked .beads metadata without
+				// owning the ignored database directory. Match FindBeadsDir by
+				// preferring the shared worktree database in that case.
+			} else if hasBeadsProjectFiles(resolved) {
+				return resolved
+			}
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	if fallbackBeadsDir != "" {
+		if info, err := os.Stat(fallbackBeadsDir); err == nil && info.IsDir() {
+			resolved := FollowRedirect(fallbackBeadsDir)
+			if hasBeadsProjectFiles(resolved) {
+				return resolved
+			}
+		}
+	}
+
+	return ""
+}
+
 // hasBeadsProjectFiles checks if a .beads directory contains actual project files.
 // Returns true if the directory contains any of:
 // - metadata.json or config.yaml (project configuration)
@@ -928,12 +989,24 @@ func findDatabaseInTree() string {
 
 	// Check cwd first — a rig subdirectory with its own .beads/ takes
 	// priority over the git root's .beads/ (same fix as FindBeadsDir step 1b).
+	//
+	// In a worktree, skip the CWD check at the worktree root. The worktree
+	// root's .beads/ may contain git-tracked metadata (metadata.json with
+	// dolt_mode=server) inherited from the parent repo checkout, but NOT the
+	// gitignored dolt/ data directory. In server mode, findDatabaseInBeadsDir
+	// returns a path regardless of whether the data dir exists, which would
+	// short-circuit the worktree-aware fallback below — causing each worktree
+	// to spawn its own dolt server against an empty data directory.
+	// The worktree-specific code (below) handles this correctly.
 	{
-		cwdBeadsDir := filepath.Join(dir, ".beads")
-		if info, err := os.Stat(cwdBeadsDir); err == nil && info.IsDir() {
-			cwdBeadsDir = FollowRedirect(cwdBeadsDir)
-			if dbPath := findDatabaseInBeadsDir(cwdBeadsDir, true); dbPath != "" {
-				return dbPath
+		skipCwdCheck := git.IsWorktree() && dir == utils.CanonicalizePath(git.GetRepoRoot())
+		if !skipCwdCheck {
+			cwdBeadsDir := filepath.Join(dir, ".beads")
+			if info, err := os.Stat(cwdBeadsDir); err == nil && info.IsDir() {
+				cwdBeadsDir = FollowRedirect(cwdBeadsDir)
+				if dbPath := findDatabaseInBeadsDir(cwdBeadsDir, true); dbPath != "" {
+					return dbPath
+				}
 			}
 		}
 	}
@@ -948,12 +1021,19 @@ func findDatabaseInTree() string {
 			}
 		}
 
-		// Worktree's own .beads (separate-DB mode, no redirect)
+		// Worktree's own .beads (separate-DB mode, no redirect).
+		// Only use it if the worktree has an actual database (dolt/, embeddeddolt/,
+		// or *.db). A worktree that only has git-tracked metadata (metadata.json
+		// with dolt_mode=server, config.yaml, etc.) should fall through to the
+		// shared fallback below. This mirrors FindBeadsDir step 3b's
+		// hasBeadsDatabase guard and prevents duplicate server spawns.
 		if worktreeRoot := git.GetRepoRoot(); worktreeRoot != "" {
 			worktreeBeadsDir := filepath.Join(worktreeRoot, ".beads")
 			if info, err := os.Stat(worktreeBeadsDir); err == nil && info.IsDir() {
-				if dbPath := findDatabaseInBeadsDir(worktreeBeadsDir, true); dbPath != "" {
-					return dbPath
+				if hasBeadsDatabase(worktreeBeadsDir) {
+					if dbPath := findDatabaseInBeadsDir(worktreeBeadsDir, true); dbPath != "" {
+						return dbPath
+					}
 				}
 			}
 		}

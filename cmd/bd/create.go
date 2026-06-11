@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,11 @@ var createCmd = &cobra.Command{
 	Args:    cobra.MinimumNArgs(0), // Changed to allow no args when using -f
 	Run: func(cmd *cobra.Command, args []string) {
 		CheckReadonly("create")
+		if usesProxiedServer() {
+			in := gatherCreateInput(cmd, args)
+			runCreateProxiedServer(cmd, rootCtx, in)
+			return
+		}
 		file, _ := cmd.Flags().GetString("file")
 		graphFile, _ := cmd.Flags().GetString("graph")
 
@@ -57,7 +63,17 @@ var createCmd = &cobra.Command{
 			if len(args) > 0 {
 				FatalError("cannot specify both title and --graph flag")
 			}
-			createIssuesFromGraph(graphFile)
+			graphDryRun, _ := cmd.Flags().GetBool("dry-run")
+			wisp, _ := cmd.Flags().GetBool("ephemeral")
+			noHistory, _ := cmd.Flags().GetBool("no-history")
+			graphOpts := GraphApplyOptions{
+				Ephemeral: wisp,
+				NoHistory: noHistory,
+			}
+			if err := graphOpts.Validate(); err != nil {
+				FatalError("invalid graph options: %v", err)
+			}
+			createIssuesFromGraph(graphFile, graphDryRun, graphOpts)
 			return
 		}
 
@@ -260,43 +276,7 @@ var createCmd = &cobra.Command{
 			}
 		}
 
-		// Handle --dry-run flag (before --rig to ensure it works with cross-rig creation)
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
-		if dryRun {
-			previewIssue := buildCreateIssue(createIssueParams{
-				ID:                 explicitID,
-				Title:              title,
-				Description:        description,
-				Design:             design,
-				AcceptanceCriteria: acceptance,
-				Notes:              notes,
-				SpecID:             specID,
-				Priority:           priority,
-				IssueType:          types.IssueType(issueType).Normalize(),
-				Assignee:           assignee,
-				ExternalRef:        externalRef,
-				Ephemeral:          wisp,
-				NoHistory:          noHistory,
-				CreatedBy:          getActorWithGit(),
-				Owner:              getOwner(),
-				MolType:            molType,
-				WispType:           wispType,
-				DueAt:              dueAt,
-				DeferUntil:         deferUntil,
-				Metadata:           metadata,
-				EventKind:          eventCategory,
-				Actor:              eventActor,
-				Target:             eventTarget,
-				Payload:            eventPayload,
-			})
-
-			if jsonOutput {
-				outputJSON(previewIssue)
-			} else {
-				renderCreateDryRunPreview(previewIssue, labels, deps)
-			}
-			return
-		}
 
 		// Get estimate if provided
 		var estimatedMinutes *int
@@ -348,11 +328,53 @@ var createCmd = &cobra.Command{
 			repoPath = routing.DetermineTargetRepo(routingConfig, userRole, ".")
 		}
 
+		renderDryRun := func() {
+			previewIssue := buildCreateIssue(createIssueParams{
+				ID:                 explicitID,
+				Title:              title,
+				Description:        description,
+				Design:             design,
+				AcceptanceCriteria: acceptance,
+				Notes:              notes,
+				SpecID:             specID,
+				Priority:           priority,
+				IssueType:          types.IssueType(issueType).Normalize(),
+				Assignee:           assignee,
+				ExternalRef:        externalRef,
+				EstimatedMinutes:   estimatedMinutes,
+				Ephemeral:          wisp,
+				NoHistory:          noHistory,
+				CreatedBy:          getActorWithGit(),
+				Owner:              getOwner(),
+				Labels:             labels,
+				MolType:            molType,
+				WispType:           wispType,
+				DueAt:              dueAt,
+				DeferUntil:         deferUntil,
+				Metadata:           metadata,
+				EventKind:          eventCategory,
+				Actor:              eventActor,
+				Target:             eventTarget,
+				Payload:            eventPayload,
+			})
+
+			if jsonOutput {
+				outputJSON(previewIssue)
+			} else {
+				renderCreateDryRunPreview(previewIssue, labels, deps)
+			}
+		}
+
+		if dryRun && parentID == "" {
+			renderDryRun()
+			return
+		}
+
 		// Switch to target repo for multi-repo support (bd-6x6g)
 		// When routing to a different repo, we use direct storage access
 		var targetStore storage.DoltStorage
 		var remoteCache *remotecache.Cache // non-nil when routing to a remote URL
-		if repoPath != "." {
+		if !dryRun && repoPath != "." {
 			if remotecache.IsRemoteURL(repoPath) {
 				// Remote URL: pull into cache, open store, push explicitly after create
 				var err error
@@ -393,8 +415,11 @@ var createCmd = &cobra.Command{
 				_ = store.Close() // Best effort cleanup on error path
 			}
 
-			// Replace store for remainder of create operation
-			store = targetStore
+			// Replace store for remainder of create operation.
+			// Must use setStore to sync cmdCtx.Store — a bare `store = targetStore`
+			// leaves cmdCtx.Store pointing at the closed original, which causes
+			// "store is closed" in PostRun tip auto-commit (GH#tip-closed-bug).
+			setStore(targetStore)
 		}
 
 		// Check for conflicting flags
@@ -402,29 +427,52 @@ var createCmd = &cobra.Command{
 			FatalError("cannot specify both --id and --parent flags")
 		}
 
-		// If parent is specified, generate child ID and optionally inherit labels
+		parentLookupStore := store
+		if dryRun && repoPath != "." {
+			var err error
+			parentLookupStore, err = openDryRunTargetStore(rootCtx, repoPath)
+			if err != nil {
+				FatalError("%v", err)
+			}
+			defer func() { _ = parentLookupStore.Close() }()
+		}
+
+		// If parent is specified, validate it and optionally inherit labels.
+		// Child ID allocation is delayed until after the dry-run gate so
+		// previews do not consume the next child counter.
 		var inheritedLabels []string
 		if parentID != "" {
 			ctx := rootCtx
-			// Validate parent exists before generating child ID
-			_, err := store.GetIssue(ctx, parentID)
+			_, err := parentLookupStore.GetIssue(ctx, parentID)
 			if err != nil {
 				if errors.Is(err, storage.ErrNotFound) {
 					FatalError("parent issue %s not found", parentID)
 				}
 				FatalError("failed to check parent issue: %v", err)
 			}
-			childID, err := store.GetNextChildID(ctx, parentID)
-			if err != nil {
-				FatalError("%v", err)
-			}
-			explicitID = childID // Set as explicit ID for the rest of the flow
 
 			// Inherit parent labels unless --no-inherit-labels is set (GH#2100)
 			noInheritLabels, _ := cmd.Flags().GetBool("no-inherit-labels")
 			if !noInheritLabels {
-				inheritedLabels, _ = store.GetLabels(ctx, parentID)
+				inheritedLabels, _ = parentLookupStore.GetLabels(ctx, parentID)
 			}
+		}
+
+		labels = mergeCreateLabels(labels, inheritedLabels)
+
+		if dryRun {
+			renderDryRun()
+			return
+		}
+
+		createCtx := rootCtx
+		if parentID != "" {
+			childID, err := store.GetNextChildID(rootCtx, parentID)
+			if err != nil {
+				FatalError("%v", err)
+			}
+			explicitID = childID // Set as explicit ID for the rest of the flow.
+			createCtx = storage.WithReservedChildCounter(createCtx, parentID, childID)
 		}
 
 		// Validate explicit ID format if provided
@@ -438,7 +486,7 @@ var createCmd = &cobra.Command{
 			}
 
 			// Validate prefix matches database prefix
-			ctx := rootCtx
+			ctx := createCtx
 
 			// Get database prefix and allowed prefixes from config.
 			// YAML config takes precedence over DB — in shared-server mode the DB
@@ -476,6 +524,7 @@ var createCmd = &cobra.Command{
 			NoHistory:          noHistory,
 			CreatedBy:          getActorWithGit(),
 			Owner:              getOwner(),
+			Labels:             labels,
 			MolType:            molType,
 			WispType:           wispType,
 			EventKind:          eventCategory,
@@ -487,7 +536,7 @@ var createCmd = &cobra.Command{
 			Metadata:           metadata,
 		})
 
-		ctx := rootCtx
+		ctx := createCtx
 
 		// Check if any dependencies are discovered-from type
 		// If so, inherit source_repo from the parent issue
@@ -529,9 +578,9 @@ var createCmd = &cobra.Command{
 		}
 
 		// Track whether any post-create writes occurred. CreateIssue commits
-		// the issue to Dolt internally, but subsequent AddDependency/AddLabel
-		// calls only write to the working set. A follow-up Dolt commit is
-		// needed to persist them (GH#2009).
+		// the issue and its initial labels to Dolt internally, but subsequent
+		// AddDependency calls only write to the working set. A follow-up Dolt
+		// commit is needed to persist them (GH#2009).
 		postCreateWrites := false
 
 		// If parent was specified, add parent-child dependency
@@ -548,31 +597,8 @@ var createCmd = &cobra.Command{
 			}
 		}
 
-		// Merge inherited parent labels with user-specified labels (GH#2100)
-		if len(inheritedLabels) > 0 {
-			seen := make(map[string]bool)
-			for _, l := range labels {
-				seen[l] = true
-			}
-			for _, l := range inheritedLabels {
-				if !seen[l] {
-					labels = append(labels, l)
-				}
-			}
-		}
-
-		// Add labels if specified
-		for _, label := range labels {
-			if err := store.AddLabel(ctx, issue.ID, label, actor); err != nil {
-				WarnError("failed to add label %s: %v", label, err)
-			} else {
-				postCreateWrites = true
-			}
-		}
-
 		// Add dependencies if specified (format: type:id or just id for default "blocks" type)
 		for _, depSpec := range deps {
-			// Skip empty specs (e.g., from trailing commas)
 			depSpec = strings.TrimSpace(depSpec)
 			if depSpec == "" {
 				continue
@@ -580,41 +606,46 @@ var createCmd = &cobra.Command{
 
 			var depType types.DependencyType
 			var dependsOnID string
+			swapDirection := false
 
-			// Parse format: "type:id" or just "id" (defaults to "blocks")
 			if strings.Contains(depSpec, ":") {
 				parts := strings.SplitN(depSpec, ":", 2)
 				if len(parts) != 2 {
 					WarnError("invalid dependency format '%s', expected 'type:id' or 'id'", depSpec)
 					continue
 				}
-				depType = types.DependencyType(strings.TrimSpace(parts[0]))
-				// "depends-on" is an alias — keep default direction (new issue depends on target)
-				if depType == "depends-on" {
-					depType = types.DepBlocks
-				}
+				rawType := types.DependencyType(strings.TrimSpace(parts[0]))
 				dependsOnID = strings.TrimSpace(parts[1])
+
+				switch rawType {
+				case "depends-on", "blocked-by":
+					// Alias: the new issue depends on the target. Store as a blocks edge.
+					depType = types.DepBlocks
+				case types.DepBlocks:
+					// Explicit "blocks:X" means the new issue blocks X, so store X -> new issue.
+					depType = types.DepBlocks
+					swapDirection = true
+				default:
+					depType = rawType
+				}
 			} else {
-				// Default to "blocks" if no type specified
 				depType = types.DepBlocks
 				dependsOnID = depSpec
 			}
 
-			// Validate dependency type
 			if !depType.IsValid() {
-				WarnError("invalid dependency type '%s' (valid: blocks, related, parent-child, discovered-from)", depType)
-				continue
+				FatalErrorRespectJSON("invalid dependency type %q (must be non-empty, max 50 chars); valid types: %s", depType, createDepsAcceptedTypeList())
+			}
+			if !depType.IsWellKnown() {
+				FatalErrorRespectJSON("unknown dependency type %q; valid types: %s", depType, createDepsAcceptedTypeList())
 			}
 
-			// Add the dependency
 			dep := &types.Dependency{
 				IssueID:     issue.ID,
 				DependsOnID: dependsOnID,
 				Type:        depType,
 			}
-			// When user explicitly says "blocks:X", they mean "new issue blocks X"
-			// So X depends on the new issue — swap direction
-			if depType == types.DepBlocks && strings.Contains(depSpec, ":") {
+			if swapDirection {
 				dep.IssueID = dependsOnID
 				dep.DependsOnID = issue.ID
 			}
@@ -658,12 +689,14 @@ var createCmd = &cobra.Command{
 			}
 		}
 
-		// Commit to Dolt. In DoltStore mode, CreateIssue commits the issue
-		// row internally, so only post-create metadata (deps, labels) needs
-		// a separate commit. In EmbeddedDoltStore mode, CreateIssue writes
-		// to the working set without a Dolt commit, so we always commit
-		// everything together at the end.
-		if isEmbeddedMode() || postCreateWrites {
+		// Commit to Dolt. Server-mode DoltStore writes version themselves.
+		// EmbeddedDoltStore writes to the working set and commits here only
+		// when --dolt-auto-commit=on.
+		shouldCommit, err := shouldCommitCreatePostWrites(issue, postCreateWrites)
+		if err != nil {
+			FatalError("dolt auto-commit failed: %v", err)
+		}
+		if shouldCommit {
 			commitMsg := fmt.Sprintf("bd: create %s", issue.ID)
 			if err := store.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
 				WarnError("failed to commit: %v", err)
@@ -675,7 +708,10 @@ var createCmd = &cobra.Command{
 		// DoltHub remotes. Per-create pushes caused 22GB of git-remote-cache
 		// bloat with dozens of agents creating wisps constantly (hq-glw).
 		if repoPath != "." && targetStore != nil {
-			if _, err := targetStore.CommitPending(ctx, actor); err != nil {
+			if err := commitPendingIfEmbedded(ctx, targetStore, actor, doltAutoCommitParams{
+				Command:  "create",
+				IssueIDs: []string{issue.ID},
+			}); err != nil {
 				debug.Logf("warning: failed to commit routed repo: %v", err)
 			}
 		}
@@ -724,6 +760,7 @@ type createIssueParams struct {
 	NoHistory          bool
 	CreatedBy          string
 	Owner              string
+	Labels             []string
 	MolType            types.MolType
 	WispType           types.WispType
 	EventKind          string
@@ -741,6 +778,11 @@ func buildCreateIssue(params createIssueParams) *types.Issue {
 		externalRefPtr = &params.ExternalRef
 	}
 
+	status := types.StatusOpen
+	if params.DeferUntil != nil && params.DeferUntil.After(time.Now()) {
+		status = types.StatusDeferred
+	}
+
 	return &types.Issue{
 		ID:                 params.ID,
 		Title:              params.Title,
@@ -749,7 +791,7 @@ func buildCreateIssue(params createIssueParams) *types.Issue {
 		AcceptanceCriteria: params.AcceptanceCriteria,
 		Notes:              params.Notes,
 		SpecID:             params.SpecID,
-		Status:             types.StatusOpen,
+		Status:             status,
 		Priority:           params.Priority,
 		IssueType:          params.IssueType,
 		Assignee:           params.Assignee,
@@ -759,6 +801,7 @@ func buildCreateIssue(params createIssueParams) *types.Issue {
 		NoHistory:          params.NoHistory,
 		CreatedBy:          params.CreatedBy,
 		Owner:              params.Owner,
+		Labels:             append([]string(nil), params.Labels...),
 		MolType:            params.MolType,
 		WispType:           params.WispType,
 		EventKind:          params.EventKind,
@@ -769,6 +812,29 @@ func buildCreateIssue(params createIssueParams) *types.Issue {
 		DeferUntil:         params.DeferUntil,
 		Metadata:           params.Metadata,
 	}
+}
+
+func mergeCreateLabels(labels, inheritedLabels []string) []string {
+	merged := make([]string, 0, len(labels)+len(inheritedLabels))
+	seen := make(map[string]struct{}, len(labels)+len(inheritedLabels))
+	for _, label := range labels {
+		if _, ok := seen[label]; ok {
+			continue
+		}
+		seen[label] = struct{}{}
+		merged = append(merged, label)
+	}
+	for _, label := range inheritedLabels {
+		if _, ok := seen[label]; ok {
+			continue
+		}
+		seen[label] = struct{}{}
+		merged = append(merged, label)
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
 }
 
 func renderCreateDryRunPreview(issue *types.Issue, labels, deps []string) {
@@ -797,6 +863,29 @@ func renderCreateDryRunPreview(issue *types.Issue, labels, deps []string) {
 	if issue.EventKind != "" {
 		fmt.Printf("  Event category: %s\n", issue.EventKind)
 	}
+}
+
+func shouldCommitCreatePostWrites(_ *types.Issue, _ bool) (bool, error) {
+	if isEmbeddedMode() {
+		if strings.TrimSpace(doltAutoCommit) == "" {
+			return true, nil
+		}
+		mode, err := getDoltAutoCommitMode()
+		if err != nil {
+			return false, err
+		}
+		return mode == doltAutoCommitOn, nil
+	}
+	return false, nil
+}
+
+func createDepsAcceptedTypeList() string {
+	names := []string{"blocked-by", "depends-on"}
+	for _, depType := range types.WellKnownDependencyTypes() {
+		names = append(names, string(depType))
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func init() {
@@ -855,6 +944,38 @@ func formatTimeForRPC(t *time.Time) string {
 		return ""
 	}
 	return t.Format(time.RFC3339)
+}
+
+func openDryRunTargetStore(ctx context.Context, repoPath string) (storage.DoltStorage, error) {
+	if remotecache.IsRemoteURL(repoPath) {
+		cache, err := remotecache.DefaultCache()
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize remote cache: %w", err)
+		}
+		// The dry-run parent lookup only reads from this cached remote store.
+		// Do not add writes here; dry-runs must not mutate cached remotes.
+		store, err := cache.OpenStore(ctx, repoPath, newDoltStoreFromConfig)
+		if err != nil {
+			return nil, fmt.Errorf("dry-run parent lookup requires an existing cached remote store for %s: %w", repoPath, err)
+		}
+		return store, nil
+	}
+
+	targetPath := routing.ExpandPath(repoPath)
+	beadsDir := filepath.Join(targetPath, ".beads")
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if _, err := os.Stat(metadataPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("target repo %s is not initialized; refusing to initialize it during dry-run", targetPath)
+		}
+		return nil, fmt.Errorf("failed to inspect target repo %s: %w", targetPath, err)
+	}
+
+	store, err := newDoltStoreFromConfig(ctx, beadsDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open target store for dry-run: %w", err)
+	}
+	return store, nil
 }
 
 // ensureBeadsDirForPath ensures a beads directory exists at the target path.

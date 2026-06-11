@@ -51,12 +51,11 @@ Examples:
 		if err := issueStore.AddLabel(ctx, result.ResolvedID, label, actor); err != nil {
 			FatalErrorRespectJSON("adding label to %s: %v", id, err)
 		}
-
-		// Flush Dolt commit for embedded mode
-		if isEmbeddedMode() && store != nil {
-			if _, err := store.CommitPending(ctx, actor); err != nil {
-				FatalErrorRespectJSON("failed to commit: %v", err)
-			}
+		if err := commitPendingIfEmbedded(ctx, issueStore, actor, doltAutoCommitParams{
+			Command:  "tag",
+			IssueIDs: []string{result.ResolvedID},
+		}); err != nil {
+			FatalErrorRespectJSON("failed to commit: %v", err)
 		}
 
 		SetLastTouchedID(result.ResolvedID)

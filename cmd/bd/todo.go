@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 var todoCmd = &cobra.Command{
@@ -65,12 +66,7 @@ var addTodoCmd = &cobra.Command{
 			FatalError("failed to create TODO: %v", err)
 		}
 
-		// Embedded mode: flush Dolt commit.
-		if isEmbeddedMode() && getStore() != nil {
-			if _, err := getStore().CommitPending(ctx, getActorWithGit()); err != nil {
-				FatalError("failed to commit: %v", err)
-			}
-		}
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			data, err := json.MarshalIndent(issue, "", "  ")
@@ -173,11 +169,8 @@ var doneTodoCmd = &cobra.Command{
 			closedIDs = append(closedIDs, issueID)
 		}
 
-		// Embedded mode: flush Dolt commit.
-		if isEmbeddedMode() && len(closedIDs) > 0 && getStore() != nil {
-			if _, err := getStore().CommitPending(ctx, getActorWithGit()); err != nil {
-				FatalError("failed to commit: %v", err)
-			}
+		if len(closedIDs) > 0 {
+			commandDidWrite.Store(true)
 		}
 
 		if jsonOutput {
@@ -229,6 +222,6 @@ func todoSortIssues(issues []*types.Issue) {
 		if a.Priority != b.Priority {
 			return a.Priority - b.Priority
 		}
-		return strings.Compare(a.ID, b.ID)
+		return utils.NaturalCompareIDs(a.ID, b.ID)
 	})
 }

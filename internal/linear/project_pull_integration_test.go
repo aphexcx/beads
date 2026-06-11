@@ -33,7 +33,7 @@ func newPullProjectsEnv(t *testing.T) (*Tracker, *embeddeddolt.EmbeddedDoltStore
 	}
 	ctx := t.Context()
 	beadsDir := filepath.Join(t.TempDir(), ".beads")
-	store, err := embeddeddolt.New(ctx, beadsDir, "pullproj", "main")
+	store, err := embeddeddolt.Open(ctx, beadsDir, "pullproj", "main")
 	if err != nil {
 		t.Fatalf("New embedded store: %v", err)
 	}

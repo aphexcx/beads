@@ -19,11 +19,11 @@ func bdHistory(t *testing.T, bd, dir string, args ...string) string {
 	cmd := exec.Command(bd, fullArgs...)
 	cmd.Dir = dir
 	cmd.Env = bdEnv(dir)
-	out, err := cmd.CombinedOutput()
+	stdout, stderr, err := runCommandBuffers(t, cmd)
 	if err != nil {
-		t.Fatalf("bd history %s failed: %v\n%s", strings.Join(args, " "), err, out)
+		t.Fatalf("bd history %s failed: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
-	return string(out)
+	return stdout.String()
 }
 
 // bdHistoryFail runs "bd history" expecting failure.
@@ -47,11 +47,11 @@ func bdHistoryJSON(t *testing.T, bd, dir string, args ...string) []map[string]in
 	cmd := exec.Command(bd, fullArgs...)
 	cmd.Dir = dir
 	cmd.Env = bdEnv(dir)
-	out, err := cmd.CombinedOutput()
+	stdout, stderr, err := runCommandBuffers(t, cmd)
 	if err != nil {
-		t.Fatalf("bd history --json %s failed: %v\n%s", strings.Join(args, " "), err, out)
+		t.Fatalf("bd history --json %s failed: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
-	s := strings.TrimSpace(string(out))
+	s := strings.TrimSpace(stdout.String())
 	start := strings.Index(s, "[")
 	if start < 0 {
 		return nil
@@ -165,6 +165,48 @@ func TestEmbeddedHistory(t *testing.T) {
 		out := bdHistory(t, bd, dir, "hi-nonexistent999")
 		if !strings.Contains(out, "No history") {
 			t.Errorf("expected 'No history' message for nonexistent issue, got: %s", out)
+		}
+	})
+
+	// --json must always produce parseable JSON, even when history is empty.
+	// Without this, consumers piping `bd history --json | jq` break on the
+	// empty case while every other --json subcommand returns valid JSON.
+	t.Run("nonexistent_issue_json_returns_empty_array", func(t *testing.T) {
+		cmd := exec.Command(bd, "history", "--json", "hi-nonexistent999")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		stdout, stderr, err := runCommandBuffers(t, cmd)
+		if err != nil {
+			t.Fatalf("bd history --json failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+		}
+		s := strings.TrimSpace(stdout.String())
+		var entries []map[string]interface{}
+		if err := json.Unmarshal([]byte(s), &entries); err != nil {
+			t.Fatalf("expected valid JSON for empty history, got prose:\n%s\n(parse error: %v)", s, err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("expected empty array for nonexistent issue, got %d entries", len(entries))
+		}
+	})
+
+	// --limit combined with --json on empty history must still produce [].
+	// Guards against future reordering that might apply limit semantics
+	// before the empty-check and skip the JSON branch.
+	t.Run("nonexistent_issue_json_with_limit_returns_empty_array", func(t *testing.T) {
+		cmd := exec.Command(bd, "history", "--json", "--limit", "2", "hi-nonexistent999")
+		cmd.Dir = dir
+		cmd.Env = bdEnv(dir)
+		stdout, stderr, err := runCommandBuffers(t, cmd)
+		if err != nil {
+			t.Fatalf("bd history --json --limit 2 failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+		}
+		s := strings.TrimSpace(stdout.String())
+		var entries []map[string]interface{}
+		if err := json.Unmarshal([]byte(s), &entries); err != nil {
+			t.Fatalf("expected valid JSON for empty history with --limit, got prose:\n%s\n(parse error: %v)", s, err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("expected empty array for nonexistent issue with --limit, got %d entries", len(entries))
 		}
 	})
 

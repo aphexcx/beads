@@ -165,12 +165,12 @@ Examples:
 			FatalErrorRespectJSON("updating issue: %v", err)
 		}
 		editSaved = true
-
-		// Embedded mode: flush Dolt commit.
-		if isEmbeddedMode() {
-			if _, err := store.CommitPending(ctx, actor); err != nil {
-				FatalErrorRespectJSON("failed to commit: %v", err)
-			}
+		if err := commitPendingIfEmbedded(ctx, issueStore, actor, doltAutoCommitParams{
+			Command:  "edit",
+			IssueIDs: []string{id},
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Your edits are preserved in: %s\n", tmpPath)
+			FatalErrorRespectJSON("failed to commit: %v", err)
 		}
 
 		displayTitle := issue.Title

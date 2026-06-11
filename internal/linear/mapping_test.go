@@ -173,6 +173,18 @@ func TestDefaultMappingConfig(t *testing.T) {
 	if config.LabelTypeMap["feature"] != "feature" {
 		t.Errorf("LabelTypeMap[feature] = %s, want feature", config.LabelTypeMap["feature"])
 	}
+	if config.LabelTypeMap["decision"] != "decision" {
+		t.Errorf("LabelTypeMap[decision] = %s, want decision", config.LabelTypeMap["decision"])
+	}
+	if config.LabelTypeMap["spike"] != "spike" {
+		t.Errorf("LabelTypeMap[spike] = %s, want spike", config.LabelTypeMap["spike"])
+	}
+	if config.LabelTypeMap["story"] != "story" {
+		t.Errorf("LabelTypeMap[story] = %s, want story", config.LabelTypeMap["story"])
+	}
+	if config.LabelTypeMap["milestone"] != "milestone" {
+		t.Errorf("LabelTypeMap[milestone] = %s, want milestone", config.LabelTypeMap["milestone"])
+	}
 
 	// Check relation mappings
 	if config.RelationMap["blocks"] != "blocks" {
@@ -269,6 +281,11 @@ func TestParseBeadsStatus(t *testing.T) {
 		{"DEFERRED", types.StatusDeferred},
 		{"closed", types.StatusClosed},
 		{"CLOSED", types.StatusClosed},
+		{"done", types.StatusClosed},
+		{"Done", types.StatusClosed},
+		{"deferred", types.StatusDeferred},
+		{"pinned", types.StatusPinned},
+		{"hooked", types.StatusHooked},
 		{"unknown", types.StatusOpen}, // Default
 	}
 
@@ -357,14 +374,44 @@ func TestLabelToIssueType(t *testing.T) {
 		{&Labels{Nodes: []Label{{Name: "feature"}}}, types.TypeFeature},
 		{&Labels{Nodes: []Label{{Name: "epic"}}}, types.TypeEpic},
 		{&Labels{Nodes: []Label{{Name: "chore"}}}, types.TypeChore},
+		{&Labels{Nodes: []Label{{Name: "decision"}}}, types.TypeDecision},
+		{&Labels{Nodes: []Label{{Name: "spike"}}}, types.TypeSpike},
+		{&Labels{Nodes: []Label{{Name: "story"}}}, types.TypeStory},
+		{&Labels{Nodes: []Label{{Name: "milestone"}}}, types.TypeMilestone},
 		{&Labels{Nodes: []Label{{Name: "random"}, {Name: "bug"}}}, types.TypeBug},
 		{&Labels{Nodes: []Label{{Name: "contains-bug-keyword"}}}, types.TypeBug},
+		{&Labels{Nodes: []Label{{Name: "history"}}}, types.TypeTask},
+		{&Labels{Nodes: []Label{{Name: "decision-log"}}}, types.TypeTask},
+		{&Labels{Nodes: []Label{{Name: "spike-detector"}}}, types.TypeTask},
+		{&Labels{Nodes: []Label{{Name: "storytime"}}}, types.TypeTask},
+		{&Labels{Nodes: []Label{{Name: "pre-milestone"}}}, types.TypeTask},
 	}
 
 	for _, tt := range tests {
 		got := LabelToIssueType(tt.labels, config)
 		if got != tt.want {
 			t.Errorf("LabelToIssueType(%v) = %v, want %v", tt.labels, got, tt.want)
+		}
+	}
+}
+
+func TestLabelToIssueTypeCustomStoryAliasIsExactOnly(t *testing.T) {
+	config := DefaultMappingConfig()
+	config.LabelTypeMap["user-story"] = "story"
+
+	tests := []struct {
+		label string
+		want  types.IssueType
+	}{
+		{"user-story", types.TypeStory},
+		{"backend-user-story", types.TypeTask},
+	}
+
+	for _, tt := range tests {
+		labels := &Labels{Nodes: []Label{{Name: tt.label}}}
+		got := LabelToIssueType(labels, config)
+		if got != tt.want {
+			t.Errorf("LabelToIssueType(%q) = %v, want %v", tt.label, got, tt.want)
 		}
 	}
 }
@@ -380,6 +427,10 @@ func TestParseIssueType(t *testing.T) {
 		{"task", types.TypeTask},
 		{"epic", types.TypeEpic},
 		{"chore", types.TypeChore},
+		{"decision", types.TypeDecision},
+		{"spike", types.TypeSpike},
+		{"story", types.TypeStory},
+		{"milestone", types.TypeMilestone},
 		{"unknown", types.TypeTask}, // Default
 	}
 
@@ -531,6 +582,48 @@ func TestIssueToBeadsWithParent(t *testing.T) {
 	if result.Dependencies[0].ToLinearID != "PROJ-123" {
 		t.Errorf("ToLinearID = %q, want %q", result.Dependencies[0].ToLinearID, "PROJ-123")
 	}
+	if result.Dependencies[0].Source != DependencySourceParent {
+		t.Errorf("Source = %q, want %q", result.Dependencies[0].Source, DependencySourceParent)
+	}
+}
+
+func TestIssueToBeadsRelationMappedToParentChildKeepsRelationSource(t *testing.T) {
+	config := DefaultMappingConfig()
+	config.RelationMap["related"] = "parent-child"
+
+	linearIssue := &Issue{
+		ID:         "uuid-456",
+		Identifier: "PROJ-456",
+		Title:      "Related Issue",
+		URL:        "https://linear.app/team/issue/PROJ-456",
+		Priority:   3,
+		State:      &State{Type: "unstarted", Name: "Todo"},
+		Relations: &Relations{Nodes: []Relation{
+			{
+				ID:   "rel-1",
+				Type: "related",
+				RelatedIssue: struct {
+					ID         string `json:"id"`
+					Identifier string `json:"identifier"`
+				}{ID: "uuid-789", Identifier: "PROJ-789"},
+			},
+		}},
+		CreatedAt: "2024-01-15T10:00:00Z",
+		UpdatedAt: "2024-01-16T12:00:00Z",
+	}
+
+	result := IssueToBeads(linearIssue, config)
+
+	if len(result.Dependencies) != 1 {
+		t.Fatalf("Expected 1 dependency, got %d", len(result.Dependencies))
+	}
+	dep := result.Dependencies[0]
+	if dep.Type != "parent-child" {
+		t.Errorf("Dependency type = %q, want %q", dep.Type, "parent-child")
+	}
+	if dep.Source != DependencySourceRelation {
+		t.Errorf("Source = %q, want %q", dep.Source, DependencySourceRelation)
+	}
 }
 
 func TestBuildLinearToLocalUpdates(t *testing.T) {
@@ -641,6 +734,29 @@ func TestLoadMappingConfig(t *testing.T) {
 	// Check that defaults are preserved
 	if config.StateMap["started"] != "in_progress" {
 		t.Errorf("StateMap[started] = %s, want in_progress (default preserved)", config.StateMap["started"])
+	}
+}
+
+func TestLoadMappingConfigDottedStateMapResolvesPushByName(t *testing.T) {
+	loader := &mockConfigLoader{
+		config: map[string]string{
+			"linear.state_map.done": "closed",
+		},
+	}
+	config := LoadMappingConfig(loader)
+	cache := &StateCache{
+		States: []State{
+			{ID: "state-done", Name: "Done", Type: "completed"},
+			{ID: "state-monitoring", Name: "Monitoring", Type: "completed"},
+		},
+	}
+
+	got, err := ResolveStateIDForBeadsStatus(cache, types.StatusClosed, config)
+	if err != nil {
+		t.Fatalf("ResolveStateIDForBeadsStatus() error = %v", err)
+	}
+	if got != "state-done" {
+		t.Fatalf("ResolveStateIDForBeadsStatus() = %q, want state-done", got)
 	}
 }
 

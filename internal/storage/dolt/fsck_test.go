@@ -2,7 +2,6 @@ package dolt
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,11 +56,18 @@ func TestPrePushFSCK_CleanDB(t *testing.T) {
 	}
 }
 
-// TestPrePushFSCK_CorruptNoms verifies that prePushFSCK returns
-// ErrDanglingReference when dolt fsck detects an invalid local store.
-// We simulate corruption by creating a .dolt/noms directory without running
-// dolt init — fsck fails because the repository state is invalid.
-func TestPrePushFSCK_CorruptNoms(t *testing.T) {
+// TestPrePushFSCK_UnopenableDB verifies that prePushFSCK logs a warning and
+// proceeds (returns nil) when dolt fsck cannot open the database. This avoids
+// misleading users with a corruption warning for environmental / tooling
+// failures. Example: dolthub/dolt#10915 (Windows url.Parse bug pre-v1.86.4)
+// caused fsck to fail-to-open healthy databases, which the previous wrapper
+// reported as "dangling chunk reference: aborting push to prevent propagating
+// corrupt chunks".
+//
+// We simulate the unopenable state by creating a .dolt/noms directory without
+// running dolt init — fsck prints "Could not open dolt database" and exits
+// non-zero.
+func TestPrePushFSCK_UnopenableDB(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("dolt"); err != nil {
 		t.Skip("dolt not in PATH")
@@ -75,11 +81,49 @@ func TestPrePushFSCK_CorruptNoms(t *testing.T) {
 	}
 
 	s := &DoltStore{dbPath: tmp, database: "mydb"}
-	err := s.prePushFSCK(context.Background())
-	if err == nil {
-		t.Fatal("expected ErrDanglingReference for invalid repo, got nil")
+	if err := s.prePushFSCK(context.Background()); err != nil {
+		t.Fatalf("expected nil when fsck cannot open db (should warn and proceed), got %v", err)
 	}
-	if !errors.Is(err, ErrDanglingReference) {
-		t.Fatalf("expected ErrDanglingReference, got %v", err)
+}
+
+// TestFsckCouldNotOpen verifies the helper identifies both known dolt
+// "couldn't open" phrasings and does not classify actual integrity failures
+// (or unrelated output) as open-failures.
+func TestFsckCouldNotOpen(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{
+			name:   "windows url.Parse bug pre-1.86.4 (dolthub/dolt#10915)",
+			output: `Could not open dolt database: CreateFile \C:\Users\x\.beads\...\.dolt\noms: The filename, directory name, or volume label syntax is incorrect.`,
+			want:   true,
+		},
+		{
+			name:   "uninitialized .dolt directory",
+			output: "The current directories repository state is invalid\nopen .dolt/repo_state.json: no such file or directory",
+			want:   true,
+		},
+		{
+			name:   "actual dangling chunk reference (must still abort)",
+			output: "dangling chunk reference: hash abc123 referenced but not present",
+			want:   false,
+		},
+		{
+			name:   "empty output",
+			output: "",
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := fsckCouldNotOpen(tc.output); got != tc.want {
+				t.Errorf("fsckCouldNotOpen(%q) = %v, want %v", tc.output, got, tc.want)
+			}
+		})
 	}
 }

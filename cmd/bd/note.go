@@ -95,12 +95,11 @@ Examples:
 		if err := issueStore.UpdateIssue(ctx, result.ResolvedID, updates, actor); err != nil {
 			FatalErrorRespectJSON("updating %s: %v", id, err)
 		}
-
-		// Flush Dolt commit for embedded mode
-		if isEmbeddedMode() && store != nil {
-			if _, err := store.CommitPending(ctx, actor); err != nil {
-				FatalErrorRespectJSON("failed to commit: %v", err)
-			}
+		if err := commitPendingIfEmbedded(ctx, issueStore, actor, doltAutoCommitParams{
+			Command:  "note",
+			IssueIDs: []string{result.ResolvedID},
+		}); err != nil {
+			FatalErrorRespectJSON("failed to commit: %v", err)
 		}
 
 		SetLastTouchedID(result.ResolvedID)
