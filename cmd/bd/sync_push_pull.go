@@ -500,6 +500,15 @@ func runLinearPull(cmd *cobra.Command, args []string) {
 	if err != nil {
 		FatalError("sync failed: %v", err)
 	}
+
+	// Record successful pull timestamp — parity with the full sync path, so
+	// staleness checks and incremental pull windows stay accurate after the
+	// shortcut command.
+	if !dryRun {
+		if beadsDir := resolveBeadsDirForStaleness(); beadsDir != "" {
+			_ = linear.WriteLastPullTimestamp(beadsDir)
+		}
+	}
 	outputSyncResult(result, dryRun)
 }
 

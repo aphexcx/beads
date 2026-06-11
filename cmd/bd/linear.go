@@ -344,13 +344,7 @@ func runLinearSync(cmd *cobra.Command, args []string) {
 		FatalError("initializing Linear tracker: %v", err)
 	}
 
-	// Wire label-sync config so PushHooks/PullHooks builders see the right
-	// LabelSyncEnabled() value when they install the label-aware hooks below.
-	allCfg, _ := store.GetAllConfig(ctx)
-	lsCfg := loadLinearLabelSyncConfig(allCfg)
-	lt.SetLabelSyncConfig(lsCfg.Enabled, lsCfg.Exclude, lsCfg.CreateScope, func(format string, args ...interface{}) {
-		fmt.Fprintf(os.Stderr, "Warning: linear label sync: "+format+"\n", args...)
-	})
+	wireLinearLabelSyncConfig(ctx, lt)
 
 	if willPush {
 		if err := lt.ValidatePushStateMappings(ctx); err != nil {
@@ -537,6 +531,20 @@ type linearPullHookOptions struct {
 	Milestones bool
 	DryRun     bool
 	Actor      string
+}
+
+// wireLinearLabelSyncConfig loads label-sync settings from store config and
+// installs them on the tracker, so PushHooks/PullHooks builders see the right
+// LabelSyncEnabled() value when they install the label-aware hooks. Every
+// entry point that builds Linear hooks (sync, and the pull/push shortcuts in
+// sync_push_pull.go) must call this after lt.Init — otherwise label sync
+// silently degrades to off for that path.
+func wireLinearLabelSyncConfig(ctx context.Context, lt *linear.Tracker) {
+	allCfg, _ := store.GetAllConfig(ctx)
+	lsCfg := loadLinearLabelSyncConfig(allCfg)
+	lt.SetLabelSyncConfig(lsCfg.Enabled, lsCfg.Exclude, lsCfg.CreateScope, func(format string, args ...interface{}) {
+		fmt.Fprintf(os.Stderr, "Warning: linear label sync: "+format+"\n", args...)
+	})
 }
 
 // buildLinearPullHooks creates PullHooks for Linear-specific pull behavior.
