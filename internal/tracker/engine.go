@@ -601,6 +601,20 @@ func parseSyncTime(value string) (time.Time, error) {
 	return time.Parse(time.RFC3339, value)
 }
 
+// LastSync returns the recorded last-sync timestamp for a tracker config
+// prefix (e.g. "linear", "jira"), or "" if the tracker has never synced.
+// The sync engine records the timestamp in local metadata; older bd versions
+// wrote it to config, so fall back there for databases synced before the
+// refactor.
+func LastSync(ctx context.Context, store storage.Storage, configPrefix string) string {
+	key := configPrefix + ".last_sync"
+	if value, err := store.GetLocalMetadata(ctx, key); err == nil && value != "" {
+		return value
+	}
+	value, _ := store.GetConfig(ctx, key)
+	return value
+}
+
 // doPush exports beads issues to the external tracker.
 func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs map[string]bool) (*PushStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.push",

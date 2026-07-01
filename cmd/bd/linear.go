@@ -406,7 +406,7 @@ func runLinearStatus(cmd *cobra.Command, args []string) {
 
 	apiKey, _ := getLinearConfig(ctx, "linear.api_key")
 	teamIDs := getLinearTeamIDs(ctx, nil)
-	lastSync, _ := store.GetConfig(ctx, "linear.last_sync")
+	lastSync := tracker.LastSync(ctx, store, "linear")
 
 	configured := apiKey != "" && len(teamIDs) > 0
 

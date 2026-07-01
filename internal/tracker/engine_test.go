@@ -242,6 +242,65 @@ func (m *mockMapper) IssueToBeads(ti *TrackerIssue) *IssueConversion {
 	}
 }
 
+func TestLastSyncPrefersLocalMetadataOverConfig(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	// Never synced: no value anywhere.
+	if got := LastSync(ctx, store, "linear"); got != "" {
+		t.Errorf("LastSync() on fresh store = %q, want empty", got)
+	}
+
+	// Pre-refactor databases recorded the timestamp in config only.
+	if err := store.SetConfig(ctx, "linear.last_sync", "2026-06-09T20:11:39Z"); err != nil {
+		t.Fatalf("SetConfig() error: %v", err)
+	}
+	if got := LastSync(ctx, store, "linear"); got != "2026-06-09T20:11:39Z" {
+		t.Errorf("LastSync() with config-only value = %q, want config fallback", got)
+	}
+
+	// The engine writes to local metadata, which takes precedence.
+	if err := store.SetLocalMetadata(ctx, "linear.last_sync", "2026-07-01T00:00:00Z"); err != nil {
+		t.Fatalf("SetLocalMetadata() error: %v", err)
+	}
+	if got := LastSync(ctx, store, "linear"); got != "2026-07-01T00:00:00Z" {
+		t.Errorf("LastSync() with both values = %q, want local metadata to win", got)
+	}
+
+	// Prefixes are independent.
+	if got := LastSync(ctx, store, "jira"); got != "" {
+		t.Errorf("LastSync(jira) = %q, want empty", got)
+	}
+}
+
+// Regression test for the read/write mismatch where Sync recorded last_sync
+// in local metadata but status commands read config, reporting "Never" after
+// real syncs.
+func TestSyncTimestampReadableViaLastSync(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{ID: "1", Identifier: "TEST-1", Title: "First issue", UpdatedAt: time.Now()},
+	}
+
+	engine := NewEngine(tracker, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if result.LastSync == "" {
+		t.Fatal("Sync() did not record LastSync")
+	}
+
+	if got := LastSync(ctx, store, tracker.ConfigPrefix()); got != result.LastSync {
+		t.Errorf("LastSync() = %q, want %q (timestamp written by Sync)", got, result.LastSync)
+	}
+}
+
 func TestEnginePullMatchesExistingIssueByLocalID(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
