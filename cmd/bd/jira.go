@@ -226,7 +226,7 @@ func runJiraStatus(cmd *cobra.Command, args []string) {
 	}
 
 	jiraURL, _ := store.GetConfig(ctx, "jira.url")
-	lastSync, _ := store.GetConfig(ctx, "jira.last_sync")
+	lastSync := tracker.LastSync(ctx, store, "jira")
 
 	// Resolve project keys from all config sources.
 	pluralProjects, _ := store.GetConfig(ctx, "jira.projects")

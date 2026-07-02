@@ -122,6 +122,32 @@ func (m *mockBatchTracker) BatchPushDryRun(_ context.Context, issues []*types.Is
 	return &BatchPushResult{}, nil
 }
 
+// mockBatchOnlyTracker implements BatchPushTracker but NOT BatchPushDryRunner,
+// mirroring trackers that can batch-push but cannot preview (bd-f0t).
+type mockBatchOnlyTracker struct {
+	*mockTracker
+	batchCalls  int
+	batchIssues []*types.Issue
+}
+
+func (m *mockBatchOnlyTracker) BatchPush(_ context.Context, issues []*types.Issue, _ map[string]bool) (*BatchPushResult, error) {
+	m.batchCalls++
+	m.batchIssues = append(m.batchIssues, issues...)
+	result := &BatchPushResult{}
+	for _, issue := range issues {
+		ref := derefStr(issue.ExternalRef)
+		if ref == "" || !m.IsExternalRef(ref) {
+			result.Created = append(result.Created, BatchPushItem{
+				LocalID:     issue.ID,
+				ExternalRef: fmt.Sprintf("https://%s.test/EXT-%s", m.name, issue.ID),
+			})
+		} else {
+			result.Updated = append(result.Updated, BatchPushItem{LocalID: issue.ID, ExternalRef: ref})
+		}
+	}
+	return result, nil
+}
+
 func (m *mockTracker) FetchIssues(ctx context.Context, opts FetchOptions) ([]TrackerIssue, error) {
 	if m.fetchErr != nil {
 		return nil, m.fetchErr
