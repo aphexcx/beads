@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"context"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -64,6 +65,48 @@ type BatchPushTracker interface {
 	BatchPush(ctx context.Context, issues []*types.Issue, forceIDs map[string]bool) (*BatchPushResult, error)
 }
 
+// RemoteAwareUpdater is an optional capability. Trackers that implement it
+// receive the already-fetched remote payload so they can decide which fields
+// are safe to omit from the update — e.g., preserving states owned by external
+// automation (Linear's "In Review" driven by a GitHub PR integration).
+//
+// The engine type-asserts this interface and prefers it over the base
+// UpdateIssue when both the tracker implements it AND a remote payload is
+// available. When remote is nil (rare — happens only if the engine couldn't
+// fetch), implementations should fall back to the same logic as UpdateIssue.
+type RemoteAwareUpdater interface {
+	UpdateIssueWithRemote(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue) (*TrackerIssue, error)
+}
+
+// DryRunDecision categorizes what UpdateIssueWithRemote would do without
+// actually issuing the API call. Used by the engine's dry-run path to print
+// accurate "Would push X" labels rather than the generic "Would update".
+type DryRunDecision int
+
+const (
+	// DryRunUnknown means the tracker doesn't have a strong opinion — engine
+	// should fall back to the generic "Would update" label.
+	DryRunUnknown DryRunDecision = iota
+	// DryRunStateChange means the update will mutate the remote's state field.
+	DryRunStateChange
+	// DryRunStatePreserved means non-state fields will be pushed but the
+	// remote's state will be left intact (e.g., Linear's "In Review" preserved
+	// while title/description/labels update).
+	DryRunStatePreserved
+	// DryRunNoDiff means the update would be a no-op. Should rarely surface
+	// since the engine's ContentEqual check usually filters these earlier.
+	DryRunNoDiff
+)
+
+// DryRunPreviewer is an optional capability paired with RemoteAwareUpdater.
+// Trackers that implement it can categorize what an UpdateIssueWithRemote
+// call would do, so dry-run output reflects the same decisions wet-run would
+// make — including the new "state preserved" path that RemoteAwareUpdater
+// enables.
+type DryRunPreviewer interface {
+	PreviewUpdate(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue) DryRunDecision
+}
+
 // BatchPushDryRunner is an optional capability for trackers that can preview
 // batch push decisions without mutating the remote system.
 type BatchPushDryRunner interface {
@@ -104,4 +147,200 @@ type FieldMapper interface {
 	// IssueToTracker builds update fields from a beads issue for the external tracker.
 	// Returns a map of field names to values in the tracker's format.
 	IssueToTracker(issue *types.Issue) map[string]interface{}
+}
+
+// CommentSyncer is an optional interface that tracker adapters can implement
+// to enable bidirectional comment synchronization. The sync engine checks for
+// this interface via type assertion — trackers that don't implement it simply
+// skip comment sync.
+type CommentSyncer interface {
+	// FetchComments retrieves comments for an issue from the external tracker.
+	// Only comments created/updated after `since` are returned (zero time = all).
+	FetchComments(ctx context.Context, externalIssueID string, since time.Time) ([]TrackerComment, error)
+
+	// CreateComment creates a new comment on an issue in the external tracker.
+	// Returns the external ID of the created comment.
+	CreateComment(ctx context.Context, externalIssueID, body string) (string, error)
+}
+
+// AttachmentFetcher is an optional interface that tracker adapters can implement
+// to enable pulling attachment metadata from the external tracker. This is
+// pull-only — beads does not push attachments to external trackers.
+type AttachmentFetcher interface {
+	// FetchAttachments retrieves attachment metadata for an issue from the external tracker.
+	FetchAttachments(ctx context.Context, externalIssueID string) ([]TrackerAttachment, error)
+}
+
+// ProjectSyncer is an optional interface that tracker adapters can implement
+// to enable bidirectional epic-to-project synchronization. When implemented,
+// beads epics are synced as tracker projects (not issues), and the parent-child
+// hierarchy is preserved via sub-issue nesting.
+type ProjectSyncer interface {
+	// CreateProject creates a new project in the external tracker from a beads epic.
+	// Returns the project URL and project ID.
+	CreateProject(ctx context.Context, epic *types.Issue) (projectURL string, projectID string, err error)
+
+	// UpdateProject updates an existing project in the external tracker.
+	UpdateProject(ctx context.Context, projectID string, epic *types.Issue) error
+
+	// FetchProjects retrieves projects from the external tracker.
+	// state can be: "all", or tracker-specific states.
+	FetchProjects(ctx context.Context, state string) ([]TrackerProject, error)
+
+	// AssignIssueToProject assigns an issue to a project in the external tracker.
+	AssignIssueToProject(ctx context.Context, issueExternalID, projectID string) error
+
+	// SetIssueParent sets the parent issue for a sub-issue in the external tracker.
+	SetIssueParent(ctx context.Context, issueExternalID, parentExternalID string) error
+
+	// IsProjectRef checks if an external_ref string refers to a project (not an issue).
+	IsProjectRef(ref string) bool
+
+	// ExtractProjectID extracts the project ID from a project URL or returns the ID directly.
+	ExtractProjectID(ref string) string
+}
+
+// ProjectPullStats summarizes a pull-side Project materialization
+// pass (bd-6cl). Engine surfaces the counts in the overall pull
+// summary; Errors / SnapshotWarnings are surfaced as sync warnings.
+type ProjectPullStats struct {
+	// Fetched is the count of Linear Projects returned by
+	// FetchProjects. Always populated.
+	Fetched int
+	// Created is the count of NEW local epics materialized from
+	// Linear Projects (no prior local match by external_ref).
+	Created int
+	// Updated is the count of existing local epics whose fields
+	// changed as a result of the pull-side resolution.
+	Updated int
+	// Skipped is the count of Projects where the resolver produced
+	// no Updates (no change, first-sync, or close-state preserved).
+	Skipped int
+	// FirstSync is the count of Projects that hit the first-sync
+	// soft rollout (snapshot baseline written, no apply).
+	FirstSync int
+	// Errors is non-fatal per-Project failures.
+	Errors []error
+	// SnapshotWarnings is bd-6cl glue for snapshot-write failures
+	// (severity-distinct from API errors, same convention as
+	// bd-ajn's reconciler stats).
+	SnapshotWarnings []error
+	// PreviewLines is dry-run output: per-Project decision summary
+	// the caller can print. Populated only when DryRun is true.
+	PreviewLines []string
+	// ProjectIDToLocalEpicID maps Linear Project UUIDs to the
+	// matched-or-newly-created local epic bead ID. Used by the
+	// engine's post-pull descendant-dep wiring pass to translate
+	// a pulled Issue's projectId metadata into a parent-child dep
+	// target without a second database lookup. Empty in dry-run
+	// (no creates happened).
+	ProjectIDToLocalEpicID map[string]string
+}
+
+// ProjectPullOptions are the runtime knobs the engine passes to a
+// ProjectPuller. Kept minimal; can grow as needed.
+type ProjectPullOptions struct {
+	// DryRun, when true, runs the resolve logic but does NOT write
+	// any local mutations or snapshot rows. Decisions are logged
+	// via the tracker's existing warn/msg callbacks.
+	DryRun bool
+	// Policy is the ConflictResolution to apply when the resolver
+	// finds true conflicts (both sides moved the same field since
+	// lastSync).
+	Policy ConflictResolution
+	// LastSync is the engine's cluster cursor — used by the
+	// resolver to query dolt_history_issues for local-at-sync
+	// state. Zero value means "no prior sync, treat everything as
+	// new" (every populated field flags as changed locally).
+	LastSync time.Time
+	// Actor is the bead-store actor string for change attribution
+	// on materialized creates / updates.
+	Actor string
+}
+
+// ProjectPuller is the bd-6cl pull-side capability for trackers
+// that materialize remote Projects as local epics. The engine's
+// doPull calls PullProjects at the top of its loop when the
+// tracker implements this interface. Trackers without it (GitHub,
+// Jira, etc.) silently skip the Project-pull phase — same graceful-
+// degradation pattern as ProjectSyncer / PostPullSnapshotter.
+type ProjectPuller interface {
+	PullProjects(ctx context.Context, opts ProjectPullOptions) (*ProjectPullStats, error)
+}
+
+// FieldScopedUpdater is the bd-ajn capability for trackers that
+// support partial-field issue updates. When the conflict resolver
+// determines that only a subset of fields should propagate to the
+// external tracker (LocalChanged \ Conflicting, plus
+// Conflicting-fields-the-policy-resolved-to-local), the engine calls
+// UpdateIssueFields with the explicit field list — instead of the
+// full UpdateIssue, which would also push fields the user didn't
+// touch and potentially clobber concurrent remote changes.
+//
+// fields is the list of ConflictField values to include in the
+// update payload. Adapters are expected to ignore unknown values and
+// to no-op when fields is empty (caller error guard).
+//
+// remote, when non-nil, is the engine's already-fetched current
+// remote — same threading as RemoteAwareUpdater so the adapter can
+// preserve remote-owned state on fields it would otherwise
+// re-resolve from local context.
+type FieldScopedUpdater interface {
+	UpdateIssueFields(ctx context.Context, externalID string, issue *types.Issue, remote *TrackerIssue, fields []ConflictField) (*TrackerIssue, error)
+}
+
+// PostPullSnapshotter is the bd-ajn capability for trackers that
+// maintain a per-issue snapshot used by field-scoped conflict
+// detection. The engine calls RecordPullSnapshot after each
+// successful pull-side import or update so the snapshot row reflects
+// the just-pulled remote state.
+//
+// Implementations should derive snapshot fields from `fetched` (and
+// fetched.Raw when richer data is needed). When the tracker can't
+// snapshot a given issue — wrong adapter type, missing fields,
+// transient store error — they should return nil (best-effort write,
+// next sync will re-baseline via DetectConflicts's first-sync path)
+// or a wrapped error that the engine surfaces as a warning. The
+// engine treats failures as non-fatal because the pull itself has
+// already succeeded; a missed snapshot only costs one spurious
+// conflict-gate next sync.
+type PostPullSnapshotter interface {
+	RecordPullSnapshot(ctx context.Context, localBeadID string, fetched TrackerIssue) error
+}
+
+// TrackerProject represents a project from an external tracker.
+type TrackerProject struct {
+	ID          string
+	Name        string
+	Description string
+	// Content is the long-form body shown on the Project page itself,
+	// distinct from Description (which has tracker-specific length
+	// limits). For Linear, populated from the GraphQL `content` field
+	// when present. bd-6cl uses this to recombine the bd-cs1 split
+	// (short description plus long content) into a single bead
+	// Description on pull-side round-trip.
+	Content   string
+	URL       string
+	State     string
+	UpdatedAt time.Time
+}
+
+// TrackerComment represents a comment from an external tracker.
+type TrackerComment struct {
+	ID        string    // External tracker's comment ID
+	Body      string    // Comment text/body
+	Author    string    // Author name or email
+	CreatedAt time.Time // When the comment was created
+	UpdatedAt time.Time // When the comment was last updated
+}
+
+// TrackerAttachment represents attachment metadata from an external tracker.
+type TrackerAttachment struct {
+	ID        string    // External tracker's attachment ID
+	Filename  string    // Original filename
+	URL       string    // Download or reference URL
+	MimeType  string    // MIME type (e.g., "image/png")
+	SizeBytes int64     // File size in bytes
+	Creator   string    // Who created/uploaded the attachment
+	CreatedAt time.Time // When the attachment was created
 }

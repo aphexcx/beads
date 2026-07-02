@@ -2,6 +2,85 @@
 
 Utility scripts for maintaining the beads project.
 
+## ci/
+
+Repository-owned CI command wrappers. These scripts are the source of truth for
+the target CI tiers; Make targets are aliases for local discoverability.
+
+```bash
+make ci-pr-core
+make ci-pr-policy
+make ci-pr-lint
+make ci-package-mcp
+make ci-package-npm
+make ci-website
+```
+
+Each wrapper auto-detects the repository root, sources `.buildflags` when it
+invokes Go in the default build mode, and records per-command timing through
+`scripts/ci/lib/timing.sh`.
+
+Broad Go test wrappers also source `scripts/ci/lib/test-env.sh`, which creates a
+temporary HOME/XDG/Dolt root, isolates Git global/system config, clears runtime
+Beads/Dolt environment variables, and sets `BEADS_TEST_SKIP=dolt` before tests
+run. This keeps local `make test` and `make ci-pr-core` results comparable to
+the fast PR-core contract even on shared agent hosts. Set
+`BEADS_TEST_ENV_RUN_DOLT=1` only when intentionally running the Dolt-dependent
+tests through these broad wrappers, or `BEADS_TEST_ENV_DISABLE=1` when debugging
+against your real local configuration.
+
+The broad Go wrappers also cap package and test parallelism to `4` by default
+(`GO_TEST_PKG_PARALLEL` and `GO_TEST_PARALLEL`). This avoids turning high-core
+shared hosts into a different test topology than GitHub Actions.
+
+`make ci-pr-policy` includes `scripts/check-testing-short.sh`, which enforces
+that `testing.Short()` is only used for runtime, stress, or large-fixture skips.
+Use build tags, environment checks, or named wrappers for integration/e2e/API
+boundaries.
+
+Package gate wrappers validate publishable/package-adjacent surfaces:
+
+- `make ci-package-mcp` builds or consumes a `bd` binary, puts it on `PATH` as
+  `bd`, then runs locked MCP package `uv sync`, Ruff, mypy, pytest, and build
+  checks.
+- `make ci-package-npm` builds or consumes the native binary expected by
+  `npm-package/bin/bd`, runs the npm package test suite, and checks
+  `npm pack --dry-run`.
+- `make ci-website` runs website dependency install, typecheck,
+  `llms-full.txt` generation, and Docusaurus build.
+
+Set `BEADS_TEST_BD_BINARY=/path/to/bd` for MCP and npm package gates to reuse a
+prebuilt candidate binary instead of rebuilding it inside the wrapper.
+
+## pr-preflight.sh
+
+Read-only PR safety check for agents and maintainers.
+
+```bash
+# Before implementing or opening a related PR
+./scripts/pr-preflight.sh --search "topic keywords" --repo gastownhall/beads
+
+# Before changing, closing, or merging an existing PR
+./scripts/pr-preflight.sh 123 --repo gastownhall/beads
+```
+
+It reports contributor/fork status, draft/review/merge/check state, risky diff
+signals such as `.beads/` changes or missing tests, and the required
+contributor-protection next steps. It does not replace code review or local
+validation.
+
+## gh-body-lint
+
+Lint Markdown files before posting them with `gh ... --body-file`.
+
+```bash
+./scripts/gh-body-lint body.md
+./scripts/gh-body-lint --fix body.md
+```
+
+The lint catches literal `\n` sequences, which render poorly on GitHub, and
+`GH#123` references, which do not auto-link like `#123` or `owner/repo#123`.
+
 ## release.sh (⭐ The Easy Button)
 
 **One-command release** from version bump to local installation.
@@ -88,8 +167,9 @@ Bumps the version number across all beads components in a single command.
 
 Updates version in all these files:
 - `cmd/bd/version.go` - bd CLI version constant
-- `claude-plugin/.claude-plugin/plugin.json` - Plugin version
-- `.claude-plugin/marketplace.json` - Marketplace plugin version
+- `plugins/beads/.claude-plugin/plugin.json` - Claude plugin version
+- `plugins/beads/.codex-plugin/plugin.json` - Codex plugin version
+- `.claude-plugin/marketplace.json` - Claude marketplace plugin version
 - `integrations/beads-mcp/pyproject.toml` - MCP server version
 - `README.md` - Alpha status version
 - `PLUGIN.md` - Version requirements

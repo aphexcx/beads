@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -70,46 +70,56 @@ Examples:
   bd graph --dot issue-id | dot -Tpng > graph.png  # PNG via Graphviz
   bd graph --html issue-id > graph.html  # Interactive browser view
   bd graph --all --html > all.html       # All issues, interactive`,
-	Args: cobra.RangeArgs(0, 1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.RangeArgs(0, 1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("graph")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		ctx := rootCtx
 
-		// Validate args
 		if graphAll && len(args) > 0 {
-			FatalError("cannot specify issue ID with --all flag")
+			return HandleErrorRespectJSON("cannot specify issue ID with --all flag")
 		}
 		if !graphAll && len(args) == 0 {
-			FatalErrorWithHint("issue ID required", "Use --all for all open issues")
+			return HandleErrorWithHintRespectJSON("issue ID required", "Use --all for all open issues")
 		}
 
 		if store == nil {
-			FatalError("no database connection")
+			return HandleErrorRespectJSON("no database connection")
 		}
 
-		// Handle --all flag: show graph for all open issues
 		if graphAll {
 			subgraphs, err := loadAllGraphSubgraphs(ctx, store)
 			if err != nil {
-				FatalError("loading all issues: %v", err)
+				return HandleErrorRespectJSON("loading all issues: %v", err)
 			}
 
 			if len(subgraphs) == 0 {
 				fmt.Println("No open issues found")
-				return
+				return nil
 			}
 
 			if jsonOutput {
-				outputJSON(subgraphs)
-				return
+				return outputJSON(subgraphs)
 			}
 
-			// Render all subgraphs
+			if graphHTML {
+				merged := mergeSubgraphsForHTML(subgraphs)
+				layout := computeLayout(merged)
+				renderGraphHTML(layout, merged)
+				return nil
+			}
+
 			for i, subgraph := range subgraphs {
 				layout := computeLayout(subgraph)
 				if graphDOT {
 					renderGraphDOT(layout, subgraph)
-				} else if graphHTML {
-					renderGraphHTML(layout, subgraph)
 				} else if graphCompact {
 					renderGraphCompact(layout, subgraph)
 				} else if graphBox {
@@ -117,38 +127,33 @@ Examples:
 				} else {
 					renderGraphVisual(layout, subgraph)
 				}
-				if !graphDOT && !graphHTML && i < len(subgraphs)-1 {
+				if !graphDOT && i < len(subgraphs)-1 {
 					fmt.Println(strings.Repeat("─", 60))
 				}
 			}
-			return
+			return nil
 		}
 
-		// Single issue mode
 		issueID, err := utils.ResolvePartialID(ctx, store, args[0])
 		if err != nil {
-			FatalError("issue '%s' not found", args[0])
+			return HandleErrorRespectJSON("issue '%s' not found", args[0])
 		}
 
-		// Load the subgraph
 		subgraph, err := loadGraphSubgraph(ctx, store, issueID)
 		if err != nil {
-			FatalError("loading graph: %v", err)
+			return HandleErrorRespectJSON("loading graph: %v", err)
 		}
 
-		// Compute layout
 		layout := computeLayout(subgraph)
 
 		if jsonOutput {
-			outputJSON(map[string]interface{}{
+			return outputJSON(map[string]interface{}{
 				"root":   subgraph.Root,
 				"issues": subgraph.Issues,
 				"layout": layout,
 			})
-			return
 		}
 
-		// Render graph in selected format
 		if graphDOT {
 			renderGraphDOT(layout, subgraph)
 		} else if graphHTML {
@@ -160,6 +165,7 @@ Examples:
 		} else {
 			renderGraphVisual(layout, subgraph)
 		}
+		return nil
 	},
 }
 
@@ -169,7 +175,16 @@ var graphCheckCmd = &cobra.Command{
 	Long: `Check the dependency graph for cycles, orphans, and other integrity issues.
 
 Returns exit code 0 if the graph is clean, 1 if issues are found.`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("graph-check")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		ctx := rootCtx
 
 		type GraphCheckResult struct {
@@ -182,10 +197,9 @@ Returns exit code 0 if the graph is clean, 1 if issues are found.`,
 
 		result := GraphCheckResult{Clean: true}
 
-		// Detect cycles
 		cycles, err := store.DetectCycles(ctx)
 		if err != nil {
-			FatalErrorRespectJSON("cycle detection failed: %v", err)
+			return HandleErrorRespectJSON("cycle detection failed: %v", err)
 		}
 
 		for _, cycle := range cycles {
@@ -202,14 +216,15 @@ Returns exit code 0 if the graph is clean, 1 if issues are found.`,
 		}
 
 		if jsonOutput {
-			outputJSON(result)
-			if !result.Clean {
-				os.Exit(1)
+			if err := outputJSON(result); err != nil {
+				return err
 			}
-			return
+			if !result.Clean {
+				return SilentExit()
+			}
+			return nil
 		}
 
-		// Human-readable output
 		if result.Clean {
 			fmt.Printf("\n%s Graph integrity check passed\n\n", ui.RenderPass("✓"))
 		} else {
@@ -229,8 +244,9 @@ Returns exit code 0 if the graph is clean, 1 if issues are found.`,
 		fmt.Println()
 
 		if !result.Clean {
-			os.Exit(1)
+			return SilentExit()
 		}
+		return nil
 	},
 }
 
@@ -521,10 +537,40 @@ func loadAllGraphSubgraphs(ctx context.Context, s storage.DoltStorage) ([]*Templ
 }
 
 // computeLayout assigns layers to nodes using topological sort
+// mergeSubgraphsForHTML joins disconnected components into one subgraph so
+// `bd graph --all --html` emits a single valid HTML document.
+func mergeSubgraphsForHTML(subgraphs []*TemplateSubgraph) *TemplateSubgraph {
+	switch len(subgraphs) {
+	case 0:
+		return &TemplateSubgraph{IssueMap: make(map[string]*types.Issue)}
+	case 1:
+		return subgraphs[0]
+	}
+	merged := &TemplateSubgraph{
+		IssueMap: make(map[string]*types.Issue),
+	}
+	for _, sg := range subgraphs {
+		for _, issue := range sg.Issues {
+			merged.IssueMap[issue.ID] = issue
+		}
+		merged.Dependencies = append(merged.Dependencies, sg.Dependencies...)
+	}
+	merged.Issues = make([]*types.Issue, 0, len(merged.IssueMap))
+	for _, issue := range merged.IssueMap {
+		merged.Issues = append(merged.Issues, issue)
+	}
+	sort.Slice(merged.Issues, func(i, j int) bool {
+		return merged.Issues[i].ID < merged.Issues[j].ID
+	})
+	return merged
+}
+
 func computeLayout(subgraph *TemplateSubgraph) *GraphLayout {
 	layout := &GraphLayout{
-		Nodes:  make(map[string]*GraphNode),
-		RootID: subgraph.Root.ID,
+		Nodes: make(map[string]*GraphNode),
+	}
+	if subgraph.Root != nil {
+		layout.RootID = subgraph.Root.ID
 	}
 
 	// Build dependency map (only "blocks" dependencies, not parent-child)
@@ -768,7 +814,7 @@ func renderGraphCompact(layout *GraphLayout, subgraph *TemplateSubgraph) {
 			if nodeI.Issue.Priority != nodeJ.Issue.Priority {
 				return nodeI.Issue.Priority < nodeJ.Issue.Priority
 			}
-			return nodeI.Issue.ID < nodeJ.Issue.ID
+			return utils.NaturalCompareIDs(nodeI.Issue.ID, nodeJ.Issue.ID) < 0
 		})
 	}
 

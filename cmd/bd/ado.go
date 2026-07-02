@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/ado"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/tracker"
@@ -355,6 +356,13 @@ type adoStatusResult struct {
 
 // runADOStatus implements the ado status command.
 func runADOStatus(cmd *cobra.Command, _ []string) error {
+	evt := metrics.NewCommandEvent("ado-status")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
 	cfg := getADOConfig()
 
 	if jsonOutput {
@@ -371,8 +379,7 @@ func runADOStatus(cmd *cobra.Command, _ []string) error {
 		} else {
 			result.Configured = true
 		}
-		outputJSON(result)
-		return nil
+		return outputJSON(result)
 	}
 
 	out := cmd.OutOrStdout()
@@ -402,6 +409,13 @@ func runADOStatus(cmd *cobra.Command, _ []string) error {
 
 // runADOProjects implements the ado projects command.
 func runADOProjects(cmd *cobra.Command, _ []string) error {
+	evt := metrics.NewCommandEvent("ado-projects")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
 	cfg := getADOConfig()
 	if cfg.PAT == "" {
 		return fmt.Errorf("ado.pat not configured: set via 'bd config set ado.pat <token>' or AZURE_DEVOPS_PAT env var")
@@ -423,8 +437,7 @@ func runADOProjects(cmd *cobra.Command, _ []string) error {
 	}
 
 	if jsonOutput {
-		outputJSON(projects)
-		return nil
+		return outputJSON(projects)
 	}
 
 	_, _ = fmt.Fprintln(out, "Azure DevOps Projects")
@@ -465,6 +478,13 @@ type adoSyncResult struct {
 // runADOSync implements the ado sync command.
 // Uses the tracker.Engine for all sync operations.
 func runADOSync(cmd *cobra.Command, _ []string) error {
+	evt := metrics.NewCommandEvent("ado-sync")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
 	cfg := getADOConfig()
 	if err := validateADOConfig(cfg); err != nil {
 		return err
@@ -667,8 +687,7 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 			syncResult.ReconcileDeleted = len(reconcileResult.Deleted)
 			syncResult.ReconcileDenied = len(reconcileResult.Denied)
 		}
-		outputJSON(syncResult)
-		return nil
+		return outputJSON(syncResult)
 	}
 
 	// Human-readable output
@@ -677,11 +696,15 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 			_, _ = fmt.Fprintf(out, "✓ Bootstrap matched %d issues\n", bootstrapMatched)
 		}
 		if result.Stats.Pulled > 0 {
-			_, _ = fmt.Fprintf(out, "✓ Pulled %d issues (%d created, %d updated)\n",
-				result.Stats.Pulled, result.Stats.Created, result.Stats.Updated)
+			_, _ = fmt.Fprintf(out, "✓ Pulled %d issues from ADO (%d created, %d updated locally)\n",
+				result.Stats.Pulled, result.PullStats.Created, result.PullStats.Updated)
 		}
 		if result.Stats.Pushed > 0 {
-			_, _ = fmt.Fprintf(out, "✓ Pushed %d issues\n", result.Stats.Pushed)
+			_, _ = fmt.Fprintf(out, "✓ Pushed %d issues to ADO (%d created, %d updated)\n",
+				result.Stats.Pushed, result.PushStats.Created, result.PushStats.Updated)
+		}
+		if result.Stats.Skipped > 0 {
+			_, _ = fmt.Fprintf(out, "  Skipped %d (no changes needed)\n", result.Stats.Skipped)
 		}
 		if linksPushed > 0 {
 			_, _ = fmt.Fprintf(out, "✓ Synced %d dependency links\n", linksPushed)
@@ -704,11 +727,8 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 		_, _ = fmt.Fprintln(out, "Run without --dry-run to apply changes")
 	}
 
-	// Embedded mode: flush Dolt commit after sync writes.
-	if isEmbeddedMode() && !adoSyncDryRun && store != nil {
-		if _, commitErr := store.CommitPending(rootCtx, actor); commitErr != nil {
-			return fmt.Errorf("failed to commit: %w", commitErr)
-		}
+	if !adoSyncDryRun {
+		commandDidWrite.Store(true)
 	}
 
 	return nil

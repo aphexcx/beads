@@ -1,6 +1,9 @@
 { pkgs, self, ... }:
 let
-  bdBase = pkgs.callPackage ./default.nix { inherit self; };
+  bdBase = pkgs.callPackage ./default.nix {
+    inherit self;
+    buildGoModule = pkgs.buildGo126Module;
+  };
 
   # Wrap the base package with shell completions baked in
   bd = pkgs.stdenv.mkDerivation {
@@ -8,6 +11,9 @@ let
     version = bdBase.version;
 
     phases = [ "installPhase" ];
+
+    env.BD_DISABLE_METRICS = "1";
+    env.BD_DISABLE_EVENT_FLUSH = "1";
 
     installPhase = ''
       mkdir -p $out/bin

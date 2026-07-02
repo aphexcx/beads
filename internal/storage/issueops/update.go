@@ -2,7 +2,6 @@ package issueops
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -125,7 +124,18 @@ type UpdateResult struct {
 // The caller is responsible for Dolt versioning (DOLT_ADD/COMMIT) if needed.
 //
 //nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
-func UpdateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[string]interface{}, actor string) (*UpdateResult, error) {
+func UpdateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string]interface{}, actor string) (*UpdateResult, error) {
+	return updateIssueInTx(ctx, tx, id, updates, actor, true)
+}
+
+// UpdateIssueWithoutEventInTx applies normal update semantics without recording
+// an intermediate event. Demotion uses this to preserve the historical event
+// stream: create/update history is copied, then a single demotion event is added.
+func UpdateIssueWithoutEventInTx(ctx context.Context, tx DBTX, id string, updates map[string]interface{}, actor string) (*UpdateResult, error) {
+	return updateIssueInTx(ctx, tx, id, updates, actor, false)
+}
+
+func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string]interface{}, actor string, recordEvent bool) (*UpdateResult, error) {
 	// Route to correct table.
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
@@ -213,13 +223,41 @@ func UpdateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 		return nil, fmt.Errorf("failed to update issue: %w", err)
 	}
 
-	// Record event.
-	oldData, _ := json.Marshal(oldIssue)
-	newData, _ := json.Marshal(updates)
-	eventType := DetermineEventType(oldIssue, updates)
+	if recordEvent {
+		oldData, _ := json.Marshal(oldIssue)
+		newData, _ := json.Marshal(updates)
+		eventType := DetermineEventType(oldIssue, updates)
 
-	if err := RecordFullEventInTable(ctx, tx, eventTable, id, eventType, actor, string(oldData), string(newData)); err != nil {
-		return nil, fmt.Errorf("failed to record event: %w", err)
+		if err := RecordFullEventInTable(ctx, tx, eventTable, id, eventType, actor, string(oldData), string(newData)); err != nil {
+			return nil, fmt.Errorf("failed to record event: %w", err)
+		}
+	}
+
+	if rawStatus, hasStatus := updates["status"]; hasStatus {
+		var newStatus string
+		switch v := rawStatus.(type) {
+		case string:
+			newStatus = v
+		case types.Status:
+			newStatus = string(v)
+		}
+		oldActive := oldIssue.Status != types.StatusClosed && oldIssue.Status != types.StatusPinned
+		newActive := newStatus != string(types.StatusClosed) && newStatus != string(types.StatusPinned)
+		if oldActive != newActive {
+			var affectedIssues, affectedWisps []string
+			var aerr error
+			if isWisp {
+				affectedIssues, affectedWisps, aerr = AffectedByStatusChangeForWispInTx(ctx, tx, id)
+			} else {
+				affectedIssues, affectedWisps, aerr = AffectedByStatusChangeInTx(ctx, tx, id)
+			}
+			if aerr != nil {
+				return nil, fmt.Errorf("affected by status change for %s: %w", id, aerr)
+			}
+			if err := RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
+				return nil, fmt.Errorf("recompute is_blocked after status change for %s: %w", id, err)
+			}
+		}
 	}
 
 	return &UpdateResult{OldIssue: oldIssue, IsWisp: isWisp}, nil
@@ -228,11 +266,11 @@ func UpdateIssueInTx(ctx context.Context, tx *sql.Tx, id string, updates map[str
 // RecordFullEventInTable records an event with both old and new values.
 //
 //nolint:gosec // G201: table is from WispTableRouting ("events" or "wisp_events")
-func RecordFullEventInTable(ctx context.Context, tx *sql.Tx, table, issueID string, eventType types.EventType, actor, oldValue, newValue string) error {
+func RecordFullEventInTable(ctx context.Context, tx DBTX, table, issueID string, eventType types.EventType, actor, oldValue, newValue string) error {
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, table), issueID, eventType, actor, oldValue, newValue)
+		INSERT INTO %s (id, issue_id, event_type, actor, old_value, new_value)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, table), NewEventID(), issueID, eventType, actor, oldValue, newValue)
 	if err != nil {
 		return fmt.Errorf("record event in %s: %w", table, err)
 	}

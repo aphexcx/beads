@@ -39,6 +39,18 @@ func acquireTestSlot() { testSem <- struct{}{} }
 // releaseTestSlot returns a semaphore slot.
 func releaseTestSlot() { <-testSem }
 
+func acquireAllTestSlots() {
+	for i := 0; i < cap(testSem); i++ {
+		acquireTestSlot()
+	}
+}
+
+func releaseAllTestSlots() {
+	for i := 0; i < cap(testSem); i++ {
+		releaseTestSlot()
+	}
+}
+
 // testContext returns a context with timeout for test operations
 func testContext(t *testing.T) (context.Context, context.CancelFunc) {
 	t.Helper()
@@ -113,15 +125,11 @@ func setupTestStore(t *testing.T) (*DoltStore, func()) {
 
 	// Create an isolated branch for this test
 	_, branchCleanup := testutil.StartTestBranch(t, store.db, testSharedDB)
-
-	// Re-create dolt_ignore'd tables (wisps, etc.) on the branch.
-	// These tables are in dolt_ignore so they only exist in the working set,
-	// not in commits. Branching from main doesn't inherit them.
-	if err := CreateIgnoredTables(store.db); err != nil {
+	if _, err := initSchemaOnDB(ctx, store.db); err != nil {
 		branchCleanup()
 		store.Close()
 		os.RemoveAll(tmpDir)
-		t.Fatalf("CreateIgnoredTables on branch failed: %v", err)
+		t.Fatalf("failed to initialize branch-local ignored schema: %v", err)
 	}
 
 	cleanup := func() {
@@ -1007,6 +1015,73 @@ func TestDoltStoreComments(t *testing.T) {
 	}
 }
 
+// TestDoltStoreGetIssueCommentsPopulatesExternalRef is a regression guard
+// for the geometric-duplication bug fixed alongside this test: the
+// non-transactional DoltStore.GetIssueComments SELECT was missing
+// external_ref, so the Linear push hook's external_ref-based dedupe read
+// empty strings for every comment and re-pushed them on every sync.
+func TestDoltStoreGetIssueCommentsPopulatesExternalRef(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	issue := &types.Issue{
+		ID:          "extref-test-issue",
+		Title:       "ext-ref round trip",
+		Description: "populate external_ref on read",
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	native, err := store.AddIssueComment(ctx, issue.ID, "bob", "written locally")
+	if err != nil {
+		t.Fatalf("add native comment: %v", err)
+	}
+
+	// Simulate an externally-originated comment (the Linear pull side calls
+	// ImportCommentWithRef). Exercises the same write-side code the sync
+	// engine uses.
+	imported, err := store.ImportCommentWithRef(ctx, issue.ID, "alice", "from linear", "linear:comment:abc123", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("import comment with ref: %v", err)
+	}
+
+	got, err := store.GetIssueComments(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("get issue comments: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(got))
+	}
+
+	byID := map[string]*types.Comment{}
+	for _, c := range got {
+		byID[c.ID] = c
+	}
+	if c := byID[native.ID]; c == nil || c.ExternalRef != "" {
+		t.Errorf("native comment should have empty external_ref, got %q", func() string {
+			if c == nil {
+				return "<missing>"
+			}
+			return c.ExternalRef
+		}())
+	}
+	if c := byID[imported.ID]; c == nil || c.ExternalRef != "linear:comment:abc123" {
+		t.Errorf("imported comment should expose external_ref=linear:comment:abc123, got %q", func() string {
+			if c == nil {
+				return "<missing>"
+			}
+			return c.ExternalRef
+		}())
+	}
+}
+
 func TestDoltStoreEvents(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -1434,8 +1509,8 @@ func TestDeleteIssuesCircularDeps(t *testing.T) {
 	// the cycle detection in AddDependency -- this test exercises DeleteIssues'
 	// ability to handle cycles that may exist in the database, not AddDependency.
 	if _, err := store.execContext(ctx, `
-		INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
-		VALUES (?, ?, 'blocks', NOW(), 'tester', '{}')
+		INSERT INTO dependencies (id, issue_id, depends_on_issue_id, type, created_at, created_by, metadata)
+		VALUES (UUID(), ?, ?, 'blocks', NOW(), 'tester', '{}')
 	`, "circ-a", "circ-c"); err != nil {
 		t.Fatalf("failed to insert cycle-completing dep circ-a->circ-c: %v", err)
 	}
@@ -1825,9 +1900,6 @@ func TestDoltStoreGetReadyWork(t *testing.T) {
 }
 
 func TestDoltStoreGetReadyWorkWaitsForChildrenOfSpawner(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow Dolt integration test in short mode")
-	}
 
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -2137,6 +2209,40 @@ func TestEphemeralExplicitID_GetIssue(t *testing.T) {
 	}
 	if !got.Ephemeral {
 		t.Error("Expected Ephemeral=true")
+	}
+}
+
+func TestGetIssue_WispLabelTableErrorPropagates(t *testing.T) {
+	store, cleanup := setupConcurrentTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	wisp := &types.Issue{
+		ID:        "test-wisp-label-error",
+		Title:     "Wisp with missing labels table",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	if err := store.CreateIssue(ctx, wisp, "tester"); err != nil {
+		t.Fatalf("CreateIssue: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "DROP TABLE wisp_labels"); err != nil {
+		t.Fatalf("drop wisp_labels: %v", err)
+	}
+
+	_, err := store.GetIssue(ctx, wisp.ID)
+	if err == nil {
+		t.Fatal("expected error for missing wisp_labels table")
+	}
+	if errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("expected table error, got ErrNotFound: %v", err)
+	}
+	if !strings.Contains(err.Error(), "wisp_labels") {
+		t.Fatalf("expected error to mention wisp_labels, got: %v", err)
 	}
 }
 

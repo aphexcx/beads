@@ -164,7 +164,6 @@ brews:
     repository:
       owner: gastownhall
       name: homebrew-beads
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
     # Disabled: macOS archives are built by a separate CI job (goreleaser-macos),
     # so goreleaser can't generate a complete formula. The update-homebrew-formula

@@ -759,6 +759,13 @@ type IssueDetails struct {
 	Comments     []*Comment                     `json:"comments,omitempty"`
 	Parent       *string                        `json:"parent,omitempty"`
 
+	// Cardinality fields — emitted by default (count-only mode).
+	// Slice fields (Dependents, Comments) are nil when count-only is active.
+	// Use --include-dependents / --include-comments to populate the slices.
+	DependentCount  *int64 `json:"dependent_count,omitempty"`
+	DependencyCount *int64 `json:"dependency_count,omitempty"`
+	CommentCount    *int64 `json:"comment_count,omitempty"`
+
 	// Epic progress fields (populated only for issue_type=epic with children)
 	EpicTotalChildren  *int  `json:"epic_total_children,omitempty"`
 	EpicClosedChildren *int  `json:"epic_closed_children,omitempty"`
@@ -811,15 +818,24 @@ func (d DependencyType) IsValid() bool {
 	return len(d) > 0 && len(d) <= 50
 }
 
+// WellKnownDependencyTypes returns the built-in dependency types accepted by
+// user-facing commands that intentionally reject custom dependency types.
+func WellKnownDependencyTypes() []DependencyType {
+	return []DependencyType{
+		DepBlocks, DepParentChild, DepConditionalBlocks, DepWaitsFor, DepRelated, DepDiscoveredFrom,
+		DepRepliesTo, DepRelatesTo, DepDuplicates, DepSupersedes,
+		DepAuthoredBy, DepAssignedTo, DepApprovedBy, DepAttests, DepTracks,
+		DepUntil, DepCausedBy, DepValidates, DepDelegatedFrom,
+	}
+}
+
 // IsWellKnown checks if the dependency type is a well-known constant.
 // Returns false for custom/user-defined types (which are still valid).
 func (d DependencyType) IsWellKnown() bool {
-	switch d {
-	case DepBlocks, DepParentChild, DepConditionalBlocks, DepWaitsFor, DepRelated, DepDiscoveredFrom,
-		DepRepliesTo, DepRelatesTo, DepDuplicates, DepSupersedes,
-		DepAuthoredBy, DepAssignedTo, DepApprovedBy, DepAttests, DepTracks,
-		DepUntil, DepCausedBy, DepValidates, DepDelegatedFrom:
-		return true
+	for _, wellKnown := range WellKnownDependencyTypes() {
+		if d == wellKnown {
+			return true
+		}
 	}
 	return false
 }
@@ -828,6 +844,13 @@ func (d DependencyType) IsWellKnown() bool {
 // Only blocking types affect the ready work calculation.
 func (d DependencyType) AffectsReadyWork() bool {
 	return d == DepBlocks || d == DepParentChild || d == DepConditionalBlocks || d == DepWaitsFor
+}
+
+// IsBlockingEdge returns true if this dependency type represents a hard blocker.
+// Unlike AffectsReadyWork, this excludes parent-child (structural, not blocking).
+// Used by dep tree rendering to decide whether the [BLOCKED] badge applies.
+func (d DependencyType) IsBlockingEdge() bool {
+	return d == DepBlocks || d == DepConditionalBlocks || d == DepWaitsFor
 }
 
 // WaitsForMeta holds metadata for waits-for dependencies (fanout gates).
@@ -921,11 +944,28 @@ type Label struct {
 
 // Comment represents a comment on an issue
 type Comment struct {
-	ID        string    `json:"id"`
-	IssueID   string    `json:"issue_id"`
-	Author    string    `json:"author"`
-	Text      string    `json:"text"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          string    `json:"id"`
+	IssueID     string    `json:"issue_id"`
+	Author      string    `json:"author"`
+	Text        string    `json:"text"`
+	CreatedAt   time.Time `json:"created_at"`
+	ExternalRef string    `json:"external_ref,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at,omitempty"`
+}
+
+// Attachment represents metadata for a file attached to an issue.
+// Only metadata (URL, filename, size) is stored — not file content.
+type Attachment struct {
+	ID          string    `json:"id"`
+	IssueID     string    `json:"issue_id"`
+	ExternalRef string    `json:"external_ref,omitempty"`
+	Filename    string    `json:"filename,omitempty"`
+	URL         string    `json:"url"`
+	MimeType    string    `json:"mime_type,omitempty"`
+	SizeBytes   int64     `json:"size_bytes,omitempty"`
+	Source      string    `json:"source,omitempty"`
+	Creator     string    `json:"creator,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // UnmarshalJSON handles backward compatibility for Comment.
@@ -1127,9 +1167,10 @@ func BuildReadyExplanation(
 // TreeNode represents a node in a dependency tree
 type TreeNode struct {
 	Issue
-	Depth     int    `json:"depth"`
-	ParentID  string `json:"parent_id"`
-	Truncated bool   `json:"truncated"`
+	Depth          int            `json:"depth"`
+	ParentID       string         `json:"parent_id"`
+	EdgeFromParent DependencyType `json:"edge_from_parent,omitempty"`
+	Truncated      bool           `json:"truncated"`
 }
 
 // MoleculeProgressStats provides efficient progress info for large molecules.
@@ -1239,7 +1280,7 @@ type IssueFilter struct {
 	ExcludeTypes []IssueType // Exclude issues with these types
 
 	// Time-based scheduling filters (GH#820)
-	Deferred    bool       // Filter issues with defer_until set (any value)
+	Deferred    bool       // Filter issues that are scheduled later: defer_until set OR status is deferred
 	DeferAfter  *time.Time // Filter issues with defer_until > this time
 	DeferBefore *time.Time // Filter issues with defer_until < this time
 	DueAfter    *time.Time // Filter issues with due_at > this time
@@ -1253,6 +1294,19 @@ type IssueFilter struct {
 	// Hydration options — control which relational data is populated on returned issues.
 	// Labels are always hydrated. Dependencies are not by default (for performance).
 	IncludeDependencies bool // When true, populate Issue.Dependencies with []*Dependency records
+
+	// SkipLabels suppresses label hydration. When true, the labels JOIN is
+	// skipped and Issue.Labels is left nil (callers MUST treat as empty).
+	// Opt-in performance flag for the bd list --skip-labels code path.
+	SkipLabels bool
+
+	// Performance escape hatches
+	SkipWisps  bool // Q2: skip wisps table merge entirely (for callers that never return ephemeral results)
+	NoIDShrink bool // Q3: force Pattern A (full 47-col scan) even when Limit > 0
+
+	Offset   int
+	SortBy   string
+	SortDesc bool
 }
 
 // SortPolicy determines how ready work is ordered
@@ -1314,8 +1368,9 @@ type WorkFilter struct {
 	IncludeDeferred bool // If true, include issues with future defer_until timestamps
 
 	// Ephemeral issue filtering
-	// By default, GetReadyWork excludes ephemeral issues (wisps).
-	// Set to true to include them (e.g., for merge-request processing).
+	// By default, GetReadyWork excludes ephemeral wisps but includes
+	// no-history wisps because they are durable work items without Dolt history.
+	// Set to true to include ephemeral wisps too (e.g., for merge-request processing).
 	IncludeEphemeral bool
 
 	// Type exclusion: exclude issues with these types from results.
@@ -1326,6 +1381,8 @@ type WorkFilter struct {
 	// Metadata field filtering (GH#1406)
 	MetadataFields map[string]string // Top-level key=value equality; AND semantics (all must match)
 	HasMetadataKey string            // Existence check: issue has this top-level key set (non-null)
+
+	Offset int
 }
 
 // StaleFilter is used to filter stale issue queries

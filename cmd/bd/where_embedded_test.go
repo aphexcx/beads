@@ -19,11 +19,11 @@ func bdWhere(t *testing.T, bd, dir string, args ...string) string {
 	cmd := exec.Command(bd, fullArgs...)
 	cmd.Dir = dir
 	cmd.Env = bdEnv(dir)
-	out, err := cmd.CombinedOutput()
+	stdout, stderr, err := runCommandBuffers(t, cmd)
 	if err != nil {
-		t.Fatalf("bd where %s failed: %v\n%s", strings.Join(args, " "), err, out)
+		t.Fatalf("bd where %s failed: %v\nstdout:\n%s\nstderr:\n%s", strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
-	return string(out)
+	return stdout.String()
 }
 
 func bdWhereAllowError(t *testing.T, bd, dir string, args ...string) (string, error) {
@@ -132,6 +132,11 @@ func TestEmbeddedWhere(t *testing.T) {
 			if p, ok := path.(string); ok && !strings.Contains(p, ".beads") {
 				t.Errorf("expected .beads in path: %v", path)
 			}
+		}
+		if prefix, ok := m["prefix"]; !ok {
+			t.Fatalf("expected prefix in where --json output: %s", out)
+		} else if p, ok := prefix.(string); !ok || p != "tw" {
+			t.Fatalf("expected prefix %q in where --json output, got %#v", "tw", prefix)
 		}
 	})
 }

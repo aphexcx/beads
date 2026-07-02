@@ -22,6 +22,17 @@ func (s *EmbeddedDoltStore) ClaimIssue(ctx context.Context, id string, actor str
 	})
 }
 
+// ClaimReadyIssue atomically claims the first ready issue matching filter.
+func (s *EmbeddedDoltStore) ClaimReadyIssue(ctx context.Context, filter types.WorkFilter, actor string) (*types.Issue, error) {
+	var claimed *types.Issue
+	err := s.withConn(ctx, true, func(tx *sql.Tx) error {
+		var err error
+		claimed, err = issueops.ClaimReadyIssueInTx(ctx, tx, filter, actor)
+		return err
+	})
+	return claimed, err
+}
+
 // UpdateIssue updates fields on an issue.
 // Delegates SQL work to issueops; EmbeddedDolt auto-commits the transaction.
 func (s *EmbeddedDoltStore) UpdateIssue(ctx context.Context, id string, updates map[string]interface{}, actor string) error {

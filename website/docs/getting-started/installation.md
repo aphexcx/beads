@@ -16,6 +16,16 @@ Complete installation guide for all platforms.
 brew install beads
 ```
 
+Homebrew core's `beads` formula is the supported Homebrew package. If you
+previously installed the old tap formula as `bd`, migrate to the core formula:
+
+```bash
+brew uninstall bd
+brew untap gastownhall/beads 2>/dev/null || true
+brew untap steveyegge/beads 2>/dev/null || true
+brew install beads
+```
+
 **Why Homebrew?**
 - Simple one-command install
 - Automatic updates via `brew upgrade`
@@ -30,34 +40,22 @@ curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/inst
 
 The installer will:
 - Detect your platform (macOS/Linux/FreeBSD, amd64/arm64)
-- Install via `go install` if Go is available
+- Fall back to the supported `go install` modes if Go is available
 - Fall back to building from source if needed
 - Guide you through PATH setup if necessary
 
-## Build Dependencies (go install / from source)
+## Go Install and Build Dependencies
 
-If you install via `go install` or build from source, you need system dependencies for CGO:
+Use Homebrew, npm, or the install script if you do not specifically need `go install`.
 
-macOS (Homebrew):
-```bash
-brew install icu4c zstd
-```
+`go install` has two supported modes:
 
-Linux (Debian/Ubuntu):
-```bash
-sudo apt-get install -y libicu-dev libzstd-dev
-```
+- **Server-mode only:** `CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest`
+- **Embedded-capable:** `CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest`
 
-Linux (Fedora/RHEL):
-```bash
-sudo dnf install -y libicu-devel libzstd-devel
-```
+ICU headers are not required. The embedded-capable command uses `gms_pure_go` so go-mysql-server uses Go's stdlib regexp instead of ICU.
 
-If you see `unicode/uregex.h` missing on macOS, `icu4c` is keg-only. Use:
-```bash
-ICU_PREFIX="$(brew --prefix icu4c)"
-CGO_CFLAGS="-I${ICU_PREFIX}/include" CGO_CPPFLAGS="-I${ICU_PREFIX}/include" CGO_LDFLAGS="-L${ICU_PREFIX}/lib" go install github.com/steveyegge/beads/cmd/bd@latest
-```
+Use the `github.com/steveyegge/beads` path for `go install`. The repository now lives under `gastownhall/beads`, but released Go modules still declare `github.com/steveyegge/beads` for compatibility.
 
 ## Platform-Specific Installation
 
@@ -68,16 +66,21 @@ CGO_CFLAGS="-I${ICU_PREFIX}/include" CGO_CPPFLAGS="-I${ICU_PREFIX}/include" CGO_
 brew install beads
 ```
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+**Via go install** (embedded-capable):
+```bash
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 **From source**:
 ```bash
 git clone https://github.com/gastownhall/beads
 cd beads
-go build -o bd ./cmd/bd
+make build
 sudo mv bd /usr/local/bin/
 ```
 
@@ -96,9 +99,14 @@ yay -S beads-git
 paru -S beads-git
 ```
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+**Via go install** (embedded-capable):
+```bash
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### FreeBSD
@@ -108,9 +116,9 @@ go install github.com/steveyegge/beads/cmd/bd@latest
 curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ### Windows 11
@@ -128,12 +136,15 @@ irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
 
 The script installs a prebuilt Windows release if available. Go is only required for `go install` or building from source.
 
-**Via go install**:
+**Via go install** (server-mode only):
 ```pwsh
-go install github.com/steveyegge/beads/cmd/bd@latest
+$env:CGO_ENABLED="0"; go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
-If you see `unicode/uregex.h` missing while building, use the PowerShell install script instead.
+**Via go install** (embedded-capable):
+```pwsh
+$env:CGO_ENABLED="1"; $env:GOFLAGS="-tags=gms_pure_go"; go install github.com/steveyegge/beads/cmd/bd@latest
+```
 
 ## IDE and Editor Integrations
 
@@ -150,16 +161,22 @@ cd your-project
 bd init --quiet
 
 # 3. Setup editor integration (choose one)
-bd setup claude   # Claude Code - installs SessionStart/PreCompact hooks
+bd setup claude   # Claude Code - installs SessionStart hooks
 bd setup cursor   # Cursor IDE - creates .cursor/rules/beads.mdc
 bd setup aider    # Aider - creates .aider.conf.yml
+bd setup codex    # Codex CLI - installs Beads skill, AGENTS.md guidance, and native hooks
+bd setup factory  # Factory.ai Droid - creates/updates AGENTS.md
+bd setup mux      # Mux - creates/updates AGENTS.md
 ```
 
 **How it works:**
+- `bd init` creates or updates `AGENTS.md` and installs project Claude/Codex integrations by default unless you use `--skip-agents` or `--stealth`
 - Editor hooks/rules inject `bd prime` automatically on session start
+- Codex 0.129.0+ uses native `/hooks` for startup and compaction-aware context refresh
 - `bd prime` provides ~1-2k tokens of workflow context
 - You use `bd` CLI commands directly
-- Git hooks (installed by `bd init`) auto-sync the database
+- Git hooks (installed by `bd init`) refresh exports and legacy fallbacks; `bd dolt push/pull` syncs the database
+- `bd onboard` prints the small manual snippet for unsupported agents or custom instruction files
 
 **Why this is recommended:**
 - **Context efficient** - ~1-2k tokens vs 10-50k for MCP tool schemas
@@ -213,6 +230,9 @@ go list -f {{.Target}} github.com/steveyegge/beads/cmd/bd
 
 # Add Go bin to PATH (add to ~/.bashrc or ~/.zshrc)
 export PATH="$PATH:$(go env GOPATH)/bin"
+
+# Or reinstall with the recommended installer
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 ```
 
 ### `zsh: killed bd` or crashes on macOS
@@ -220,8 +240,8 @@ export PATH="$PATH:$(go env GOPATH)/bin"
 This is typically caused by CGO/SQLite compatibility issues:
 
 ```bash
-# Build with CGO enabled
-CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest
+# Install an embedded-capable build
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 ## Updating bd
@@ -247,7 +267,11 @@ brew upgrade beads
 ### go install
 
 ```bash
-go install github.com/steveyegge/beads/cmd/bd@latest
+# Server-mode only
+CGO_ENABLED=0 go install github.com/steveyegge/beads/cmd/bd@latest
+
+# Embedded-capable
+CGO_ENABLED=1 GOFLAGS=-tags=gms_pure_go go install github.com/steveyegge/beads/cmd/bd@latest
 ```
 
 For post-upgrade steps (hooks, migrations), see [Upgrading](/getting-started/upgrading).
@@ -258,4 +282,4 @@ After installation:
 
 1. **Initialize a project**: `cd your-project && bd init`
 2. **Learn the basics**: See [Quick Start](/getting-started/quickstart)
-3. **Configure your agent**: See [IDE Setup](/getting-started/ide-setup)
+3. **Configure your agent**: See [IDE Setup](/getting-started/ide-setup), or run `bd setup --list`

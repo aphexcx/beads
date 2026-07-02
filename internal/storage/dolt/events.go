@@ -12,6 +12,7 @@ import (
 
 // AddComment adds a comment event to an issue
 func (s *DoltStore) AddComment(ctx context.Context, issueID, actor, comment string) error {
+	isWisp := s.isActiveWisp(ctx, issueID)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -21,7 +22,13 @@ func (s *DoltStore) AddComment(ctx context.Context, issueID, actor, comment stri
 	if err := issueops.AddCommentEventInTx(ctx, tx, issueID, actor, comment); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return wrapTransactionError("commit add comment event", err)
+	}
+	if isWisp {
+		return nil
+	}
+	return s.doltAddAndCommit(ctx, []string{"events"}, fmt.Sprintf("bd: comment %s", issueID))
 }
 
 // GetEvents retrieves events for an issue
@@ -55,35 +62,38 @@ func (s *DoltStore) AddIssueComment(ctx context.Context, issueID, author, text s
 // ImportIssueComment adds a comment during import, preserving the original timestamp.
 // This prevents comment timestamp drift across import/export cycles.
 func (s *DoltStore) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error) {
+	isWisp := s.isActiveWisp(ctx, issueID)
 	var result *types.Comment
 	err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		var err error
 		result, err = issueops.ImportIssueCommentInTx(ctx, tx, issueID, author, text, createdAt)
 		return err
 	})
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	if isWisp {
+		return result, nil
+	}
+	if err := s.doltAddAndCommit(ctx, []string{"comments"}, fmt.Sprintf("bd: comment %s", issueID)); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
-// GetIssueComments retrieves all comments for an issue
+// GetIssueComments retrieves all comments for an issue. Delegates to the
+// shared transactional implementation so external_ref and updated_at are
+// populated — the Linear comment push hook relies on external_ref to dedupe
+// already-synced comments and WILL re-push every comment on every run if
+// this field comes back empty (observed as geometric comment growth).
 func (s *DoltStore) GetIssueComments(ctx context.Context, issueID string) ([]*types.Comment, error) {
-	table := "comments"
-	if s.isActiveWisp(ctx, issueID) {
-		table = "wisp_comments"
-	}
-
-	//nolint:gosec // G201: table is hardcoded
-	rows, err := s.queryContext(ctx, fmt.Sprintf(`
-		SELECT id, issue_id, author, text, created_at
-		FROM %s
-		WHERE issue_id = ?
-		ORDER BY created_at ASC, id ASC
-	`, table), issueID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get comments: %w", err)
-	}
-	defer rows.Close()
-
-	return scanComments(rows)
+	var result []*types.Comment
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetIssueCommentsInTx(ctx, tx, issueID)
+		return err
+	})
+	return result, err
 }
 
 // GetCommentsForIssues retrieves comments for multiple issues
@@ -107,17 +117,4 @@ func (s *DoltStore) GetCommentCounts(ctx context.Context, issueIDs []string) (ma
 		return err
 	})
 	return result, err
-}
-
-// scanComments scans comment rows into a slice.
-func scanComments(rows *sql.Rows) ([]*types.Comment, error) {
-	var comments []*types.Comment
-	for rows.Next() {
-		var c types.Comment
-		if err := rows.Scan(&c.ID, &c.IssueID, &c.Author, &c.Text, &c.CreatedAt); err != nil {
-			return nil, fmt.Errorf("failed to scan comment: %w", err)
-		}
-		comments = append(comments, &c)
-	}
-	return comments, rows.Err()
 }
