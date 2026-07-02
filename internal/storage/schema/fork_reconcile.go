@@ -128,11 +128,87 @@ func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
 		return false, err
 	}
 
+	if err := repairForkIssueColumnDrift(ctx, db); err != nil {
+		return false, err
+	}
+
 	if _, err := db.ExecContext(ctx,
 		"DELETE FROM "+mainSource.cursorTable+" WHERE version BETWEEN 51 AND ?", forkPreMergeMainMax); err != nil {
 		return false, fmt.Errorf("rewriting fork main cursor: %w", err)
 	}
 	return true, nil
+}
+
+// forkIssueDriftColumns are the gt-role columns that exist only in the
+// squashed 0001_create_issues: no ALTER migration ever added them, so
+// fork-lineage databases created before the squash carry an issues table
+// without them (observed on 2 of the 15 prod databases). Upstream migration
+// 0053_repair_rig_wisps lists these columns in its promote-INSERT and fails
+// where they are missing. Definitions mirror 0001 (and the wisps twin in
+// 0020) verbatim.
+var forkIssueDriftColumns = []struct {
+	name string
+	ddl  string
+}{
+	{"hook_bead", "VARCHAR(255) DEFAULT ''"},
+	{"role_bead", "VARCHAR(255) DEFAULT ''"},
+	{"agent_state", "VARCHAR(32) DEFAULT ''"},
+	{"last_activity", "DATETIME"},
+	{"role_type", "VARCHAR(32) DEFAULT ''"},
+	{"rig", "VARCHAR(255) DEFAULT ''"},
+}
+
+// repairForkIssueColumnDrift converges a pre-squash fork issues table to the
+// canonical 0001 shape by adding whichever gt-role columns are missing. Runs
+// only on the verified fork-lineage path, is guarded per column, and heals
+// exactly the drift class the content-hash/doctor machinery exists to catch:
+// same recorded version, different actual schema.
+//
+// The ALTERs are committed here, before MigrateUp snapshots dirty tables —
+// otherwise the repair itself would make issues "pre-existing dirty" and the
+// pass's own guard would refuse to run 0052 (which indexes issues). For the
+// same reason the repair refuses to touch an issues table that already has
+// uncommitted changes: committing would sweep user writes into the repair
+// commit.
+func repairForkIssueColumnDrift(ctx context.Context, db DBConn) error {
+	altered := false
+	for _, col := range forkIssueDriftColumns {
+		present, err := columnExists(ctx, db, "issues", col.name)
+		if err != nil {
+			return fmt.Errorf("probing issues.%s: %w", col.name, err)
+		}
+		if present {
+			continue
+		}
+		if !altered {
+			var dirty int
+			if err := db.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM dolt_status WHERE table_name = 'issues'").Scan(&dirty); err != nil {
+				return fmt.Errorf("reading dolt_status for issues: %w", err)
+			}
+			if dirty > 0 {
+				return fmt.Errorf(
+					"issues is missing column %s (pre-squash drift) but has uncommitted changes; commit the working set, then rerun",
+					col.name)
+			}
+		}
+		if _, err := db.ExecContext(ctx,
+			"ALTER TABLE issues ADD COLUMN "+col.name+" "+col.ddl); err != nil {
+			return fmt.Errorf("repairing issues.%s drift: %w", col.name, err)
+		}
+		altered = true
+	}
+	if !altered {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_ADD('issues')"); err != nil {
+		return fmt.Errorf("staging issues drift repair: %w", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"CALL DOLT_COMMIT('-m', 'schema: repair pre-squash issues column drift (bd-dn6)')"); err != nil {
+		return fmt.Errorf("committing issues drift repair: %w", err)
+	}
+	return nil
 }
 
 func reconcileForkIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {

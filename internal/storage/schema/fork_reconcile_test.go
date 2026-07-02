@@ -84,6 +84,11 @@ func expectForkMainVerification(t *testing.T, mock sqlmock.Sqlmock) {
 	for _, v := range []int{51, 52, 53, 54} {
 		expectRecordedHash(mock, "schema_migrations", v, forkFileHash(t, mainSource, forkRenumberedMainFiles[v]))
 	}
+	// Pre-squash drift repair probes: all six gt-role columns present, so no
+	// ALTER and no repair commit.
+	for _, col := range forkIssueDriftColumns {
+		expectColumnProbe(mock, "issues", col.name, true)
+	}
 }
 
 func TestReconcileForkMainCursor_HappyPath_DeletesForkRows(t *testing.T) {
@@ -224,6 +229,9 @@ func TestReconcileForkMainCursor_NullHashes_FallBackToProbes(t *testing.T) {
 	for _, v := range []int{51, 52, 53, 54} {
 		expectRecordedHash(mock, "schema_migrations", v, nil) // pre-hash-column rows
 	}
+	for _, col := range forkIssueDriftColumns {
+		expectColumnProbe(mock, "issues", col.name, true)
+	}
 	mock.ExpectExec(`DELETE FROM schema_migrations WHERE version BETWEEN 51 AND \?`).
 		WithArgs(54).
 		WillReturnResult(sqlmock.NewResult(0, 4))
@@ -237,6 +245,87 @@ func TestReconcileForkMainCursor_NullHashes_FallBackToProbes(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestReconcileForkMainCursor_PreSquashDrift_RepairsAndCommits covers the
+// ace/beads_witness shape: issues lacks the six gt-role columns (pre-squash
+// lineage), so the reconciliation adds them and commits the repair before
+// rewriting the cursor.
+func TestReconcileForkMainCursor_PreSquashDrift_RepairsAndCommits(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+	expectMaxVersion(mock, "schema_migrations", 54)
+	expectTableProbe(mock, "linear_label_snapshots", true)
+	expectColumnProbe(mock, "comments", "external_ref", true)
+	expectColumnProbe(mock, "comments", "updated_at", true)
+	expectTableProbe(mock, "attachments", true)
+	expectHasContentHashColumn(mock, "schema_migrations", true)
+	for _, v := range []int{51, 52, 53, 54} {
+		expectRecordedHash(mock, "schema_migrations", v, forkFileHash(t, mainSource, forkRenumberedMainFiles[v]))
+	}
+	for i, col := range forkIssueDriftColumns {
+		expectColumnProbe(mock, "issues", col.name, false)
+		if i == 0 {
+			// Clean working set on issues, so the repair may proceed.
+			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_status WHERE table_name = 'issues'`).
+				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		}
+		mock.ExpectExec(`ALTER TABLE issues ADD COLUMN ` + col.name).
+			WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+	mock.ExpectExec(`CALL DOLT_ADD\('issues'\)`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`CALL DOLT_COMMIT\('-m', 'schema: repair pre-squash issues column drift \(bd-dn6\)'\)`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`DELETE FROM schema_migrations WHERE version BETWEEN 51 AND \?`).
+		WithArgs(54).
+		WillReturnResult(sqlmock.NewResult(0, 4))
+
+	changed, err := reconcileForkMainCursor(context.Background(), db)
+	if err != nil {
+		t.Fatalf("reconcileForkMainCursor: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestReconcileForkMainCursor_DriftWithDirtyIssues_Errors: a drifted issues
+// table with uncommitted changes must refuse the repair rather than sweep
+// user writes into the repair commit.
+func TestReconcileForkMainCursor_DriftWithDirtyIssues_Errors(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+	expectMaxVersion(mock, "schema_migrations", 54)
+	expectTableProbe(mock, "linear_label_snapshots", true)
+	expectColumnProbe(mock, "comments", "external_ref", true)
+	expectColumnProbe(mock, "comments", "updated_at", true)
+	expectTableProbe(mock, "attachments", true)
+	expectHasContentHashColumn(mock, "schema_migrations", true)
+	for _, v := range []int{51, 52, 53, 54} {
+		expectRecordedHash(mock, "schema_migrations", v, forkFileHash(t, mainSource, forkRenumberedMainFiles[v]))
+	}
+	expectColumnProbe(mock, "issues", forkIssueDriftColumns[0].name, false)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_status WHERE table_name = 'issues'`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	_, err = reconcileForkMainCursor(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") {
+		t.Fatalf("err = %v, want refusal on dirty issues table", err)
 	}
 }
 
