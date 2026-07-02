@@ -272,8 +272,9 @@ func TestReconcileForkMainCursor_PreSquashDrift_RepairsAndCommits(t *testing.T) 
 	for i, col := range forkIssueDriftColumns {
 		expectColumnProbe(mock, "issues", col.name, false)
 		if i == 0 {
-			// Clean working set on issues, so the repair may proceed.
-			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_status WHERE table_name = 'issues'`).
+			// Clean working set (no dirty issues, nothing staged), so the
+			// repair may proceed.
+			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_status WHERE table_name = 'issues' OR staged = true`).
 				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 		}
 		mock.ExpectExec(`ALTER TABLE issues ADD COLUMN ` + col.name).
@@ -320,12 +321,39 @@ func TestReconcileForkMainCursor_DriftWithDirtyIssues_Errors(t *testing.T) {
 		expectRecordedHash(mock, "schema_migrations", v, forkFileHash(t, mainSource, forkRenumberedMainFiles[v]))
 	}
 	expectColumnProbe(mock, "issues", forkIssueDriftColumns[0].name, false)
-	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_status WHERE table_name = 'issues'`).
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_status WHERE table_name = 'issues' OR staged = true`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 
 	_, err = reconcileForkMainCursor(context.Background(), db)
-	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") {
-		t.Fatalf("err = %v, want refusal on dirty issues table", err)
+	if err == nil || !strings.Contains(err.Error(), "uncommitted or staged changes") {
+		t.Fatalf("err = %v, want refusal on dirty/staged working set", err)
+	}
+}
+
+// TestVerifyForkLineageState_MixedCursor_Inconsistent: a fingerprint row
+// coexisting with an unexpected MAX is a state the reconciler refuses, so the
+// doctor must report it as inconsistent, not "will reconcile on next write".
+func TestVerifyForkLineageState_MixedCursor_Inconsistent(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectMaxVersion(mock, "schema_migrations", 73)
+	expectMaxVersion(mock, "ignored_schema_migrations", 11)
+	expectCursorRowProbe(mock, "schema_migrations", 54, 1) // row 54 despite MAX=73
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
+
+	report, err := VerifyForkLineageState(context.Background(), db)
+	if err != nil {
+		t.Fatalf("VerifyForkLineageState: %v", err)
+	}
+	if report.Status != ForkLineageInconsistent {
+		t.Fatalf("Status = %q, want %q (row 54 with MAX=73 is unreconcilable)", report.Status, ForkLineageInconsistent)
+	}
+	if len(report.Problems) == 0 {
+		t.Fatal("Problems is empty, want the mixed-cursor description")
 	}
 }
 

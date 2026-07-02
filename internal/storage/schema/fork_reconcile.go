@@ -181,14 +181,19 @@ func repairForkIssueColumnDrift(ctx context.Context, db DBConn) error {
 			continue
 		}
 		if !altered {
-			var dirty int
+			// Refuse when issues itself is dirty (the repair would commit
+			// user data changes alongside the ALTERs) or when ANY table is
+			// already staged (DOLT_COMMIT commits the whole staged set, so
+			// pre-staged user changes would be swept into the repair commit;
+			// this runs before MigrateUp's own unstagePreExistingTables).
+			var blocked int
 			if err := db.QueryRowContext(ctx,
-				"SELECT COUNT(*) FROM dolt_status WHERE table_name = 'issues'").Scan(&dirty); err != nil {
-				return fmt.Errorf("reading dolt_status for issues: %w", err)
+				"SELECT COUNT(*) FROM dolt_status WHERE table_name = 'issues' OR staged = true").Scan(&blocked); err != nil {
+				return fmt.Errorf("reading dolt_status before drift repair: %w", err)
 			}
-			if dirty > 0 {
+			if blocked > 0 {
 				return fmt.Errorf(
-					"issues is missing column %s (pre-squash drift) but has uncommitted changes; commit the working set, then rerun",
+					"issues is missing column %s (pre-squash drift) but the working set has uncommitted or staged changes; commit the working set, then rerun",
 					col.name)
 			}
 		}
@@ -356,6 +361,24 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 	}
 
 	if has54 || has11 {
+		// A fingerprint row that coexists with an unexpected MAX is a state
+		// the reconciler refuses to rewrite — report it as inconsistent
+		// rather than "will reconcile on the next write" (which would be a
+		// false promise).
+		if has54 && report.MainVersion != forkPreMergeMainMax {
+			report.Problems = append(report.Problems, fmt.Sprintf(
+				"schema_migrations row %d coexists with MAX(version)=%d; reconciliation will refuse this cursor",
+				forkPreMergeMainMax, report.MainVersion))
+		}
+		if has11 && report.IgnoredVersion != forkPreMergeIgnoredMax {
+			report.Problems = append(report.Problems, fmt.Sprintf(
+				"ignored_schema_migrations row %d coexists with MAX(version)=%d; reconciliation will refuse this cursor",
+				forkPreMergeIgnoredMax, report.IgnoredVersion))
+		}
+		if len(report.Problems) > 0 {
+			report.Status = ForkLineageInconsistent
+			return report, nil
+		}
 		report.Status = ForkLineagePreMerge
 		return report, nil
 	}
@@ -377,6 +400,8 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 		{"cursor row 0073 (fork create_attachments)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 73) }},
 		{"table linear_label_snapshots (fork 0070)", func() (bool, error) { return tableExists(ctx, db, "linear_label_snapshots") }},
 		{"column comments.external_ref (fork 0072)", func() (bool, error) { return columnExists(ctx, db, "comments", "external_ref") }},
+		{"column comments.updated_at (fork 0072)", func() (bool, error) { return columnExists(ctx, db, "comments", "updated_at") }},
+		{"index comments.idx_comments_external_ref (fork 0072)", func() (bool, error) { return indexExists(ctx, db, "comments", "idx_comments_external_ref") }},
 		{"table attachments (fork 0073)", func() (bool, error) { return tableExists(ctx, db, "attachments") }},
 		{"index issues.idx_issues_status_updated_at (upstream 0052)", func() (bool, error) { return indexExists(ctx, db, "issues", "idx_issues_status_updated_at") }},
 		{"index issues.idx_issues_defer_until (upstream 0052)", func() (bool, error) { return indexExists(ctx, db, "issues", "idx_issues_defer_until") }},

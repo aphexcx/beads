@@ -412,11 +412,12 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		opts.ExcludeEphemeral = true
 	}
 
-	// Parse --since flag
+	// Parse --since flag. Return (not FatalError/os.Exit): the sync lock
+	// acquired above releases via defer, which an exit would bypass.
 	if sinceStr != "" {
 		sinceTime, err := parseSinceFlag(sinceStr)
 		if err != nil {
-			FatalError("invalid --since value %q: %v", sinceStr, err)
+			return HandleErrorRespectJSON("invalid --since value %q: %v", sinceStr, err)
 		}
 		opts.Since = sinceTime
 	}
