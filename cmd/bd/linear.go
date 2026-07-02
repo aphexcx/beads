@@ -1183,7 +1183,7 @@ func runLinearStatus(cmd *cobra.Command, args []string) {
 	oauthClientID, _ := getLinearConfig(ctx, "linear.oauth_client_id")
 	oauthClientSecret, _ := getLinearConfig(ctx, "linear.oauth_client_secret")
 	teamIDs := getLinearTeamIDs(ctx, nil)
-	lastSync, _ := store.GetConfig(ctx, "linear.last_sync")
+	lastSync := tracker.LastSync(ctx, store, "linear")
 
 	hasOAuth := oauthClientID != "" && oauthClientSecret != ""
 	configured := (apiKey != "" || hasOAuth) && len(teamIDs) > 0
