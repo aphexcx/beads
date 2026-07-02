@@ -102,8 +102,20 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	latestIgnored := LatestIgnoredVersion()
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
+	// bd-dn6 fork-lineage reconciliation probes both cursor tables for the
+	// pre-merge fork fingerprint rows (main 54, ignored 11); neither exists
+	// in this mocked world, so both cursors are left alone.
+	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
+	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
 	expectDoltStatusRows(mock)
 	expectDoltStatusRows(mock)
+	// MigrateUp probes the aux-rekey crash sentinel (bd-578h9.16); this
+	// mocked world has no local_metadata table, so no crashed pass.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	// MigrateUp captures the pre-pass main cursor for the aux re-key
+	// watershed (bd-578h9.4) before the main migrations run.
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS schema_migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectContentHashColumnExists(mock)

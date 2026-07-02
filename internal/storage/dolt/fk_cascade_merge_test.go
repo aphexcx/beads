@@ -42,8 +42,10 @@ var fkCascadeCases = []fkCascadeCase{
 	},
 	{
 		name: "comments",
-		insert: "INSERT INTO comments (issue_id, author, text, created_at) " +
-			"VALUES ('fkc-x-%[1]s', 'peer', 'late comment', NOW())",
+		// comments.id lost its DB-side default in 0051 (bd-2rd37); inserts
+		// must supply an explicit id like the app does (bd-6dnrw.18).
+		insert: "INSERT INTO comments (id, issue_id, author, text, created_at) " +
+			"VALUES (UUID(), 'fkc-x-%[1]s', 'peer', 'late comment', NOW())",
 		orphanQuery: "SELECT COUNT(*) FROM comments WHERE issue_id = 'fkc-x-%[1]s'",
 	},
 }
@@ -255,6 +257,88 @@ func TestFKCascadeViolationRepairOnCLIPull(t *testing.T) {
 	}
 	if violations != 0 {
 		t.Errorf("%d constraint violations survive the repair", violations)
+	}
+}
+
+// TestFKCascadeRepairWithAutoResolvableConflicts covers bd-578h9.14: ONE merge
+// carrying BOTH settle classes — an auto-resolvable metadata conflict (GH#2466)
+// and an FK cascade violation (bd-6dnrw.4). The resolver used to conclude with
+// DOLT_COMMIT while the violations were still outstanding; DOLT_COMMIT refuses
+// a violated working set, so the settle aborted even though each class alone
+// settles fine. Realistic single merge: clone A deletes issue X while clone B
+// adds a child row to X, and both clones touched the same metadata row.
+func TestFKCascadeRepairWithAutoResolvableConflicts(t *testing.T) {
+	tc := fkCascadeCases[1] // labels
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	db := store.db
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("get current branch: %v", err)
+	}
+
+	// Seed the metadata row both branches will rewrite. It lands in
+	// seedFKCascadeDivergence's "seed issues" commit, the branches' common base.
+	if _, err := db.ExecContext(ctx,
+		"REPLACE INTO metadata (`key`, value) VALUES ('bd578h914-key', 'base')"); err != nil {
+		t.Fatalf("seed metadata row: %v", err)
+	}
+	peerBranch := seedFKCascadeDivergence(ctx, t, db, tc)
+
+	// Diverge the metadata row on both branches on top of the FK divergence.
+	if _, err := db.ExecContext(ctx,
+		"UPDATE metadata SET value = 'ours' WHERE `key` = 'bd578h914-key'"); err != nil {
+		t.Fatalf("update metadata on current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'metadata ours')"); err != nil {
+		t.Fatalf("commit metadata on current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", peerBranch); err != nil {
+		t.Fatalf("checkout peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"UPDATE metadata SET value = 'theirs' WHERE `key` = 'bd578h914-key'"); err != nil {
+		t.Fatalf("update metadata on peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'metadata theirs')"); err != nil {
+		t.Fatalf("commit metadata on peer: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("checkout current: %v", err)
+	}
+
+	if err := settleForcedMerge(ctx, t, store, peerBranch); err != nil {
+		t.Fatalf("settling combined conflict+violation merge: %v", err)
+	}
+
+	var metaVal string
+	if err := db.QueryRowContext(ctx,
+		"SELECT value FROM metadata WHERE `key` = 'bd578h914-key'").Scan(&metaVal); err != nil {
+		t.Fatalf("read metadata row: %v", err)
+	}
+	if metaVal != "theirs" {
+		t.Errorf("metadata conflict resolved to %q, want %q (--theirs)", metaVal, "theirs")
+	}
+	var orphans int
+	if err := db.QueryRowContext(ctx, fmt.Sprintf(tc.orphanQuery, tc.name)).Scan(&orphans); err != nil {
+		t.Fatalf("count dangling rows: %v", err)
+	}
+	if orphans != 0 {
+		t.Errorf("repair left %d dangling %s row(s)", orphans, tc.name)
+	}
+	var violations int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COALESCE(SUM(num_violations),0) FROM dolt_constraint_violations").Scan(&violations); err != nil {
+		t.Fatalf("read dolt_constraint_violations: %v", err)
+	}
+	if violations != 0 {
+		t.Errorf("%d constraint violations survive the settle", violations)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'combined settle')"); err != nil && !isDoltNothingToCommit(err) {
+		t.Errorf("post-settle DOLT_COMMIT: %v", err)
 	}
 }
 

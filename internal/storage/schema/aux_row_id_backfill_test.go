@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"regexp"
 	"testing"
 
@@ -202,7 +203,7 @@ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
 		"version", auxRowRekeyMarkerVersion)
 	// No further expectations: no table may be probed or scanned.
 
-	wrote, err := rekeyAuxRowIDs(context.Background(), db)
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1)
 	if err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
@@ -225,18 +226,140 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRowRekeyMarkerVersion-1)
+	expectAuxRekeySentinel(mock, false)
+	expectSetAuxRekeySentinel(mock)
 	// Each of the four tables is probed; this mocked world has none of them,
 	// so each probe returns 0 and the loop completes without scanning.
 	for range auxRekeyTables {
 		expectColumnExists(mock, false)
 	}
+	expectClearAuxRekeySentinel(mock)
 
-	wrote, err := rekeyAuxRowIDs(context.Background(), db)
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1)
 	if err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
 	if wrote {
 		t.Error("expected wrote=false when no aux table exists")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// expectAuxRekeySentinel mocks auxRekeyResumePending: the local_metadata
+// table-existence probe, then (when the table exists) the sentinel-row count.
+func expectAuxRekeySentinel(mock sqlmock.Sqlmock, pending bool) {
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	n := 0
+	if pending {
+		n = 1
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyInProgressKey).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
+}
+
+func expectSetAuxRekeySentinel(mock sqlmock.Sqlmock) {
+	// Fresh clones lack the dolt-ignored local_metadata table, so the set
+	// path ensures it exists first.
+	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, '1')")).
+		WithArgs(auxRowRekeyInProgressKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+func expectClearAuxRekeySentinel(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
+		WithArgs(auxRowRekeyInProgressKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// TestRekeyAuxRowIDsSkipsConvergedLineage verifies the bd-578h9.4 gate: when
+// the main cursor already reached the version that shipped with the re-key
+// BEFORE this pass ran, the lineage was migrated by a rekey-aware binary and
+// has converged — a pending marker just means "fresh clone" (the marker table
+// is dolt-ignored and never synced), and no table may be probed or rewritten.
+func TestRekeyAuxRowIDsSkipsConvergedLineage(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+		"version", auxRowRekeyMarkerVersion-1)
+	expectAuxRekeySentinel(mock, false)
+	// No further expectations: marker is pending, but the pre-pass main
+	// cursor at the watershed and no crash sentinel means no table may be
+	// probed or scanned.
+
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion)
+	if err != nil {
+		t.Fatalf("rekeyAuxRowIDs: %v", err)
+	}
+	if wrote {
+		t.Error("expected wrote=false for a converged lineage (pre-pass cursor at watershed)")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestRekeyAuxRowIDsResumesAfterCrash covers bd-578h9.16: a pass that died
+// mid-rekey already advanced the main cursor past the watershed, so without
+// the sentinel the next pass would read the lineage as a converged fresh
+// clone, record the marker, and strand the partially re-keyed rows forever.
+// A pending sentinel must override the fresh-clone skip and resume the
+// rewrite.
+func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+		"version", auxRowRekeyMarkerVersion-1)
+	expectAuxRekeySentinel(mock, true)
+	expectSetAuxRekeySentinel(mock)
+	for range auxRekeyTables {
+		expectColumnExists(mock, false)
+	}
+	expectClearAuxRekeySentinel(mock)
+
+	// Pre-pass cursor at the watershed — the crashed pass already migrated
+	// main — yet the rewrite must run because the sentinel is pending.
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion); err != nil {
+		t.Fatalf("rekeyAuxRowIDs: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestRekeyAuxRowIDsKeepsSentinelOnFailure: when a table rewrite fails, the
+// sentinel must NOT be cleared — it is the only record that the rewrite is
+// incomplete once the main cursor has advanced.
+func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+		"version", auxRowRekeyMarkerVersion-1)
+	expectAuxRekeySentinel(mock, false)
+	expectSetAuxRekeySentinel(mock)
+	// First table probe fails; no DELETE of the sentinel may follow.
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
+		WillReturnError(errors.New("boom"))
+
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1); err == nil {
+		t.Fatal("expected the table failure to propagate")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)

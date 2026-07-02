@@ -21,9 +21,10 @@
 //
 // The derivation is consumed by the one-time upgrade backfill
 // (rekeyAuxRowIDs in internal/storage/schema). Rows inserted after that
-// backfill keep their DB-minted random ids: a post-backfill row is created on
-// exactly one clone and reaches the others by merge, so its id is random but
-// consistent everywhere and needs no convergence.
+// backfill keep their app-minted random ids (issueops.NewEventID / UUIDv7
+// comment ids; migration 0051 dropped the DB-side DEFAULT): a post-backfill
+// row is created on exactly one clone and reaches the others by merge, so its
+// id is random but consistent everywhere and needs no convergence.
 package rowid
 
 import (

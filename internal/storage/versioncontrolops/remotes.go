@@ -39,10 +39,11 @@ func RemoveRemote(ctx context.Context, db DBConn, name string) error {
 // If user is non-empty, authenticates with that user — DOLT_REMOTE_PASSWORD
 // must be set in the in-process Dolt server's environment.
 //
-// On failure, a best-effort GC is run to clean up any orphaned tmp_pack_*
-// files that DOLT_FETCH may have left in the git-remote-cache. These files
-// accumulate unboundedly across repeated failures and can consume hundreds of
-// gigabytes over time.
+// A failed DOLT_FETCH can leave orphaned tmp_pack_* files in the
+// git-remote-cache; the embedded store's connection teardown sweeps those
+// (cleanGitRemoteCacheGarbage). Do NOT run DOLT_GC here: dolt_gc invalidates
+// every other open session on the same engine, so a failed fetch would break
+// concurrent in-flight connections (bd-6dnrw.10).
 func Fetch(ctx context.Context, db DBConn, peer, user string) error {
 	var err error
 	if user != "" {
@@ -51,10 +52,6 @@ func Fetch(ctx context.Context, db DBConn, peer, user string) error {
 		_, err = db.ExecContext(ctx, "CALL DOLT_FETCH(?)", peer)
 	}
 	if err != nil {
-		// Best-effort: ignore GC errors — the original fetch error is what matters.
-		// DoltGC requires a non-transactional connection; if db is a tx it will
-		// fail silently here, which is acceptable.
-		_ = DoltGC(ctx, db)
 		return fmt.Errorf("fetch from %s: %w", peer, err)
 	}
 	return nil

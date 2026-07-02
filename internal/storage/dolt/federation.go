@@ -2,6 +2,7 @@ package dolt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -61,7 +62,7 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 	// GH#2474: Auto-commit pending changes before pull to prevent
 	// "cannot merge with uncommitted changes" errors.
 	if !s.readOnly {
-		if err := s.Commit(ctx, "auto-commit before pull"); err != nil {
+		if err := s.commitBeforePull(ctx, "auto-commit before pull"); err != nil {
 			if !isDoltNothingToCommit(err) {
 				return nil, fmt.Errorf("failed to commit pending changes before pull: %w", err)
 			}
@@ -77,21 +78,21 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 		}
 	}
 
+	// bd-578h9.3: every peer-pull route funnels through the same settle
+	// machinery as the default-remote pull (pullTransport): the CLI routes
+	// through finishCLIPull, the SQL route through pullWithAutoResolve. A bare
+	// peer pull used to leave non-convergent merges behind — an FK
+	// delete-vs-insert divergence rolls the merge back with nothing in
+	// dolt_conflicts, and mixed-vintage schema_migrations rows conflict on
+	// every retry.
 	var conflicts []storage.Conflict
 	var err error
 	if useCLI, routeErr := s.prepareCLIRouteForPeerGitProtocol(ctx, peer); routeErr != nil {
 		return nil, routeErr
 	} else if useCLI {
 		err = s.withPeerCredentials(ctx, peer, func(creds *remoteCredentials) error {
-			if pullErr := s.doltCLIPullFromPeer(ctx, peer, creds); pullErr != nil {
-				c, conflictErr := s.GetConflicts(ctx)
-				if conflictErr == nil && len(c) > 0 {
-					conflicts = c
-					return nil
-				}
-				return fmt.Errorf("failed to pull from peer %s: %w", peer, pullErr)
-			}
-			return nil
+			pullErr := s.finishCLIPull(ctx, s.doltCLIPullFromPeer(ctx, peer, creds))
+			return s.peerPullOutcome(ctx, peer, pullErr, &conflicts)
 		})
 		return s.finishPeerPull(ctx, conflicts, err, preHead)
 	}
@@ -100,29 +101,38 @@ func (s *DoltStore) PullFrom(ctx context.Context, peer string) ([]storage.Confli
 		if useCLI, err := s.prepareCLIRouteForPeerCredentials(ctx, peer, creds); err != nil {
 			return err
 		} else if useCLI {
-			if pullErr := s.doltCLIPullFromPeer(ctx, peer, creds); pullErr != nil {
-				c, conflictErr := s.GetConflicts(ctx)
-				if conflictErr == nil && len(c) > 0 {
-					conflicts = c
-					return nil
-				}
-				return fmt.Errorf("failed to pull from peer %s: %w", peer, pullErr)
-			}
-			return nil
+			pullErr := s.finishCLIPull(ctx, s.doltCLIPullFromPeer(ctx, peer, creds))
+			return s.peerPullOutcome(ctx, peer, pullErr, &conflicts)
 		}
 		return withEnvCredentials(creds, func() error {
-			if pullErr := s.execWithLongTimeout(ctx, "CALL DOLT_PULL(?)", peer); pullErr != nil {
-				c, conflictErr := s.GetConflicts(ctx)
-				if conflictErr == nil && len(c) > 0 {
-					conflicts = c
-					return nil
-				}
-				return fmt.Errorf("failed to pull from peer %s: %w", peer, pullErr)
-			}
-			return nil
+			pullErr := s.pullWithAutoResolve(ctx, peer, "CALL DOLT_PULL(?)", peer)
+			return s.peerPullOutcome(ctx, peer, pullErr, &conflicts)
 		})
 	})
 	return s.finishPeerPull(ctx, conflicts, err, preHead)
+}
+
+// peerPullOutcome converts a settled peer pull's result into PullFrom's
+// contract: conflicts the settle machinery could not auto-resolve are returned
+// as data for the caller, anything else stays an error. The SQL route rolls
+// the conflicted merge back before returning, so its conflicts arrive only via
+// MergeConflictsError, captured pre-rollback (bd-578h9.15); the CLI route's
+// subprocess writes conflicts to the on-disk working set where GetConflicts
+// still sees them.
+func (s *DoltStore) peerPullOutcome(ctx context.Context, peer string, pullErr error, conflicts *[]storage.Conflict) error {
+	if pullErr == nil {
+		return nil
+	}
+	var mce *versioncontrolops.MergeConflictsError
+	if errors.As(pullErr, &mce) {
+		*conflicts = mce.Conflicts
+		return nil
+	}
+	if c, conflictErr := s.GetConflicts(ctx); conflictErr == nil && len(c) > 0 {
+		*conflicts = c
+		return nil
+	}
+	return fmt.Errorf("failed to pull from peer %s: %w", peer, pullErr)
 }
 
 // finishPeerPull runs the post-merge is_blocked recompute (bd-6dnrw.3) after a
@@ -185,6 +195,13 @@ func (s *DoltStore) ListRemotes(ctx context.Context) ([]storage.RemoteInfo, erro
 // fails open (migration is not wedged on unrelated corruption) but is logged,
 // never swallowed (bd-6dnrw.33).
 func (s *DoltStore) hasPersistedCLIRemote() bool {
+	return s.HasPersistedRemote()
+}
+
+// HasPersistedRemote is the exported on-disk probe for callers that must not
+// trust an empty dolt_remotes table at cold start: the remote-migrate gate
+// and the push/pull "no remote configured" exit-0 skip (bd-578h9.10).
+func (s *DoltStore) HasPersistedRemote() bool {
 	cliDir := s.CLIDir()
 	dirs := []string{cliDir}
 	if s.dbPath != "" && s.dbPath != cliDir {
@@ -294,6 +311,20 @@ func (s *DoltStore) Sync(ctx context.Context, peer string, strategy string) (*Sy
 		StartTime: time.Now(),
 	}
 
+	// GH#2474: match PullFrom — commit pending changes before the merge,
+	// INCLUDING config (where kv.memory.* rows live). Plain Commit excludes
+	// config (GH#2455), so federation metadata writes such as add-peer plus any
+	// persistent memories would otherwise leave the working set dirty and wedge
+	// DOLT_MERGE ("cannot merge with uncommitted changes").
+	if !s.readOnly {
+		if err := s.commitBeforePull(ctx, "auto-commit before sync"); err != nil {
+			if !isDoltNothingToCommit(err) {
+				result.Error = fmt.Errorf("failed to commit pending changes before sync: %w", err)
+				return result, result.Error
+			}
+		}
+	}
+
 	// Step 1: Fetch from peer
 	if err := s.Fetch(ctx, peer); err != nil {
 		result.Error = fmt.Errorf("fetch failed: %w", err)
@@ -331,9 +362,21 @@ func (s *DoltStore) Sync(ctx context.Context, peer string, strategy string) (*Sy
 		}
 		result.ConflictsResolved = true
 
-		// Commit the resolution
-		if err := s.Commit(ctx, fmt.Sprintf("Resolve conflicts from %s using %s strategy", peer, strategy)); err != nil {
+		// Commit the resolution INCLUDING config: the operator chose this
+		// strategy, and plain Commit excludes config (GH#2455). A config-only
+		// conflict — routine now that kv.memory.* memories sync through config —
+		// would otherwise resolve but never commit, leaving the merge
+		// unconcluded and re-wedging the next sync.
+		if err := s.CommitMergeResolution(ctx, fmt.Sprintf("Resolve conflicts from %s using %s strategy", peer, strategy)); err != nil {
 			result.Error = fmt.Errorf("failed to commit conflict resolution: %w", err)
+			return result, result.Error
+		}
+
+		// bd-578h9.11: the conflicted merge skipped the automatic is_blocked
+		// recompute (unresolved rows would have fed it garbage); now that the
+		// resolution is committed, cover the whole merge+resolution window.
+		if err := s.RecomputeBlockedAfterMerge(ctx, beforeCommit); err != nil {
+			result.Error = fmt.Errorf("conflicts resolved but is_blocked recompute failed: %w", err)
 			return result, result.Error
 		}
 	}

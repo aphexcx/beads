@@ -21,6 +21,43 @@ var doltCommitHashRE = regexp.MustCompile(`^[0-9a-v]{32}$`)
 // is not.
 const mergeRecomputeSeedCap = 1000
 
+// isBlockedRecomputePendingKey marks a post-merge is_blocked recompute that
+// failed AFTER its merge was already committed (bd-578h9.11). Without it the
+// retry is unreachable: the next pull's fromCommit is the new HEAD, so the
+// head==fromCommit skip reads the failed window as "nothing merged" and stale
+// is_blocked persists silently. The marker's value is the failed attempt's
+// fromCommit (or "full" when unknown), so the retry can widen its diff window
+// to cover the lost merge instead of always paying the full-graph pass.
+const isBlockedRecomputePendingKey = "is_blocked_recompute_pending"
+
+// MarkIsBlockedRecomputePendingInTx records a failed post-merge recompute so
+// the next RecomputeIsBlockedAfterMergeInTx retries with a widened window. It
+// must run in its OWN transaction — the failed recompute's tx is rolling back.
+// INSERT IGNORE on purpose: when a marker from an earlier failure exists, its
+// older fromCommit covers a superset of this one's window and must win.
+func MarkIsBlockedRecomputePendingInTx(ctx context.Context, tx *sql.Tx, fromCommit string) error {
+	value := fromCommit
+	if !doltCommitHashRE.MatchString(value) {
+		value = "full"
+	}
+	_, err := tx.ExecContext(ctx,
+		"INSERT IGNORE INTO metadata (`key`, value) VALUES (?, ?)",
+		isBlockedRecomputePendingKey, value)
+	return err
+}
+
+// pendingIsBlockedRecompute reads the failure marker; "" means none. Read
+// errors degrade to "no marker" — the marker is a self-heal fast path, and the
+// caller's recompute proceeds either way.
+func pendingIsBlockedRecompute(ctx context.Context, tx *sql.Tx) string {
+	var value string
+	if err := tx.QueryRowContext(ctx,
+		"SELECT value FROM metadata WHERE `key` = ?", isBlockedRecomputePendingKey).Scan(&value); err != nil {
+		return ""
+	}
+	return value
+}
+
 // RecomputeIsBlockedAfterMergeInTx recomputes the denormalized is_blocked
 // column for every issue and wisp whose blocked state may have changed between
 // fromCommit and the current working set — typically the HEAD before a
@@ -50,6 +87,32 @@ const mergeRecomputeSeedCap = 1000
 // clone converges — both sides compute the same values from the same merged
 // graph).
 func RecomputeIsBlockedAfterMergeInTx(ctx context.Context, tx *sql.Tx, fromCommit string) error {
+	// bd-578h9.11: a marker from an earlier recompute that failed after its
+	// merge committed means this call must also cover THAT merge's window —
+	// the head==fromCommit skip below would otherwise read it as "nothing
+	// merged" forever. Widen fromCommit to the failed attempt's (older)
+	// pre-merge HEAD, or to a full pass when it is unknown. The marker is
+	// cleared in this same transaction, so it survives if this attempt fails
+	// too and disappears atomically with a successful recompute.
+	if pending := pendingIsBlockedRecompute(ctx, tx); pending != "" {
+		if doltCommitHashRE.MatchString(pending) && fromCommit != "" {
+			fromCommit = pending
+		} else {
+			fromCommit = ""
+		}
+		if err := recomputeIsBlockedAfterMergeScoped(ctx, tx, fromCommit); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx,
+			"DELETE FROM metadata WHERE `key` = ?", isBlockedRecomputePendingKey)
+		return err
+	}
+	return recomputeIsBlockedAfterMergeScoped(ctx, tx, fromCommit)
+}
+
+// recomputeIsBlockedAfterMergeScoped is RecomputeIsBlockedAfterMergeInTx
+// without the failure-marker handling.
+func recomputeIsBlockedAfterMergeScoped(ctx context.Context, tx *sql.Tx, fromCommit string) error {
 	if fromCommit == "" {
 		// The caller could not read the pre-merge HEAD; recompute everything
 		// rather than skip the hook.
@@ -97,11 +160,19 @@ func mergeAffectedSets(ctx context.Context, tx *sql.Tx, fromCommit string) (issu
 	changedIssues, err := changedIssueIDs(ctx, tx, fromCommit)
 	if err != nil {
 		// dolt_diff fails when the merge also reshaped the table (schema change
-		// between the refs); the safe answer is the full pass.
+		// between the refs); the safe answer is the full pass. A canceled or
+		// timed-out context is not a diff failure, though — falling back would
+		// only run a doomed full recompute on a dead context.
+		if ctx.Err() != nil {
+			return nil, nil, false, ctx.Err()
+		}
 		return nil, nil, false, nil
 	}
 	changedDeps, err := changedDependencyEdges(ctx, tx, fromCommit)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, false, ctx.Err()
+		}
 		return nil, nil, false, nil
 	}
 	if len(changedIssues)+len(changedDeps) > mergeRecomputeSeedCap {
@@ -224,7 +295,7 @@ func recomputeIsBlockedForAll(ctx context.Context, tx *sql.Tx) error {
 }
 
 // allIDs lists every id in table. table must be a hardcoded constant.
-func allIDs(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
+func allIDs(ctx context.Context, tx DBTX, table string) ([]string, error) {
 	//nolint:gosec // G201: table is a hardcoded constant, never user input.
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf("SELECT id FROM %s", table))
 	if err != nil {

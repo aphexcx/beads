@@ -5,6 +5,7 @@ package tracker
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,65 @@ func newTestStore(t *testing.T) *dolt.DoltStore {
 		store.Close()
 	})
 	return store
+}
+
+func TestLastSyncPrefersLocalMetadataOverConfig(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	// Never synced: no value anywhere.
+	if got := LastSync(ctx, store, "linear"); got != "" {
+		t.Errorf("LastSync() on fresh store = %q, want empty", got)
+	}
+
+	// Pre-refactor databases recorded the timestamp in config only.
+	if err := store.SetConfig(ctx, "linear.last_sync", "2026-06-09T20:11:39Z"); err != nil {
+		t.Fatalf("SetConfig() error: %v", err)
+	}
+	if got := LastSync(ctx, store, "linear"); got != "2026-06-09T20:11:39Z" {
+		t.Errorf("LastSync() with config-only value = %q, want config fallback", got)
+	}
+
+	// The engine writes to local metadata, which takes precedence.
+	if err := store.SetLocalMetadata(ctx, "linear.last_sync", "2026-07-01T00:00:00Z"); err != nil {
+		t.Fatalf("SetLocalMetadata() error: %v", err)
+	}
+	if got := LastSync(ctx, store, "linear"); got != "2026-07-01T00:00:00Z" {
+		t.Errorf("LastSync() with both values = %q, want local metadata to win", got)
+	}
+
+	// Prefixes are independent.
+	if got := LastSync(ctx, store, "jira"); got != "" {
+		t.Errorf("LastSync(jira) = %q, want empty", got)
+	}
+}
+
+// Regression test for the read/write mismatch where Sync recorded last_sync
+// in local metadata but status commands read config, reporting "Never" after
+// real syncs.
+func TestSyncTimestampReadableViaLastSync(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	tracker := newMockTracker("test")
+	tracker.issues = []TrackerIssue{
+		{ID: "1", Identifier: "TEST-1", Title: "First issue", UpdatedAt: time.Now()},
+	}
+
+	engine := NewEngine(tracker, store, "test-actor")
+	result, err := engine.Sync(ctx, SyncOptions{Pull: true})
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if result.LastSync == "" {
+		t.Fatal("Sync() did not record LastSync")
+	}
+
+	if got := LastSync(ctx, store, tracker.ConfigPrefix()); got != result.LastSync {
+		t.Errorf("LastSync() = %q, want %q (timestamp written by Sync)", got, result.LastSync)
+	}
 }
 
 func TestEnginePullMatchesExistingIssueByLocalID(t *testing.T) {
@@ -642,6 +702,155 @@ func TestEngineDryRunUsesBatchPreviewWhenAvailable(t *testing.T) {
 	}
 }
 
+// TestEngineBatchDryRunWithoutPreviewerMatchesBatchCandidates is a regression
+// test for bd-f0t: with a tracker that batch-pushes but cannot preview, the
+// dry-run used to fall through to the per-issue loop, whose duplicated filters
+// could drift from the batch candidate selection (observed as a dry-run
+// reporting 14 creates before a real run that created 438). Dry-run and real
+// run must operate on the identical candidate set.
+func TestEngineBatchDryRunWithoutPreviewerMatchesBatchCandidates(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	// A mix of candidate classes: unlinked open and unlinked closed issues
+	// (creates), a linked issue (update), and an excluded type (skip).
+	issues := []*types.Issue{
+		{ID: "bd-dr-open", Title: "bd-dr-open", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-dr-closed1", Title: "bd-dr-closed1", Status: types.StatusClosed, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-dr-closed2", Title: "bd-dr-closed2", Status: types.StatusClosed, IssueType: types.TypeBug, Priority: 2},
+		{ID: "bd-dr-linked", Title: "bd-dr-linked", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2, ExternalRef: strPtr("https://batchonly.test/EXT-9")},
+		{ID: "bd-dr-epic", Title: "bd-dr-epic", Status: types.StatusOpen, IssueType: types.TypeEpic, Priority: 2},
+	}
+	for _, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue(%s) error: %v", issue.ID, err)
+		}
+	}
+	opts := SyncOptions{Push: true, ExcludeTypes: []types.IssueType{types.TypeEpic}}
+
+	// Dry run first (it must not mutate anything).
+	dryTracker := &mockBatchOnlyTracker{mockTracker: newMockTracker("batchonly")}
+	dryEngine := NewEngine(dryTracker, store, "test-actor")
+	var msgs []string
+	dryEngine.OnMessage = func(msg string) { msgs = append(msgs, msg) }
+
+	dryOpts := opts
+	dryOpts.DryRun = true
+	dryResult, err := dryEngine.Sync(ctx, dryOpts)
+	if err != nil {
+		t.Fatalf("dry-run Sync() error: %v", err)
+	}
+	if dryTracker.batchCalls != 0 {
+		t.Fatalf("dry-run called BatchPush %d times, want 0", dryTracker.batchCalls)
+	}
+	wouldCreate := make(map[string]bool)
+	wouldUpdate := make(map[string]bool)
+	for _, msg := range msgs {
+		title := msg[strings.LastIndex(msg, " ")+1:]
+		switch {
+		case strings.Contains(msg, "Would create"):
+			wouldCreate[title] = true
+		case strings.Contains(msg, "Would update"):
+			wouldUpdate[title] = true
+		}
+	}
+
+	// Real run against the same DB state.
+	realTracker := &mockBatchOnlyTracker{mockTracker: newMockTracker("batchonly")}
+	realEngine := NewEngine(realTracker, store, "test-actor")
+	realResult, err := realEngine.Sync(ctx, opts)
+	if err != nil {
+		t.Fatalf("real Sync() error: %v", err)
+	}
+	if realTracker.batchCalls != 1 {
+		t.Fatalf("real run batchCalls = %d, want 1", realTracker.batchCalls)
+	}
+
+	// The dry-run preview must name exactly the issues the real batch push
+	// created and updated (titles equal IDs above).
+	realCreate := make(map[string]bool)
+	realUpdate := make(map[string]bool)
+	for _, issue := range realTracker.batchIssues {
+		ref := derefStr(issue.ExternalRef)
+		if ref == "" || !realTracker.IsExternalRef(ref) {
+			realCreate[issue.ID] = true
+		} else {
+			realUpdate[issue.ID] = true
+		}
+	}
+	if !maps.Equal(wouldCreate, realCreate) {
+		t.Errorf("dry-run create set = %v, real batch create set = %v", wouldCreate, realCreate)
+	}
+	if !maps.Equal(wouldUpdate, realUpdate) {
+		t.Errorf("dry-run update set = %v, real batch update set = %v", wouldUpdate, realUpdate)
+	}
+	if dryResult.PushStats.Created != realResult.PushStats.Created ||
+		dryResult.PushStats.Updated != realResult.PushStats.Updated ||
+		dryResult.PushStats.Skipped != realResult.PushStats.Skipped {
+		t.Errorf("dry-run PushStats = %+v, real PushStats = %+v; preview must match run", dryResult.PushStats, realResult.PushStats)
+	}
+	if dryResult.PushStats.Created != 3 || dryResult.PushStats.Updated != 1 || dryResult.PushStats.Skipped != 1 {
+		t.Errorf("dry-run PushStats = %+v, want Created=3 Updated=1 Skipped=1", dryResult.PushStats)
+	}
+}
+
+// TestEngineBatchDryRunWithoutPreviewerHonorsCreateOnly asserts the dry-run
+// preview applies the same CreateOnly gate as the batch candidate selection:
+// the pre-bd-f0t fall-through printed "Would update" for issues the real
+// batch run would never push.
+func TestEngineBatchDryRunWithoutPreviewerHonorsCreateOnly(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	defer store.Close()
+
+	issues := []*types.Issue{
+		{ID: "bd-co-new", Title: "bd-co-new", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2},
+		{ID: "bd-co-linked", Title: "bd-co-linked", Status: types.StatusOpen, IssueType: types.TypeTask, Priority: 2, ExternalRef: strPtr("https://batchonly.test/EXT-7")},
+	}
+	for _, issue := range issues {
+		if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
+			t.Fatalf("CreateIssue(%s) error: %v", issue.ID, err)
+		}
+	}
+	opts := SyncOptions{Push: true, CreateOnly: true}
+
+	dryTracker := &mockBatchOnlyTracker{mockTracker: newMockTracker("batchonly")}
+	dryEngine := NewEngine(dryTracker, store, "test-actor")
+	var msgs []string
+	dryEngine.OnMessage = func(msg string) { msgs = append(msgs, msg) }
+
+	dryOpts := opts
+	dryOpts.DryRun = true
+	dryResult, err := dryEngine.Sync(ctx, dryOpts)
+	if err != nil {
+		t.Fatalf("dry-run Sync() error: %v", err)
+	}
+	if dryResult.PushStats.Created != 1 || dryResult.PushStats.Updated != 0 || dryResult.PushStats.Skipped != 1 {
+		t.Errorf("dry-run PushStats = %+v, want Created=1 Updated=0 Skipped=1", dryResult.PushStats)
+	}
+	for _, msg := range msgs {
+		if strings.Contains(msg, "Would update") {
+			t.Errorf("dry-run previewed an update under CreateOnly: %q", msg)
+		}
+	}
+
+	realTracker := &mockBatchOnlyTracker{mockTracker: newMockTracker("batchonly")}
+	realEngine := NewEngine(realTracker, store, "test-actor")
+	realResult, err := realEngine.Sync(ctx, opts)
+	if err != nil {
+		t.Fatalf("real Sync() error: %v", err)
+	}
+	if len(realTracker.batchIssues) != 1 || realTracker.batchIssues[0].ID != "bd-co-new" {
+		t.Fatalf("real batch candidates = %+v, want only bd-co-new", realTracker.batchIssues)
+	}
+	if dryResult.PushStats.Created != realResult.PushStats.Created ||
+		dryResult.PushStats.Updated != realResult.PushStats.Updated ||
+		dryResult.PushStats.Skipped != realResult.PushStats.Skipped {
+		t.Errorf("dry-run PushStats = %+v, real PushStats = %+v; preview must match run", dryResult.PushStats, realResult.PushStats)
+	}
+}
+
 func TestEnginePushCountsCreateErrors(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -894,10 +1103,11 @@ func TestEngineConflictResolution(t *testing.T) {
 	store := newTestStore(t)
 	defer store.Close()
 
-	// Set up last_sync (use UTC to avoid DATETIME timezone round-trip issues)
+	// Set up last_sync (use UTC to avoid DATETIME timezone round-trip issues).
+	// The engine reads last_sync from local metadata, not config.
 	lastSync := time.Now().UTC().Add(-1 * time.Hour)
-	if err := store.SetConfig(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
-		t.Fatalf("SetConfig() error: %v", err)
+	if err := store.SetLocalMetadata(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetLocalMetadata() error: %v", err)
 	}
 
 	// Create a local issue that was modified after last_sync
@@ -946,8 +1156,8 @@ func TestEngineSyncDoesNotCreateFalseConflictsAfterPull(t *testing.T) {
 	defer store.Close()
 
 	lastSync := time.Now().UTC().Add(-1 * time.Hour)
-	if err := store.SetConfig(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
-		t.Fatalf("SetConfig() error: %v", err)
+	if err := store.SetLocalMetadata(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetLocalMetadata() error: %v", err)
 	}
 
 	issue := &types.Issue{

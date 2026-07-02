@@ -4,9 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dberrors"
+	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 )
@@ -19,20 +23,55 @@ const migrationContentSkewCheckName = "Migration Content Skew"
 // against the already-cached remote-tracking ref (no network fetch) and warns on
 // any divergence.
 //
-// This is a read-only diagnostic; it never gates push/pull. It runs in server
-// mode (where `bd doctor` runs) and skips cleanly when there is no remote, no
-// cached remote ref, or no recorded hashes to compare.
+// This is a read-only diagnostic; it never gates push/pull. It skips cleanly
+// when there is no remote, no cached remote ref, or no recorded hashes to
+// compare. In an embedded workspace SharedStore only ever holds a server-mode
+// store (nil here), so the check falls back to opening the embedded database
+// directly — embedded mode is what #4259 was reported against, and without
+// the fallback the detection half of the guard never ran there (bd-578h9.13).
 func CheckMigrationContentSkew(ss *SharedStore) DoctorCheck {
-	store := ss.Store()
-	if store == nil {
+	if store := ss.Store(); store != nil {
+		return checkMigrationContentSkew(context.Background(), store.DB(), store.RemoteName())
+	}
+	if check, ok := checkMigrationContentSkewEmbedded(context.Background(), sharedStoreBeadsDir(ss)); ok {
+		return check
+	}
+	return DoctorCheck{
+		Name:     migrationContentSkewCheckName,
+		Status:   StatusOK,
+		Message:  "N/A (no database)",
+		Category: CategoryData,
+	}
+}
+
+// checkMigrationContentSkewEmbedded opens the workspace's embedded Dolt
+// database (read-only diagnostic queries only; nothing is written) and runs
+// the skew comparison on it. Returns ok=false when there is no embedded
+// database to inspect.
+func checkMigrationContentSkewEmbedded(ctx context.Context, beadsDir string) (DoctorCheck, bool) {
+	if beadsDir == "" {
+		return DoctorCheck{}, false
+	}
+	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	if _, err := os.Stat(dataDir); err != nil {
+		return DoctorCheck{}, false
+	}
+	database := configfile.DefaultDoltDatabase
+	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
+		database = cfg.GetDoltDatabase()
+	}
+	db, cleanup, err := embeddeddolt.OpenSQL(ctx, dataDir, database, "")
+	if err != nil {
 		return DoctorCheck{
 			Name:     migrationContentSkewCheckName,
-			Status:   StatusOK,
-			Message:  "N/A (no database)",
+			Status:   StatusWarning,
+			Message:  fmt.Sprintf("Could not check migration content skew (open embedded database): %v", err),
+			Detail:   "The skew check failed to run; this does not mean skew exists. Re-run `bd doctor` and report the error if it persists.",
 			Category: CategoryData,
-		}
+		}, true
 	}
-	return checkMigrationContentSkew(context.Background(), store.DB(), store.RemoteName())
+	defer func() { _ = cleanup() }()
+	return checkMigrationContentSkew(ctx, db, ""), true
 }
 
 // checkMigrationContentSkew compares local migration content hashes against the

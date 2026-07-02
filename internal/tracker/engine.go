@@ -225,7 +225,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 
 	// Phase 2: Pull
 	if opts.Pull {
-		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs, pullFieldScopes)
+		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs, skipPushIDs, pullFieldScopes)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("pull failed: %v", err)
@@ -271,9 +271,13 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		attribute.Int("sync.errors", result.Stats.Errors),
 	)
 
-	// Update last_sync timestamp
+	// Update last_sync timestamp. Dolt DATETIME columns round sub-second
+	// values, so rows this sync just wrote can carry updated_at values up
+	// to half a second in the future of wall clock. Record last_sync at
+	// the next whole second so the engine's own writes are never misread
+	// as local edits by the next pull's conflict guard.
 	if !opts.DryRun {
-		lastSync := time.Now().UTC().Format(time.RFC3339Nano)
+		lastSync := time.Now().UTC().Truncate(time.Second).Add(time.Second).Format(time.RFC3339Nano)
 		key := e.Tracker.ConfigPrefix() + ".last_sync"
 		if err := e.Store.SetLocalMetadata(ctx, key, lastSync); err != nil {
 			e.warn("Failed to update last_sync: %v", err)
@@ -281,7 +285,9 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		result.LastSync = lastSync
 	}
 
-	result.Warnings = e.warnings
+	// Batch-push warnings were already appended above; e.warn-collected
+	// warnings join them rather than replacing them.
+	result.Warnings = append(result.Warnings, e.warnings...)
 	return result, nil
 }
 
@@ -486,13 +492,16 @@ func (e *Engine) detectFieldScopedConflict(
 	}, nil
 }
 
-// doPull imports issues from the external tracker into beads. bd-ajn:
-// pullFieldScopes carries per-issue field restrictions from the
+// doPull imports issues from the external tracker into beads. IDs of issues
+// it creates or updates are added to pulledIDs so a bidirectional sync's push
+// phase does not echo the freshly pulled content straight back to the tracker.
+//
+// bd-ajn: pullFieldScopes carries per-issue field restrictions from the
 // conflict resolver. When set for an issue, buildPullIssueUpdates
 // returns ONLY those fields so the pull doesn't clobber locally-
 // changed fields that aren't part of the resolver's pull set.
 // Empty / missing entry → whole-issue update (legacy path).
-func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs map[string]bool, pullFieldScopes map[string]map[ConflictField]bool) (*PullStats, error) {
+func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs, pulledIDs map[string]bool, pullFieldScopes map[string]map[ConflictField]bool) (*PullStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.pull",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -788,6 +797,9 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				continue
 			}
 			stats.Updated++
+			if pulledIDs != nil {
+				pulledIDs[existing.ID] = true
+			}
 		} else {
 			// Create new issue
 			conv.Issue.ExternalRef = strPtr(ref)
@@ -799,6 +811,9 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				continue
 			}
 			stats.Created++
+			if pulledIDs != nil {
+				pulledIDs[conv.Issue.ID] = true
+			}
 		}
 
 		// Sync comments/attachments after import (new or updated).
@@ -1332,9 +1347,6 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		// post-sync ReconcileProjectMembership pass (Linear-specific,
 		// fired from cmd/bd/linear.go) walks descendants and assigns
 		// them to the right Project via projectId.
-		// NOTE: kept outside classifyPushIssue because epicProjectMap is
-		// built per-push by doEpicSync; dry-run previews build the same map
-		// before classification so candidate sets stay identical (bd-f0t).
 		if _, isEpicProject := epicProjectMap[issue.ID]; isEpicProject {
 			stats.Skipped++
 			continue
@@ -1394,7 +1406,6 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				}
 			}
 		} else {
-			// CreateOnly/force gating already applied by classifyPushIssue (bd-f0t).
 			// Update existing external issue
 			extID := e.Tracker.ExtractIdentifier(derefStr(issue.ExternalRef))
 			if extID == "" {
@@ -2072,6 +2083,19 @@ func (e *Engine) dependencyIssueResolver(ctx context.Context, extraIssues []*typ
 		}
 		if issue := byExternal[strings.ToLower(externalID)]; issue != nil {
 			return issue, nil
+		}
+		// Tracker refs come in URL variants (e.g. Linear URLs with and
+		// without the title slug); match on the extracted identifier the
+		// same way the index above was built.
+		if e.Tracker.IsExternalRef(externalID) {
+			if identifier := strings.TrimSpace(e.Tracker.ExtractIdentifier(externalID)); identifier != "" {
+				if issue := byExternal[identifier]; issue != nil {
+					return issue, nil
+				}
+				if issue := byExternal[strings.ToLower(identifier)]; issue != nil {
+					return issue, nil
+				}
+			}
 		}
 		if strings.Contains(externalID, "://") {
 			return e.Store.GetIssueByExternalRef(ctx, externalID)

@@ -238,8 +238,8 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 		}
 
 		if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO wisp_events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
-		SELECT issue_id, event_type, actor, old_value, new_value, comment, created_at
+		INSERT IGNORE INTO wisp_events (id, issue_id, event_type, actor, old_value, new_value, comment, created_at)
+		SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
 		FROM events WHERE issue_id = ?
 	`, id); err != nil {
 			return fmt.Errorf("copy events for demoted issue %s: %w", id, err)
@@ -249,8 +249,8 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 		}
 
 		if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO wisp_comments (issue_id, author, text, created_at)
-		SELECT issue_id, author, text, created_at
+		INSERT IGNORE INTO wisp_comments (id, issue_id, author, text, created_at)
+		SELECT id, issue_id, author, text, created_at
 		FROM comments WHERE issue_id = ?
 	`, id); err != nil {
 			return fmt.Errorf("copy comments for demoted issue %s: %w", id, err)
@@ -260,9 +260,9 @@ func (s *DoltStore) DemoteToWisp(ctx context.Context, id string, updates map[str
 		}
 
 		if _, err := tx.ExecContext(ctx, `
-		INSERT INTO wisp_events (issue_id, event_type, actor, old_value, new_value)
-		VALUES (?, ?, ?, ?, ?)
-	`, id, types.EventUpdated, actor, "", "demoted to wisp"); err != nil {
+		INSERT INTO wisp_events (id, issue_id, event_type, actor, old_value, new_value)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, issueops.NewEventID(), id, types.EventUpdated, actor, "", "demoted to wisp"); err != nil {
 			return fmt.Errorf("record demotion event for demoted issue %s: %w", id, err)
 		}
 
