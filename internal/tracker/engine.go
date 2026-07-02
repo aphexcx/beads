@@ -1256,10 +1256,14 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 	// per-issue filter), or epic Projects would double-create as Issues
 	// in the batch.
 	if batchTracker, ok := e.Tracker.(BatchPushTracker); ok {
-		pushIssues, skipped := e.collectBatchPushIssues(issues, opts, descendantSet, skipIDs, forceIDs)
+		candidates, skipped := e.collectBatchPushIssues(issues, opts, descendantSet, skipIDs, forceIDs)
 		stats.Skipped += skipped
-		if len(pushIssues) == 0 {
+		if len(candidates) == 0 {
 			return stats, nil
+		}
+		pushIssues := make([]*types.Issue, len(candidates))
+		for i, c := range candidates {
+			pushIssues[i] = c.issue
 		}
 		if opts.DryRun {
 			if dryRunner, ok := e.Tracker.(BatchPushDryRunner); ok {
@@ -1282,66 +1286,61 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				}
 				return stats, nil
 			}
-		} else {
-			batchResult, err := batchTracker.BatchPush(ctx, pushIssues, forceIDs)
-			if err != nil {
-				return nil, fmt.Errorf("batch pushing issues: %w", err)
-			}
-			e.applyBatchPushResult(ctx, batchResult)
-			stats.Created += len(batchResult.Created)
-			stats.Updated += len(batchResult.Updated)
-			stats.Skipped += len(batchResult.Skipped)
-			stats.Errors += len(batchResult.Errors)
-			stats.Warnings = append(stats.Warnings, batchResult.Warnings...)
-			for _, item := range batchResult.Errors {
-				if item.LocalID != "" {
-					e.warn("Failed to push %s in %s: %s", item.LocalID, e.Tracker.DisplayName(), item.Message)
-					continue
+			// The tracker cannot preview a batch push itself, so preview from
+			// the exact candidate set BatchPush would receive. Falling through
+			// to the per-issue loop here would let the preview drift from the
+			// real run whenever the two paths' filters differ (bd-f0t).
+			for _, c := range candidates {
+				if c.action == pushActionCreate {
+					e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(c.issue.Title))
+					stats.Created++
+				} else {
+					e.msg("[dry-run] Would update in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(c.issue.Title))
+					stats.Updated++
 				}
-				e.warn("Failed to push issues in %s: %s", e.Tracker.DisplayName(), item.Message)
 			}
 			return stats, nil
 		}
+		batchResult, err := batchTracker.BatchPush(ctx, pushIssues, forceIDs)
+		if err != nil {
+			return nil, fmt.Errorf("batch pushing issues: %w", err)
+		}
+		e.applyBatchPushResult(ctx, batchResult)
+		stats.Created += len(batchResult.Created)
+		stats.Updated += len(batchResult.Updated)
+		stats.Skipped += len(batchResult.Skipped)
+		stats.Errors += len(batchResult.Errors)
+		stats.Warnings = append(stats.Warnings, batchResult.Warnings...)
+		for _, item := range batchResult.Errors {
+			if item.LocalID != "" {
+				e.warn("Failed to push %s in %s: %s", item.LocalID, e.Tracker.DisplayName(), item.Message)
+				continue
+			}
+			e.warn("Failed to push issues in %s: %s", e.Tracker.DisplayName(), item.Message)
+		}
+		return stats, nil
 	}
 
 	for _, issue := range issues {
-		// Limit to parent and its descendants if requested.
-		if descendantSet != nil && !descendantSet[issue.ID] {
+		action := e.classifyPushIssue(issue, opts, descendantSet, skipIDs, forceIDs)
+		if action == pushActionSkip {
 			stats.Skipped++
 			continue
 		}
-		// Skip filtered types/states/ephemeral
-		if !e.shouldPushIssue(issue, opts) {
-			stats.Skipped++
-			continue
-		}
-
 		// bd-1ay: top-level epics handled as Projects by doEpicSync are
 		// skipped here so they don't double-create as Issues. The
 		// post-sync ReconcileProjectMembership pass (Linear-specific,
 		// fired from cmd/bd/linear.go) walks descendants and assigns
 		// them to the right Project via projectId.
+		// NOTE: kept outside classifyPushIssue because epicProjectMap is
+		// built per-push by doEpicSync; dry-run previews build the same map
+		// before classification so candidate sets stay identical (bd-f0t).
 		if _, isEpicProject := epicProjectMap[issue.ID]; isEpicProject {
 			stats.Skipped++
 			continue
 		}
 
-		// ShouldPush hook: custom filtering (prefix filtering, etc.)
-		if e.PushHooks != nil && e.PushHooks.ShouldPush != nil {
-			if !e.PushHooks.ShouldPush(issue) {
-				stats.Skipped++
-				continue
-			}
-		}
-
-		// Skip conflict-excluded issues
-		if skipIDs[issue.ID] {
-			stats.Skipped++
-			continue
-		}
-
-		extRef := derefStr(issue.ExternalRef)
-		willCreate := extRef == "" || !e.Tracker.IsExternalRef(extRef)
+		willCreate := action == pushActionCreate
 
 		// Skip tombstone creates: a bead that's already closed locally with no
 		// external ref was done without ever flowing through the external
@@ -1354,12 +1353,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 
 		// FormatDescription hook: apply to a copy so we don't mutate local data.
-		pushIssue := issue
-		if e.PushHooks != nil && e.PushHooks.FormatDescription != nil {
-			copy := *issue
-			copy.Description = e.PushHooks.FormatDescription(issue)
-			pushIssue = &copy
-		}
+		pushIssue := e.formatPushIssue(issue)
 
 		if willCreate {
 			if opts.DryRun {
@@ -1399,9 +1393,10 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 					e.warn("Comment push failed for %s: %v", issue.ID, err)
 				}
 			}
-		} else if !opts.CreateOnly || forceIDs[issue.ID] {
+		} else {
+			// CreateOnly/force gating already applied by classifyPushIssue (bd-f0t).
 			// Update existing external issue
-			extID := e.Tracker.ExtractIdentifier(extRef)
+			extID := e.Tracker.ExtractIdentifier(derefStr(issue.ExternalRef))
 			if extID == "" {
 				stats.Skipped++
 				continue
@@ -1528,8 +1523,6 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 					e.warn("Comment push failed for %s: %v", issue.ID, err)
 				}
 			}
-		} else {
-			stats.Skipped++
 		}
 	}
 
@@ -1542,36 +1535,66 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 	return stats, nil
 }
 
-func (e *Engine) collectBatchPushIssues(issues []*types.Issue, opts SyncOptions, descendantSet, skipIDs, forceIDs map[string]bool) ([]*types.Issue, int) {
-	pushIssues := make([]*types.Issue, 0, len(issues))
+// pushAction classifies what the push path will do with an issue.
+type pushAction int
+
+const (
+	pushActionSkip pushAction = iota
+	pushActionCreate
+	pushActionUpdate
+)
+
+// pushCandidate pairs an issue selected for push with the action the push
+// path will take on it.
+type pushCandidate struct {
+	issue  *types.Issue
+	action pushAction
+}
+
+// classifyPushIssue applies the push candidate-selection filters. Both the
+// per-issue loop and the batch path must route through this single helper so
+// dry-run previews and real pushes always operate on the same candidate set
+// (bd-f0t: duplicated filters drifted, making dry-run under-report creates).
+func (e *Engine) classifyPushIssue(issue *types.Issue, opts SyncOptions, descendantSet, skipIDs, forceIDs map[string]bool) pushAction {
+	// Limit to parent and its descendants if requested.
+	if descendantSet != nil && !descendantSet[issue.ID] {
+		return pushActionSkip
+	}
+	// Skip filtered types/states/ephemeral
+	if !e.shouldPushIssue(issue, opts) {
+		return pushActionSkip
+	}
+	// ShouldPush hook: custom filtering (prefix filtering, etc.)
+	if e.PushHooks != nil && e.PushHooks.ShouldPush != nil && !e.PushHooks.ShouldPush(issue) {
+		return pushActionSkip
+	}
+	// Skip conflict-excluded issues
+	if skipIDs[issue.ID] {
+		return pushActionSkip
+	}
+
+	extRef := derefStr(issue.ExternalRef)
+	if extRef == "" || !e.Tracker.IsExternalRef(extRef) {
+		return pushActionCreate
+	}
+	if opts.CreateOnly && !forceIDs[issue.ID] {
+		return pushActionSkip
+	}
+	return pushActionUpdate
+}
+
+func (e *Engine) collectBatchPushIssues(issues []*types.Issue, opts SyncOptions, descendantSet, skipIDs, forceIDs map[string]bool) ([]pushCandidate, int) {
+	candidates := make([]pushCandidate, 0, len(issues))
 	skipped := 0
 	for _, issue := range issues {
-		if descendantSet != nil && !descendantSet[issue.ID] {
+		action := e.classifyPushIssue(issue, opts, descendantSet, skipIDs, forceIDs)
+		if action == pushActionSkip {
 			skipped++
 			continue
 		}
-		if !e.shouldPushIssue(issue, opts) {
-			skipped++
-			continue
-		}
-		if e.PushHooks != nil && e.PushHooks.ShouldPush != nil && !e.PushHooks.ShouldPush(issue) {
-			skipped++
-			continue
-		}
-		if skipIDs[issue.ID] {
-			skipped++
-			continue
-		}
-
-		extRef := derefStr(issue.ExternalRef)
-		willCreate := extRef == "" || !e.Tracker.IsExternalRef(extRef)
-		if !willCreate && opts.CreateOnly && !forceIDs[issue.ID] {
-			skipped++
-			continue
-		}
-		pushIssues = append(pushIssues, e.formatPushIssue(issue))
+		candidates = append(candidates, pushCandidate{issue: e.formatPushIssue(issue), action: action})
 	}
-	return pushIssues, skipped
+	return candidates, skipped
 }
 
 func (e *Engine) formatPushIssue(issue *types.Issue) *types.Issue {
