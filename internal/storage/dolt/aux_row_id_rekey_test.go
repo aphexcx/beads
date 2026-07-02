@@ -16,6 +16,12 @@ import (
 // state every pre-fix database is in when it upgrades.
 const auxRekeyMarkerVersion = 9
 
+// auxRekeyShippedMainVersion mirrors the unexported watershed in
+// internal/storage/schema: the rewrite only runs when the pre-pass main
+// cursor is below it (bd-578h9.4). Simulating a pre-rekey lineage therefore
+// also requires regressing the main cursor below this version.
+const auxRekeyShippedMainVersion = 51
+
 // seedAuxRekeyFixture writes the same logical history rows under
 // clone-specific random primary keys, simulating what migration 0037's
 // UUID() backfill left behind on one clone (bd-6dnrw.2), and commits them so
@@ -50,15 +56,27 @@ func seedAuxRekeyFixture(ctx context.Context, t *testing.T, db *sql.DB, clonePre
 		t.Fatalf("seed event: %v", err)
 	}
 
+	// Regress the main cursor below the re-key watershed: a pre-rekey lineage
+	// was last migrated by a binary without the pass, so its cursor cannot
+	// have reached auxRekeyShippedMainVersion (bd-578h9.4). MigrateUp
+	// re-applies the regressed migrations idempotently.
+	if _, err := db.ExecContext(ctx,
+		"DELETE FROM schema_migrations WHERE version >= ?", auxRekeyShippedMainVersion); err != nil {
+		t.Fatalf("regress main cursor: %v", err)
+	}
+
 	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'seed pre-rekey rows')"); err != nil {
 		t.Fatalf("commit seed: %v", err)
 	}
 
-	// Un-record the clone-local marker so MigrateUp treats this clone as not
-	// yet converged. The cursor is dolt-ignored, so no commit is involved.
+	// Regress the clone-local ignored cursor below the marker so MigrateUp
+	// treats this clone as not yet converged. Pending detection is MAX-based,
+	// so rows at or past the marker must all go — deleting just the marker's
+	// row leaves it non-pending once later ignored migrations exist. The
+	// cursor is dolt-ignored, so no commit is involved.
 	if _, err := db.ExecContext(ctx,
-		"DELETE FROM ignored_schema_migrations WHERE version = ?", auxRekeyMarkerVersion); err != nil {
-		t.Fatalf("unrecord marker: %v", err)
+		"DELETE FROM ignored_schema_migrations WHERE version >= ?", auxRekeyMarkerVersion); err != nil {
+		t.Fatalf("regress ignored cursor: %v", err)
 	}
 }
 
@@ -183,5 +201,64 @@ func TestAuxRowIDRekeyConvergesIndependentClones(t *testing.T) {
 				t.Errorf("comments/events left dirty after MigrateUp")
 			}
 		})
+	}
+}
+
+// TestAuxRowIDRekeyAdoptionRecordsMarkerWithoutRewrite is the bd-578h9.4
+// regression: a fresh clone of an already-converged lineage (main cursor at
+// or past the watershed, clone-local marker absent — the marker table is
+// dolt-ignored and never travels with a clone) must record the marker WITHOUT
+// rewriting any ids. Post-backfill app-minted ids must survive adoption, or
+// every new clone emits a mass PK-rewrite commit on first open.
+func TestAuxRowIDRekeyAdoptionRecordsMarkerWithoutRewrite(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Fully migrated store (cursor at latest). Seed a post-backfill comment
+	// with an app-minted id, as any row written after the fleet's rekey has.
+	appMintedID := "0197a5c0-0000-7000-8000-00000000abcd"
+	if _, err := store.db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('bd-adopt-1', 'adoption fixture', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx,
+		"INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, 'bd-adopt-1', 'alice', 'post-rekey comment', '2026-06-11 09:00:00')",
+		appMintedID); err != nil {
+		t.Fatalf("seed comment: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'seed adopted rows')"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+
+	// Simulate the fresh clone: the dolt-ignored cursor does not travel with
+	// a clone, so the marker (and everything after it) is pending there.
+	if _, err := store.db.ExecContext(ctx,
+		"DELETE FROM ignored_schema_migrations WHERE version >= ?", auxRekeyMarkerVersion); err != nil {
+		t.Fatalf("regress ignored cursor: %v", err)
+	}
+
+	if _, err := schema.MigrateUp(ctx, store.db); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+
+	var gotID string
+	if err := store.db.QueryRowContext(ctx,
+		"SELECT id FROM comments WHERE issue_id = 'bd-adopt-1'").Scan(&gotID); err != nil {
+		t.Fatalf("read comment id: %v", err)
+	}
+	if gotID != appMintedID {
+		t.Errorf("adoption rewrote the app-minted comment id: got %s, want %s", gotID, appMintedID)
+	}
+
+	var markerCount int
+	if err := store.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", auxRekeyMarkerVersion).Scan(&markerCount); err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	if markerCount != 1 {
+		t.Errorf("marker version %d recorded %d times, want 1", auxRekeyMarkerVersion, markerCount)
 	}
 }

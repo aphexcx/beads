@@ -125,7 +125,7 @@ func TestPrintBootstrapRemoteBehindGuidance(t *testing.T) {
 		CurrentVersion: 49,
 		LatestVersion:  50,
 		Pending:        1,
-	}, "https://doltremoteapi.example.com/org/beads")
+	}, "https://doltremoteapi.example.com/org/beads", "bd bootstrap")
 
 	out := buf.String()
 	for _, want := range []string{
@@ -137,5 +137,21 @@ func TestPrintBootstrapRemoteBehindGuidance(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("guidance missing %q in:\n%s", want, out)
 		}
+	}
+}
+
+// bd-4mpy7: bd init's bootstrap path reuses the same guidance but must name
+// the command the operator actually ran in the don't-bother-retrying line.
+func TestPrintBootstrapRemoteBehindGuidance_InitWording(t *testing.T) {
+	var buf bytes.Buffer
+	printBootstrapRemoteBehindGuidance(&buf, &schema.RemoteMigrateGateError{
+		CurrentVersion: 49,
+		LatestVersion:  50,
+		Pending:        1,
+	}, "git+https://github.com/example/dotfiles.git", "bd init")
+
+	out := buf.String()
+	if !strings.Contains(out, "Re-running `bd init` will NOT fix this") {
+		t.Errorf("guidance missing init-specific retry line in:\n%s", out)
 	}
 }

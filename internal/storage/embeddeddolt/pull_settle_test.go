@@ -5,6 +5,7 @@ package embeddeddolt_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -64,9 +65,11 @@ var embeddedFKCascadeCases = []embeddedFKCascadeCase{
 		orphanQuery: "SELECT COUNT(*) FROM labels WHERE issue_id = 'fkc-x-%[1]s'",
 	},
 	{
+		// comments.id lost its DB-side default in 0051 (bd-2rd37); inserts
+		// must supply an explicit id like the app does (bd-6dnrw.18).
 		name: "comments",
-		insert: "INSERT INTO comments (issue_id, author, text, created_at) " +
-			"VALUES ('fkc-x-%[1]s', 'peer', 'late comment', NOW())",
+		insert: "INSERT INTO comments (id, issue_id, author, text, created_at) " +
+			"VALUES (UUID(), 'fkc-x-%[1]s', 'peer', 'late comment', NOW())",
 		orphanQuery: "SELECT COUNT(*) FROM comments WHERE issue_id = 'fkc-x-%[1]s'",
 	},
 }
@@ -260,5 +263,147 @@ func TestEmbeddedMergeAndSettleMetadataConflict(t *testing.T) {
 	}
 	if value != "bbb" {
 		t.Errorf("expected metadata value 'bbb' (theirs), got %q", value)
+	}
+}
+
+// TestEmbeddedMergeAndSettleDirtyWorkingSetSurvivesRefusedMerge pins the
+// bd-578h9.2 fix: when DOLT_MERGE refuses to start because the working set
+// is dirty, no merge state exists, so DOLT_MERGE('--abort') fails too — and
+// the old abortMerge fell back to DOLT_RESET('--hard'), silently destroying
+// the uncommitted rows the merge never touched. The hard reset is now gated
+// on the working set having been clean before the merge ran.
+// TestEmbeddedMergeAndSettleReportsOperatorConflicts covers bd-578h9.15: a
+// semantic conflict the resolver declines (here: both sides retitle the same
+// issue) must surface as MergeConflictsError with the conflicted tables
+// captured BEFORE the abort. The settle machinery aborts such merges, so a
+// post-hoc GetConflicts sees an empty set — which had turned PullFrom's
+// conflict-reporting contract into dead code.
+func TestEmbeddedMergeAndSettleReportsOperatorConflicts(t *testing.T) {
+	te := newTestEnv(t, "opconflict")
+	ctx := t.Context()
+	conn := openSettleConn(t, ctx, te)
+
+	if _, err := conn.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('opc-1', 'base', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("seed issue: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'seed issue')"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH('opcpeer', 'HEAD')"); err != nil {
+		t.Fatalf("create peer branch: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE issues SET title = 'ours' WHERE id = 'opc-1'"); err != nil {
+		t.Fatalf("retitle on main: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'retitle ours')"); err != nil {
+		t.Fatalf("commit main retitle: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('opcpeer')"); err != nil {
+		t.Fatalf("checkout peer: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE issues SET title = 'theirs' WHERE id = 'opc-1'"); err != nil {
+		t.Fatalf("retitle on peer: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'retitle theirs')"); err != nil {
+		t.Fatalf("commit peer retitle: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+
+	err := versioncontrolops.MergeAndSettle(ctx, conn, "opcpeer")
+	var mce *versioncontrolops.MergeConflictsError
+	if !errors.As(err, &mce) {
+		t.Fatalf("want MergeConflictsError, got: %v", err)
+	}
+	foundIssues := false
+	for _, c := range mce.Conflicts {
+		if c.Field == "issues" {
+			foundIssues = true
+		}
+	}
+	if !foundIssues {
+		t.Errorf("captured conflicts %+v do not name the issues table", mce.Conflicts)
+	}
+
+	// The merge must have been aborted: no live conflicts, local value intact.
+	var liveConflicts int
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM dolt_conflicts").Scan(&liveConflicts); err != nil {
+		t.Fatalf("count live conflicts: %v", err)
+	}
+	if liveConflicts != 0 {
+		t.Errorf("%d conflicted table(s) remain after the abort", liveConflicts)
+	}
+	var title string
+	if err := conn.QueryRowContext(ctx,
+		"SELECT title FROM issues WHERE id = 'opc-1'").Scan(&title); err != nil {
+		t.Fatalf("read title: %v", err)
+	}
+	if title != "ours" {
+		t.Errorf("local title = %q after aborted merge, want %q", title, "ours")
+	}
+}
+
+func TestEmbeddedMergeAndSettleDirtyWorkingSetSurvivesRefusedMerge(t *testing.T) {
+	te := newTestEnv(t, "dirtysettle")
+	ctx := t.Context()
+	conn := openSettleConn(t, ctx, te)
+
+	// Seed and commit a baseline, then diverge a peer branch so the merge
+	// has real work to do (a fast-forward can succeed on a dirty set).
+	if _, err := conn.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('dirty-base', 'base', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("seed base issue: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'seed base')"); err != nil {
+		t.Fatalf("commit seed: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_BRANCH('dirtypeer', 'HEAD')"); err != nil {
+		t.Fatalf("create peer branch: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('dirtypeer')"); err != nil {
+		t.Fatalf("checkout peer: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('dirty-peer', 'peer', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("seed peer issue: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'peer work')"); err != nil {
+		t.Fatalf("commit peer: %v", err)
+	}
+	// Diverge main too so the merge is a true three-way merge.
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_CHECKOUT('main')"); err != nil {
+		t.Fatalf("checkout main: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('dirty-main', 'main', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("seed main issue: %v", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'main work')"); err != nil {
+		t.Fatalf("commit main: %v", err)
+	}
+
+	// The user's uncommitted work: present in the working set, never committed.
+	if _, err := conn.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('dirty-uncommitted', 'precious', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("insert uncommitted issue: %v", err)
+	}
+
+	mergeErr := versioncontrolops.MergeAndSettle(ctx, conn, "dirtypeer")
+	if mergeErr == nil {
+		t.Logf("note: this Dolt version merged over a dirty working set without refusing")
+	} else {
+		t.Logf("merge refused as expected: %v", mergeErr)
+	}
+
+	var count int
+	if err := conn.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM issues WHERE id = 'dirty-uncommitted'").Scan(&count); err != nil {
+		t.Fatalf("count uncommitted issue: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("uncommitted working-set row was destroyed by the merge abort path (count=%d)", count)
 	}
 }

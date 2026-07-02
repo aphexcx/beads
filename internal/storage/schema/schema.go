@@ -102,6 +102,53 @@ func CheckForwardDrift(ctx context.Context, db *sql.DB) error {
 	return checkSchemaSkew(ctx, db)
 }
 
+// SchemaBehindError is returned when a database is opened on a path that
+// cannot migrate it (read-only opens) and its schema version is behind the
+// binary's. Without this check the open succeeds and queries fail later with
+// cryptic unknown-column/table errors (bd-578h9.12).
+type SchemaBehindError struct {
+	DBVersion     int
+	BinaryVersion int
+}
+
+func (e *SchemaBehindError) Error() string {
+	return fmt.Sprintf("schema version mismatch: database is at v%d, binary expects v%d, and the read-only open cannot migrate it; run any bd write command in that workspace to migrate, or set BD_IGNORE_SCHEMA_SKEW=1 to read anyway (queries touching newer schema may fail)",
+		e.DBVersion, e.BinaryVersion)
+}
+
+// IsSchemaBehindError reports whether err (or any error it wraps) is a
+// *SchemaBehindError.
+func IsSchemaBehindError(err error) bool {
+	var e *SchemaBehindError
+	return errors.As(err, &e)
+}
+
+// CheckBehindDrift returns a *SchemaBehindError when the database's schema
+// version is behind the binary's. Used by read-only opens, which skip
+// MigrateUp by design (bd-6dnrw.32) — the paths that previously auto-migrated
+// foreign databases (GH#3231) now need a clear open-time failure instead of
+// unknown-column errors at query time. BD_IGNORE_SCHEMA_SKEW=1 downgrades it
+// to a warning, mirroring forward drift. A fresh DB (version 0) is reported
+// as behind too: it has no readable schema at all.
+func CheckBehindDrift(ctx context.Context, db *sql.DB) error {
+	var currentVersion int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+	).Scan(&currentVersion); err != nil {
+		return fmt.Errorf("schema behind-drift check: %w", err)
+	}
+	if currentVersion >= LatestVersion() {
+		return nil
+	}
+	if os.Getenv("BD_IGNORE_SCHEMA_SKEW") == "1" {
+		fmt.Fprintf(os.Stderr,
+			"Warning: schema skew ignored — database (v%d) is behind binary (v%d) and was opened read-only; some queries may fail\n",
+			currentVersion, LatestVersion())
+		return nil
+	}
+	return &SchemaBehindError{DBVersion: currentVersion, BinaryVersion: LatestVersion()}
+}
+
 type dirtyTableState struct {
 	staged bool
 }
@@ -195,6 +242,18 @@ func parseVersion(name string) (int, error) {
 	return strconv.Atoi(parts[0])
 }
 
+// MigrateUpTo applies main-source migrations up to and including maxVersion,
+// without the dirty-table guards, backfills, rekeys, or ignored-source pass
+// that MigrateUp layers on. It exists so cross-upgrade-boundary tests
+// (bd-6dnrw.16) can reconstruct the schema as it stood at a historical
+// release and use it as a Dolt merge ancestor. Production code must use
+// MigrateUp: stopping short of the latest version on a real database leaves
+// it half-upgraded by design.
+func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
+	applied, _, err := mainSource.migrate(ctx, db, maxVersion)
+	return applied, err
+}
+
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
@@ -202,6 +261,18 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	}
 	if !needed {
 		return 0, nil
+	}
+
+	// bd-dn6: databases migrated by a pre-merge fork binary recorded the
+	// fork's migrations under numbers upstream now owns (main 51-54, ignored
+	// 10-11). Rewrite those cursor rows to the renumbered scheme BEFORE
+	// pending versions are computed, so this pass applies upstream's
+	// same-numbered migrations instead of silently skipping them. The DELETE
+	// only touches the cursor tables (exempt from the dirty-table guards) and
+	// is committed with the rest of the pass; a crash before the commit is
+	// harmless because detection re-probes actual schema state.
+	if _, err := reconcileForkLineageCursors(ctx, db); err != nil {
+		return 0, fmt.Errorf("reconciling fork-lineage migration cursors: %w", err)
 	}
 
 	dirtyBeforeAll, err := dirtyTables(ctx, db, false)
@@ -215,6 +286,19 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("reading pre-migration status: %w", err)
 	}
+	// A previous pass that crashed mid-aux-rekey left its partial UPDATEs
+	// dirty in the working set with the in-progress sentinel still recorded
+	// (bd-578h9.16). Those tables are this pass's own migration state, not
+	// pre-existing user writes: dropping them from dirtyBefore exempts them
+	// from the changed-signature guard (the resumed rekey is about to change
+	// them) and lets stageSchemaTables commit them with the rest of the pass.
+	if resuming, err := auxRekeyResumePending(ctx, db); err != nil {
+		return 0, fmt.Errorf("reading aux rekey sentinel: %w", err)
+	} else if resuming {
+		for _, t := range auxRekeyTables {
+			delete(dirtyBefore, t.name)
+		}
+	}
 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
 	if err != nil {
 		return 0, fmt.Errorf("checking dirty tables against pending migrations: %w", err)
@@ -226,7 +310,16 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("reading pre-migration dirty table diffs: %w", err)
 	}
-	applied, mainColumnAdded, err := mainSource.migrate(ctx, db)
+	// Captured before the main migrations run: the aux re-key uses it to
+	// distinguish the lineage's first rekey-aware migration (run the pass)
+	// from a fresh clone of an already-converged lineage (record the marker
+	// only, bd-578h9.4).
+	mainVersionBefore, err := mainSource.currentVersion(ctx, db)
+	if err != nil {
+		return 0, fmt.Errorf("reading pre-migration schema version: %w", err)
+	}
+
+	applied, mainColumnAdded, err := mainSource.migrate(ctx, db, 0)
 	if err != nil {
 		return applied, err
 	}
@@ -251,8 +344,10 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// migration 0037 randomized per-clone, the same hazard class on the aux
 	// tables. Gated on the clone-local ignored marker (recorded later in this
 	// pass by ignoredSource.migrate) so it runs exactly once per clone instead
-	// of churning synced rows on every later migration pass.
-	auxRekeyed, err := rekeyAuxRowIDs(ctx, db)
+	// of churning synced rows on every later migration pass — and on the
+	// pre-pass main cursor, so fresh clones of converged lineages record the
+	// marker without re-running the rewrite (bd-578h9.4).
+	auxRekeyed, err := rekeyAuxRowIDs(ctx, db, mainVersionBefore)
 	if err != nil {
 		return applied, fmt.Errorf("rekey aux row ids: %w", err)
 	}
@@ -270,7 +365,7 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 		return applied, fmt.Errorf("pending ignored schema migrations alter pre-existing dirty tables: %s", strings.Join(touchedIgnoredDirtyTables, ", "))
 	}
 
-	appliedIgnored, ignoredColumnAdded, err := ignoredSource.migrate(ctx, db)
+	appliedIgnored, ignoredColumnAdded, err := ignoredSource.migrate(ctx, db, 0)
 	if err != nil {
 		return applied, fmt.Errorf("ignored migrations: %w", err)
 	}
@@ -817,7 +912,10 @@ func migrationSQLTouchesTable(sqlText, table string) bool {
 // numbered migrations applied plus whether it added the content_hash column to a
 // pre-existing cursor table. The column signal lets MigrateUp stage and commit
 // that ALTER as schema work even when no numbered migration was applied.
-func (m migrationSource) migrate(ctx context.Context, db DBConn) (int, bool, error) {
+// migrate applies pending migrations from this source. upTo bounds the highest
+// version applied; pass 0 for the latest (the production path — only the
+// MigrateUpTo test-support path passes a real bound).
+func (m migrationSource) migrate(ctx context.Context, db DBConn, upTo int) (int, bool, error) {
 	if _, err := db.ExecContext(ctx, m.bootstrapSQL()); err != nil {
 		return 0, false, fmt.Errorf("creating %s: %w", m.cursorTable, err)
 	}
@@ -826,18 +924,23 @@ func (m migrationSource) migrate(ctx context.Context, db DBConn) (int, bool, err
 		return 0, false, err
 	}
 
+	target := m.latest()
+	if upTo > 0 && upTo < target {
+		target = upTo
+	}
+
 	var current int
 	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM "+m.cursorTable).Scan(&current); err != nil && err != sql.ErrNoRows {
 		return 0, columnAdded, fmt.Errorf("reading %s version: %w", m.cursorTable, err)
 	}
 
-	if current >= m.latest() {
+	if current >= target {
 		return 0, columnAdded, nil
 	}
 
 	count := 0
 	for _, mf := range m.list() {
-		if mf.version <= current {
+		if mf.version <= current || mf.version > target {
 			continue
 		}
 		data, err := m.files.ReadFile(m.dir + "/" + mf.name)

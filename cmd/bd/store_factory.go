@@ -54,6 +54,12 @@ func newDoltStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, e
 	if cfg.ServerMode {
 		return dolt.New(ctx, cfg)
 	}
+	if cfg.ReadOnly {
+		// Read-only commands must not be bricked by the #4259
+		// remote-migrate gate (bd-578h9.5); server mode's ReadOnly opens
+		// already skip migration entirely.
+		return embeddeddolt.OpenForReadOnlyCommand(ctx, cfg.BeadsDir, cfg.Database, "main")
+	}
 	return embeddeddolt.Open(ctx, cfg.BeadsDir, cfg.Database, "main")
 }
 

@@ -21,6 +21,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
@@ -123,7 +124,16 @@ Examples:
   bd bootstrap --json       # Output plan as JSON
   bd bootstrap --yes        # Skip confirmation prompt
 `,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("bootstrap")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		yesFlag, _ := cmd.Flags().GetBool("yes")
 		nonInteractiveFlag, _ := cmd.Flags().GetBool("non-interactive")
@@ -153,7 +163,7 @@ Examples:
 						} else {
 							cwd, err := os.Getwd()
 							if err != nil {
-								FatalError("failed to get working directory: %v", err)
+								return HandleError("failed to get working directory: %v", err)
 							}
 							beadsDir = filepath.Join(cwd, ".beads")
 						}
@@ -163,15 +173,15 @@ Examples:
 		}
 
 		if beadsDir == "" {
-			// No .beads and no remote data — nothing to bootstrap from.
 			if jsonOutput {
-				outputJSON(noWorkspaceBootstrapPayload())
-			} else {
-				fmt.Fprintf(os.Stderr, "%s\n", activeWorkspaceNotFoundMessage())
-				fmt.Fprintf(os.Stderr, "Hint: %s\n", diagHint())
-				fmt.Fprintf(os.Stderr, "Bootstrap is for existing projects that need database setup.\n")
+				if err := outputJSON(noWorkspaceBootstrapPayload()); err != nil {
+					return err
+				}
+				return SilentExit()
 			}
-			os.Exit(1)
+			fmt.Fprintf(os.Stderr, "Hint: %s\n", diagHint())
+			fmt.Fprintf(os.Stderr, "Bootstrap is for existing projects that need database setup.\n")
+			return HandleError("%s", activeWorkspaceNotFoundMessage())
 		}
 
 		// Load config from .beads/metadata.json. When the beadsDir was
@@ -190,7 +200,7 @@ Examples:
 
 		resolvedCfg, repairMsg, err := applyBootstrapMetadataRepair(beadsDir, cfg, !dryRun)
 		if err != nil {
-			FatalError("failed to reconcile shared-server metadata: %v", err)
+			return HandleError("failed to reconcile shared-server metadata: %v", err)
 		}
 		if resolvedCfg != nil {
 			cfg = resolvedCfg
@@ -200,9 +210,11 @@ Examples:
 		plan := detectBootstrapAction(beadsDir, cfg)
 
 		if jsonOutput {
-			outputJSON(plan)
+			if err := outputJSON(plan); err != nil {
+				return err
+			}
 			if plan.Action == "none" || dryRun {
-				return
+				return nil
 			}
 		} else {
 			if repairMsg != "" {
@@ -210,14 +222,14 @@ Examples:
 			}
 			printBootstrapPlan(plan)
 			if plan.Action == "none" || dryRun {
-				return
+				return nil
 			}
 		}
 
-		// Execute the plan
 		if err := executeBootstrapPlan(plan, cfg, nonInteractive); err != nil {
-			FatalError("Bootstrap failed: %v", err)
+			return HandleError("Bootstrap failed: %v", err)
 		}
+		return nil
 	},
 }
 
@@ -657,7 +669,7 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		var gateErr *schema.RemoteMigrateGateError
 		if errors.As(err, &gateErr) {
 			if !jsonOutput {
-				printBootstrapRemoteBehindGuidance(os.Stderr, gateErr, plan.SyncRemote)
+				printBootstrapRemoteBehindGuidance(os.Stderr, gateErr, plan.SyncRemote, "bd bootstrap")
 			}
 			unit := "migrations"
 			if gateErr.Pending == 1 {
@@ -680,11 +692,12 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 
 // printBootstrapRemoteBehindGuidance explains a remote-migrate gate refusal in
 // bootstrap terms. The gate's generic remedy ("adopt the migrated database:
-// bd bootstrap") is wrong from inside bootstrap — the database was just cloned
-// from the remote, so the REMOTE is what is behind this binary and re-cloning
-// can never help. The way out is exactly one designated machine migrating and
-// pushing.
-func printBootstrapRemoteBehindGuidance(w io.Writer, e *schema.RemoteMigrateGateError, syncRemote string) {
+// bd bootstrap") is wrong from inside a bootstrap-style clone — the database
+// was just cloned from the remote, so the REMOTE is what is behind this binary
+// and re-cloning can never help. The way out is exactly one designated machine
+// migrating and pushing. rerunCmd is the command the operator just ran ("bd
+// bootstrap", "bd init") so the don't-bother-retrying line names it.
+func printBootstrapRemoteBehindGuidance(w io.Writer, e *schema.RemoteMigrateGateError, syncRemote, rerunCmd string) {
 	unit := "migrations"
 	if e.Pending == 1 {
 		unit = "migration"
@@ -695,10 +708,10 @@ func printBootstrapRemoteBehindGuidance(w io.Writer, e *schema.RemoteMigrateGate
 		"  bd will not migrate it automatically: migrating clones independently forks\n"+
 			"  the schema so `bd dolt pull` can no longer merge (#4259).\n"+
 			"\n"+
-			"  Re-running `bd bootstrap` will NOT fix this — the remote itself is behind.\n"+
+			"  Re-running `"+rerunCmd+"` will NOT fix this — the remote itself is behind.\n"+
 			"  Choose one:\n"+
 			"    • This machine is the designated migrator (exactly ONE machine should be):\n"+
-			"        "+schema.AllowRemoteMigrateEnv+"=1 bd ready\n"+
+			"        "+schema.AllowRemoteMigrateEnv+"=1 bd migrate\n"+
 			"        bd dolt push\n"+
 			"      then other machines re-run `bd bootstrap` to adopt the migrated database.\n"+
 			"    • Another machine is the designated migrator: wait for it to push, then\n"+
