@@ -457,8 +457,11 @@ FROM schema_migrations`)
 	if got := rows[0]["max_version"]; got != want {
 		t.Fatalf("MAX(version) = %s, want %s", got, want)
 	}
-	if got := rows[0]["version_count"]; got != want {
-		t.Fatalf("COUNT(*) = %s, want %s", got, want)
+	// Version numbers are no longer contiguous (the bd-dn6 renumbering moved
+	// the fork migrations to 0070-0073), so the recorded row count is the
+	// migration file count, not MAX(version).
+	if wantCount := strconv.Itoa(len(mainSource.list())); rows[0]["version_count"] != wantCount {
+		t.Fatalf("COUNT(*) = %s, want %s (one row per migration file)", rows[0]["version_count"], wantCount)
 	}
 
 	requireDoltNoRows(t, dir, `
