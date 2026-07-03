@@ -119,6 +119,21 @@ type PullStatsProvider interface {
 	LastPullStats() (queried int, candidates int)
 }
 
+// BatchIssueFetcher is an optional capability for trackers that can resolve
+// many external identifiers to their current remote state in a bounded number
+// of API requests (e.g., one filtered query per page instead of one query per
+// issue). The engine prefers this over per-issue FetchIssue calls in loops
+// that touch every linked issue — conflict detection and pre-linked hydration
+// — where per-issue fetches amplify a sync into hundreds of requests (bd-kqt).
+//
+// The result map is keyed by identifier exactly as requested. Identifiers
+// that don't resolve remotely are absent from the map (not an error). An
+// error return may still carry a partial map of what was fetched before the
+// failure.
+type BatchIssueFetcher interface {
+	BatchFetchIssues(ctx context.Context, identifiers []string) (map[string]*TrackerIssue, error)
+}
+
 // FieldMapper handles bidirectional conversion of issue fields between
 // an external tracker and beads. Each tracker provides its own mapper.
 type FieldMapper interface {

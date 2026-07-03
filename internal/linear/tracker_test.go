@@ -128,7 +128,7 @@ func TestBatchPush_SkipsUnchangedIssue(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
-		case strings.Contains(req.Query, "IssueByIdentifier"):
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
 			// Remote issue has the same title, empty description, priority 0 (no
 			// priority), and "backlog" state — matching the local issue exactly.
 			json.NewEncoder(w).Encode(issueByIdentifierResp(
@@ -200,7 +200,7 @@ func TestBatchPush_ForceBypassesSkip(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
-		case strings.Contains(req.Query, "IssueByIdentifier"):
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
 			// Return the same content as local (would be skipped without force).
 			json.NewEncoder(w).Encode(issueByIdentifierResp(
 				"remote-uuid", "TEAM-1", "My Issue", "", 0,
@@ -356,7 +356,7 @@ func TestBatchPush_PerTeamStateCache(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-2", "t2-state-open", "Ready", "backlog"))
-		case strings.Contains(req.Query, "IssueByIdentifier"):
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
 			// Return the issue with DIFFERENT title so PushFieldsEqual = false and we proceed.
 			json.NewEncoder(w).Encode(issueByIdentifierResp(
 				"t2-uuid", "T2-1", "Old Title", "", 0,
@@ -390,7 +390,7 @@ func TestBatchPush_PerTeamStateCache(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			json.NewEncoder(w).Encode(teamStatesResp("team-1", "t1-state-open", "Backlog", "backlog"))
-		case strings.Contains(req.Query, "IssueByIdentifier"):
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
 			// Team-1 does not own this issue; return an empty result.
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"data": map[string]interface{}{

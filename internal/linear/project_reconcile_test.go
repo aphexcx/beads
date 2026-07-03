@@ -259,6 +259,26 @@ func failingUpdateMockHandler(t *testing.T) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 
 		switch {
+		case strings.Contains(req.Query, "IssuesByIdentifiers"):
+			filter, _ := req.Variables["filter"].(map[string]interface{})
+			number, _ := filter["number"].(map[string]interface{})
+			in, _ := number["in"].([]interface{})
+			nodes := []interface{}{}
+			for _, nRaw := range in {
+				n, _ := nRaw.(float64)
+				nodes = append(nodes, map[string]interface{}{
+					"id": "uuid-" + itoa(int(n)), "identifier": "TEAM-" + itoa(int(n)),
+					"createdAt": "2026-06-08T00:00:00Z", "updatedAt": "2026-06-08T00:00:00Z",
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{
+						"nodes":    nodes,
+						"pageInfo": map[string]interface{}{"hasNextPage": false, "endCursor": ""},
+					},
+				},
+			})
 		case strings.Contains(req.Query, "IssueByIdentifier"):
 			filter, _ := req.Variables["filter"].(map[string]interface{})
 			number, _ := filter["number"].(map[string]interface{})

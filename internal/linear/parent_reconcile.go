@@ -182,6 +182,39 @@ func (t *Tracker) ReconcileParents(ctx context.Context, links []ParentLink, dryR
 		return e, nil
 	}
 
+	// Seed the cache with a batched prefetch of every identifier the links
+	// reference — ceil(N/page) requests instead of one per unique
+	// identifier (bd-kqt). Not-found identifiers are cached as nil entries,
+	// mirroring fetchIssueAcrossTeams's "no team has it" result. On a
+	// failed prefetch the cache is left unseeded (except what resolved) and
+	// the per-identifier path above fills the gaps lazily; rate-limit
+	// exhaustion aborts the pass just like a per-fetch trip would.
+	{
+		identifiers := make([]string, 0, len(links)*2)
+		for _, link := range links {
+			identifiers = append(identifiers, link.ChildIdentifier, link.ParentIdentifier)
+		}
+		issues, clients, err := t.batchFetchIssuesAcrossTeams(ctx, identifiers)
+		if err != nil && isRateLimitExhausted(err) {
+			return stats, fmt.Errorf("prefetching linked issues: %w", err)
+		}
+		for identifier, issue := range issues {
+			fetched[identifier] = entry{issue: issue, client: clients[identifier]}
+		}
+		if err == nil {
+			for _, link := range links {
+				for _, identifier := range []string{link.ChildIdentifier, link.ParentIdentifier} {
+					if identifier == "" {
+						continue
+					}
+					if _, ok := fetched[identifier]; !ok {
+						fetched[identifier] = entry{}
+					}
+				}
+			}
+		}
+	}
+
 	for _, link := range links {
 		if link.ChildIdentifier == "" || link.ParentIdentifier == "" {
 			continue

@@ -2,6 +2,7 @@ package linear
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -14,7 +15,10 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-var _ tracker.BatchPushTracker = (*Tracker)(nil)
+var (
+	_ tracker.BatchPushTracker  = (*Tracker)(nil)
+	_ tracker.BatchIssueFetcher = (*Tracker)(nil)
+)
 
 func init() {
 	tracker.Register("linear", func() tracker.IssueTracker {
@@ -235,6 +239,25 @@ func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.T
 		}
 	}
 	return nil, nil
+}
+
+// BatchFetchIssues resolves many Linear identifiers to their current remote
+// state using batched number-in queries — ceil(N/MaxPageSize) requests per
+// team instead of N (tracker.BatchIssueFetcher, bd-kqt). Team routing mirrors
+// FetchIssue: the primary team is tried first, and identifiers it doesn't
+// resolve are retried against the remaining teams. Identifiers not found in
+// any team are absent from the result map.
+func (t *Tracker) BatchFetchIssues(ctx context.Context, identifiers []string) (map[string]*tracker.TrackerIssue, error) {
+	issues, _, err := t.batchFetchIssuesAcrossTeams(ctx, identifiers)
+	result := make(map[string]*tracker.TrackerIssue, len(issues))
+	for identifier, li := range issues {
+		ti := linearToTrackerIssue(li)
+		result[identifier] = &ti
+	}
+	if err != nil {
+		return result, fmt.Errorf("batch fetching issues: %w", err)
+	}
+	return result, nil
 }
 
 func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker.TrackerIssue, error) {
@@ -795,6 +818,30 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		}
 	}
 
+	// Resolve the remote state of every update candidate in batched queries
+	// up front — one number-in query per page per team instead of one
+	// FetchIssueByIdentifier per issue (bd-kqt). The prefetch serves three
+	// consumers in the loop below: the unchanged-skip check, team routing
+	// (which team resolved the identifier), and the identifier→UUID
+	// resolution for the update mutation. Forced issues skip the equality
+	// check but still need the UUID, so they are prefetched too.
+	remoteByIdentifier, routeByIdentifier, prefetchErr := t.prefetchUpdateCandidates(ctx, toUpdate)
+	if prefetchErr != nil {
+		var exhausted *ErrRateLimitExhausted
+		if errors.As(prefetchErr, &exhausted) {
+			// No budget left — attempting the per-issue updates below would
+			// just grind through more doomed requests. Abort the batch so
+			// the engine's rate-limit handling stops the sync cleanly.
+			return result, prefetchErr
+		}
+		// Degraded prefetch: unresolved candidates fall back to the
+		// per-issue lookup path below (HEAD semantics) so a transient
+		// batch failure doesn't cost them their skip check, UUID
+		// resolution, or team routing.
+		result.Warnings = append(result.Warnings, fmt.Sprintf("batch prefetch of update candidates failed (falling back to per-issue lookups): %v", prefetchErr))
+	}
+	prefetchDegraded := prefetchErr != nil
+
 	// Update existing issues individually (each has different field values).
 	for _, issue := range toUpdate {
 		extRef := *issue.ExternalRef
@@ -803,7 +850,18 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			externalID = extRef
 		}
 
-		routeClient := t.clientForExternalID(ctx, externalID)
+		routeClient := routeByIdentifier[externalID]
+		if routeClient == nil {
+			if prefetchDegraded {
+				// The batch never resolved this identifier — probe teams
+				// per-issue like the pre-batch code did.
+				routeClient = t.clientForExternalID(ctx, externalID)
+			} else {
+				// Batch ran cleanly and no team has this issue — fall back
+				// to the primary client, matching clientForExternalID.
+				routeClient = t.primaryClient()
+			}
+		}
 		if routeClient == nil {
 			result.Errors = append(result.Errors, tracker.BatchPushError{
 				LocalID: issue.ID,
@@ -819,18 +877,23 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			teamCache = primaryCache // defensive fallback
 		}
 
+		remoteIssue := remoteByIdentifier[externalID]
+		if remoteIssue == nil && prefetchDegraded {
+			// Lazy per-issue recovery for candidates the failed batch left
+			// unresolved: without it, changed or forced updates would send
+			// the mutation with the human identifier instead of the UUID.
+			if fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID); lookupErr == nil && fetched != nil {
+				remoteIssue = fetched
+			}
+		}
+
 		// Skip issues that haven't changed since the last push, unless forced.
 		// This mirrors the ContentEqual / UpdatedAt skip logic in the single-issue
 		// push path (engine.go doPush) to avoid redundant API writes.
-		var remoteIssue *Issue
-		if !forceIDs[issue.ID] {
-			fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID)
-			if lookupErr == nil && fetched != nil {
-				remoteIssue = fetched
-				if PushFieldsEqual(issue, remoteIssue, t.config) {
-					result.Skipped = append(result.Skipped, issue.ID)
-					continue
-				}
+		if !forceIDs[issue.ID] && remoteIssue != nil {
+			if PushFieldsEqual(issue, remoteIssue, t.config) {
+				result.Skipped = append(result.Skipped, issue.ID)
+				continue
 			}
 		}
 
@@ -849,13 +912,12 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 			updates["stateId"] = stateID
 		}
 
-		// Prefer the UUID obtained during the skip-check fetch; fall back to a
-		// fresh lookup only when the skip check was bypassed (forceIDs).
+		// Prefer the UUID from the prefetch; unresolved identifiers keep the
+		// identifier itself (the update will fail server-side and be recorded
+		// per-issue, matching the old lookup-miss behavior).
 		issueUUID := externalID
 		if remoteIssue != nil {
 			issueUUID = remoteIssue.ID
-		} else if li, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID); lookupErr == nil && li != nil {
-			issueUUID = li.ID
 		}
 
 		updated, updateErr := routeClient.UpdateIssue(ctx, issueUUID, updates)
@@ -874,6 +936,29 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 	}
 
 	return result, nil
+}
+
+// prefetchUpdateCandidates batch-resolves the remote state of every issue in
+// the update pass. Returns the remote issue and the team client that resolved
+// each identifier. Identifiers no team resolves are absent from both maps.
+// Like BatchFetchIssues, the primary team is tried first and only unresolved
+// identifiers are retried against later teams, which also replaces
+// clientForExternalID's per-issue trial fetches for routing.
+//
+// A non-nil error reports the first per-team batch failure; the maps still
+// carry everything resolved before (and, for non-primary-team failures,
+// after) it.
+func (t *Tracker) prefetchUpdateCandidates(ctx context.Context, toUpdate []*types.Issue) (map[string]*Issue, map[string]*Client, error) {
+	identifiers := make([]string, 0, len(toUpdate))
+	for _, issue := range toUpdate {
+		extRef := *issue.ExternalRef
+		externalID := ExtractLinearIdentifier(extRef)
+		if externalID == "" {
+			externalID = extRef
+		}
+		identifiers = append(identifiers, externalID)
+	}
+	return t.batchFetchIssuesAcrossTeams(ctx, identifiers)
 }
 
 func (t *Tracker) FieldMapper() tracker.FieldMapper {

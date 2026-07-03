@@ -1223,6 +1223,178 @@ func (c *Client) FetchIssueByIdentifier(ctx context.Context, identifier string) 
 	return nil, nil // Issue not found
 }
 
+// issuesByIdentifierQuery mirrors FetchIssueByIdentifier's field selection but
+// accepts a paginated multi-issue filter, so one request can resolve up to
+// MaxPageSize identifiers instead of one.
+const issuesByIdentifierQuery = `
+	query IssuesByIdentifiers($filter: IssueFilter!, $first: Int!, $after: String) {
+		issues(filter: $filter, first: $first, after: $after) {
+			nodes {
+				id
+				identifier
+				title
+				description
+				url
+				priority
+				state {
+					id
+					name
+					type
+				}
+				assignee {
+					id
+					name
+					email
+					displayName
+				}
+				labels {
+					nodes {
+						id
+						name
+					}
+				}
+				parent {
+					id
+					identifier
+				}
+				project {
+					id
+				}
+				projectMilestone {
+					id
+					name
+					description
+					progress
+					targetDate
+				}
+				createdAt
+				updatedAt
+				completedAt
+			}
+			pageInfo {
+				hasNextPage
+				endCursor
+			}
+		}
+	}
+`
+
+// FetchIssuesByIdentifiers retrieves multiple issues by their Linear
+// identifiers (e.g., "TEAM-123") in batched requests instead of one request
+// per issue. Identifiers are reduced to their issue numbers and fetched with
+// a number-in filter scoped to the client's team, then validated against the
+// requested identifiers (mirroring FetchIssueByIdentifier's exact-match
+// check). Identifiers not found in this team are simply absent from the
+// result map.
+//
+// This is the bulk counterpart to FetchIssueByIdentifier: a sync sweep over N
+// linked issues costs ceil(N/MaxPageSize) requests instead of N (bd-kqt).
+func (c *Client) FetchIssuesByIdentifiers(ctx context.Context, identifiers []string) (map[string]*Issue, error) {
+	result := make(map[string]*Issue, len(identifiers))
+	if len(identifiers) == 0 {
+		return result, nil
+	}
+
+	// Reduce identifiers to their numeric suffixes. Identifiers without a
+	// parseable number cannot be batch-filtered; they are skipped here and
+	// left to per-issue fallbacks (same identifiers would also fail
+	// FetchIssueByIdentifier's number filter).
+	wanted := make(map[string]bool, len(identifiers))
+	var numbers []int
+	seenNumbers := make(map[int]bool, len(identifiers))
+	for _, identifier := range identifiers {
+		identifier = strings.TrimSpace(identifier)
+		if identifier == "" {
+			continue
+		}
+		parts := strings.Split(identifier, "-")
+		if len(parts) < 2 {
+			continue
+		}
+		number, err := strconv.Atoi(parts[len(parts)-1])
+		if err != nil {
+			continue
+		}
+		wanted[identifier] = true
+		if !seenNumbers[number] {
+			seenNumbers[number] = true
+			numbers = append(numbers, number)
+		}
+	}
+	if len(numbers) == 0 {
+		return result, nil
+	}
+
+	for start := 0; start < len(numbers); start += MaxPageSize {
+		end := start + MaxPageSize
+		if end > len(numbers) {
+			end = len(numbers)
+		}
+		chunk := numbers[start:end]
+
+		filter := map[string]interface{}{
+			"team": map[string]interface{}{
+				"id": map[string]interface{}{
+					"eq": c.TeamID,
+				},
+			},
+			"number": map[string]interface{}{
+				"in": chunk,
+			},
+		}
+
+		var cursor string
+		page := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return result, ctx.Err()
+			default:
+			}
+
+			page++
+			if page > MaxPages {
+				return result, fmt.Errorf("pagination limit exceeded: stopped after %d pages", MaxPages)
+			}
+
+			variables := map[string]interface{}{
+				"filter": filter,
+				"first":  MaxPageSize,
+			}
+			if cursor != "" {
+				variables["after"] = cursor
+			}
+
+			data, err := c.Execute(ctx, &GraphQLRequest{
+				Query:     issuesByIdentifierQuery,
+				Variables: variables,
+			})
+			if err != nil {
+				return result, fmt.Errorf("failed to fetch issues by identifiers: %w", err)
+			}
+
+			var issuesResp IssuesResponse
+			if err := json.Unmarshal(data, &issuesResp); err != nil {
+				return result, fmt.Errorf("failed to parse issues response: %w", err)
+			}
+
+			for i := range issuesResp.Issues.Nodes {
+				issue := issuesResp.Issues.Nodes[i]
+				if wanted[issue.Identifier] {
+					result[issue.Identifier] = &issue
+				}
+			}
+
+			if !issuesResp.Issues.PageInfo.HasNextPage {
+				break
+			}
+			cursor = issuesResp.Issues.PageInfo.EndCursor
+		}
+	}
+
+	return result, nil
+}
+
 // LabelsByName resolves a set of label names to their Linear IDs by querying
 // both team-scoped and workspace-scoped labels. Names not found in Linear are
 // simply absent from the returned map; the caller decides whether to auto-create.

@@ -109,6 +109,35 @@ func (t *Tracker) ReconcileProjectMembership(ctx context.Context, links []Projec
 		return e, nil
 	}
 
+	// Seed the cache with a batched prefetch of every issue the links
+	// reference — ceil(N/page) requests instead of one per unique issue
+	// (bd-kqt). Same pattern as ReconcileParents: not-found identifiers
+	// cache as nil entries; a failed prefetch (other than rate-limit
+	// exhaustion, which aborts) leaves gaps for the lazy per-issue path.
+	{
+		identifiers := make([]string, 0, len(links))
+		for _, link := range links {
+			identifiers = append(identifiers, link.IssueIdentifier)
+		}
+		issues, clients, err := t.batchFetchIssuesAcrossTeams(ctx, identifiers)
+		if err != nil && isRateLimitExhausted(err) {
+			return stats, fmt.Errorf("prefetching linked issues: %w", err)
+		}
+		for identifier, issue := range issues {
+			fetched[identifier] = entry{issue: issue, client: clients[identifier]}
+		}
+		if err == nil {
+			for _, link := range links {
+				if link.IssueIdentifier == "" {
+					continue
+				}
+				if _, ok := fetched[link.IssueIdentifier]; !ok {
+					fetched[link.IssueIdentifier] = entry{}
+				}
+			}
+		}
+	}
+
 	for _, link := range links {
 		if link.IssueIdentifier == "" || link.ProjectID == "" {
 			continue

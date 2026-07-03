@@ -338,14 +338,18 @@ func (e *Engine) DetectConflicts(ctx context.Context, opts SyncOptions) ([]Confl
 	snapStore, snapStoreOK := e.Store.(storage.LinearIssueSnapshotStore)
 	snapshotter, snapshotterOK := e.Tracker.(PostPullSnapshotter)
 
-	var conflicts []Conflict
+	// First pass: select detection candidates without touching the API.
+	type conflictCandidate struct {
+		issue  *types.Issue
+		extRef string
+		extID  string
+	}
+	var candidates []conflictCandidate
 	for _, issue := range issues {
 		extRef := derefStr(issue.ExternalRef)
 		if extRef == "" || !e.Tracker.IsExternalRef(extRef) {
 			continue
 		}
-
-		localChanged := issue.UpdatedAt.After(lastSync)
 
 		// Whole-issue fast-skip: no local change AND we'll only know
 		// about external changes after fetching. The old code skipped
@@ -354,18 +358,79 @@ func (e *Engine) DetectConflicts(ctx context.Context, opts SyncOptions) ([]Confl
 		// fields we still want to pull. The conservative compromise:
 		// keep the fast-skip when neither snapshot infra is available
 		// (legacy behavior preserved).
-		if !localChanged && !(snapStoreOK && snapshotterOK) {
+		if !issue.UpdatedAt.After(lastSync) && !(snapStoreOK && snapshotterOK) {
 			continue
 		}
 
-		// Fetch external version
 		extID := e.Tracker.ExtractIdentifier(extRef)
 		if extID == "" {
 			continue
 		}
-		extIssue, err := e.Tracker.FetchIssue(ctx, extID)
-		if err != nil || extIssue == nil {
+		candidates = append(candidates, conflictCandidate{issue: issue, extRef: extRef, extID: extID})
+	}
+
+	// Resolve remote state for all candidates in batched requests when the
+	// tracker supports it (bd-kqt: the per-issue fallback costs one API
+	// request per linked issue, which alone can exhaust an hourly budget on
+	// ~1k-issue repos).
+	identifiers := make([]string, len(candidates))
+	for i, cand := range candidates {
+		identifiers[i] = cand.extID
+	}
+	remoteByID, batched, batchErr := e.batchFetchRemoteIssues(ctx, identifiers)
+	if batchErr != nil && isRateLimitExhausted(batchErr) {
+		// No budget left — stop instead of letting later phases grind
+		// against a tripped circuit breaker.
+		return nil, fmt.Errorf("batch fetching conflict candidates: %w", batchErr)
+	}
+	// Transient batch failure: restore HEAD's per-issue semantics for the
+	// unresolved remainder (fetch each; per-issue errors skip that issue
+	// only) instead of misreading them as "absent remotely".
+	perIssueFallback := batchErr != nil
+
+	var conflicts []Conflict
+	for _, cand := range candidates {
+		issue, extRef, extID := cand.issue, cand.extRef, cand.extID
+		localChanged := issue.UpdatedAt.After(lastSync)
+
+		// Fetch external version (from the batch map when available).
+		var extIssue *TrackerIssue
+		if batched {
+			extIssue = remoteByID[extID]
+			if extIssue == nil && perIssueFallback {
+				var err error
+				extIssue, err = e.Tracker.FetchIssue(ctx, extID)
+				if err != nil {
+					continue
+				}
+			}
+		} else {
+			var err error
+			extIssue, err = e.Tracker.FetchIssue(ctx, extID)
+			if err != nil {
+				continue
+			}
+		}
+		if extIssue == nil {
 			continue
+		}
+
+		// Both-sides-clean fast-skip: neither side has been touched since
+		// lastSync, so no conflict is possible and there is nothing new to
+		// field-scope. Skipping here saves the per-issue dolt_history scan
+		// that detectFieldScopedConflict performs for every baselined
+		// issue — which otherwise runs for EVERY linked bead on every
+		// bidirectional sync and dominates wall time on ~1k-issue repos
+		// (bd-kqt). The skip requires an existing baseline snapshot: a
+		// clean issue with NO baseline must still flow into
+		// detectFieldScopedConflict so the first-sync soft rollout records
+		// one — otherwise a later both-sides change would baseline the
+		// already-changed remote and let the push overwrite it without
+		// conflict resolution (codex bd-kqt round-3).
+		if !localChanged && !extIssue.UpdatedAt.After(lastSync) && snapStoreOK && snapshotterOK {
+			if snap, snapErr := snapStore.GetLinearIssueSnapshot(ctx, issue.ID); snapErr == nil && snap != nil {
+				continue
+			}
 		}
 
 		// Try field-scoped path. Falls through to whole-issue logic on
@@ -746,14 +811,16 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 			// class of bug as the snapshot baseline write this PR
 			// fixed in detectFieldScopedConflict — caught by codex
 			// round-1's wider audit.
-			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" && !opts.DryRun {
-				if err := e.PullHooks.SyncComments(ctx, existing.ID, extIssue.ID); err != nil {
-					e.warn("Comment sync failed for %s: %v", existing.ID, err)
+			if e.shouldSyncSubresources(opts, &extIssue, lastSync, prelinkedHydrateIDs[existing.ID]) {
+				if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" && !opts.DryRun {
+					if err := e.PullHooks.SyncComments(ctx, existing.ID, extIssue.ID); err != nil {
+						e.warn("Comment sync failed for %s: %v", existing.ID, err)
+					}
 				}
-			}
-			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" && !opts.DryRun {
-				if err := e.PullHooks.SyncAttachments(ctx, existing.ID, extIssue.ID); err != nil {
-					e.warn("Attachment sync failed for %s: %v", existing.ID, err)
+				if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" && !opts.DryRun {
+					if err := e.PullHooks.SyncAttachments(ctx, existing.ID, extIssue.ID); err != nil {
+						e.warn("Attachment sync failed for %s: %v", existing.ID, err)
+					}
 				}
 			}
 			stats.Skipped++
@@ -833,14 +900,16 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				e.warn("Snapshot write failed for %s after pull: %v", localID, err)
 			}
 		}
-		if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
-			if err := e.PullHooks.SyncComments(ctx, localID, extIssue.ID); err != nil {
-				e.warn("Comment sync failed for %s: %v", localID, err)
+		if e.shouldSyncSubresources(opts, &extIssue, lastSync, prelinkedHydrateIDs[localID]) {
+			if e.PullHooks != nil && e.PullHooks.SyncComments != nil && extIssue.ID != "" {
+				if err := e.PullHooks.SyncComments(ctx, localID, extIssue.ID); err != nil {
+					e.warn("Comment sync failed for %s: %v", localID, err)
+				}
 			}
-		}
-		if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
-			if err := e.PullHooks.SyncAttachments(ctx, localID, extIssue.ID); err != nil {
-				e.warn("Attachment sync failed for %s: %v", localID, err)
+			if e.PullHooks != nil && e.PullHooks.SyncAttachments != nil && extIssue.ID != "" {
+				if err := e.PullHooks.SyncAttachments(ctx, localID, extIssue.ID); err != nil {
+					e.warn("Attachment sync failed for %s: %v", localID, err)
+				}
 			}
 		}
 
@@ -880,6 +949,32 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 		attribute.Int("sync.skipped", stats.Skipped),
 	)
 	return stats, nil
+}
+
+// shouldSyncSubresources gates the per-issue comment/attachment pull hooks,
+// each of which costs one API request per issue (bd-kqt). Sub-resources are
+// synced when there is evidence they could have changed:
+//
+//   - no lastSync — first/full pull, backfill everything;
+//   - explicitly requested issues (--issues) — the user asked for a refresh;
+//   - the remote changed since lastSync — comments/attachments bump the
+//     remote issue's updatedAt, so a stale updatedAt proves stale
+//     sub-resources;
+//   - the local bead was just (re-)linked to this remote issue — its
+//     comments were never imported, regardless of remote staleness.
+//
+// Issues hydrated only because of local churn (e.g. every bead looking dirty
+// after a sync write-back storm) fail all four conditions and skip the two
+// per-issue requests.
+func (e *Engine) shouldSyncSubresources(opts SyncOptions, extIssue *TrackerIssue, lastSync *time.Time, hydratedForRefChange bool) bool {
+	if lastSync == nil || len(opts.IssueIDs) > 0 || hydratedForRefChange {
+		return true
+	}
+	// >= rather than > : the incremental pull filter is updatedAt gte
+	// last_sync, so an issue updated exactly at the boundary is returned by
+	// the pull and its sub-resources must not be skipped (codex bd-kqt
+	// round-1 MINOR).
+	return !extIssue.UpdatedAt.Before(*lastSync)
 }
 
 // referencesMatch reports whether the local external_ref matches the provided
@@ -1011,6 +1106,35 @@ func appendFilteredDependencies(dst []DependencyInfo, deps []DependencyInfo, all
 	return dst
 }
 
+// batchFetchRemoteIssues resolves identifiers to remote issues through the
+// tracker's BatchIssueFetcher capability. Returns batched=false when the
+// tracker doesn't support batching — callers then use their per-issue
+// FetchIssue paths for everything.
+//
+// Error contract (codex bd-kqt round-1 MAJOR): a batch failure must not
+// silently reclassify unresolved identifiers as "absent remotely". The
+// partial map plus the error are returned so callers can (a) abort the
+// phase on rate-limit exhaustion instead of issuing further doomed
+// requests, and (b) restore HEAD's per-issue fetch semantics for the
+// unresolved remainder on transient failures.
+func (e *Engine) batchFetchRemoteIssues(ctx context.Context, identifiers []string) (map[string]*TrackerIssue, bool, error) {
+	fetcher, ok := e.Tracker.(BatchIssueFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	if len(identifiers) == 0 {
+		return map[string]*TrackerIssue{}, true, nil
+	}
+	remote, err := fetcher.BatchFetchIssues(ctx, identifiers)
+	if err != nil {
+		e.warn("Batch fetch of %d remote issues failed (resolved %d before the error): %v", len(identifiers), len(remote), err)
+	}
+	if remote == nil {
+		remote = map[string]*TrackerIssue{}
+	}
+	return remote, true, err
+}
+
 func (e *Engine) fetchPrelinkedIssues(ctx context.Context, fetched []TrackerIssue, localIssues []*types.Issue, lastSync *time.Time) ([]TrackerIssue, map[string]bool, error) {
 	hydratedLocalIDs := make(map[string]bool)
 	if lastSync == nil {
@@ -1030,7 +1154,13 @@ func (e *Engine) fetchPrelinkedIssues(ctx context.Context, fetched []TrackerIssu
 		}
 	}
 
-	var hydrated []TrackerIssue
+	// First pass: decide which local issues need hydration without touching
+	// the API, so the fetches can be batched (bd-kqt).
+	type hydrateCandidate struct {
+		local      *types.Issue
+		identifier string
+	}
+	var candidates []hydrateCandidate
 	for _, local := range localIssues {
 		if local == nil || local.ExternalRef == nil {
 			continue
@@ -1041,7 +1171,7 @@ func (e *Engine) fetchPrelinkedIssues(ctx context.Context, fetched []TrackerIssu
 		}
 		changedAfterLastSync, err := e.externalRefChangedAfter(ctx, local, ref, *lastSync)
 		if err != nil {
-			return hydrated, hydratedLocalIDs, fmt.Errorf("checking pre-linked local issue %s: %w", local.ID, err)
+			return nil, hydratedLocalIDs, fmt.Errorf("checking pre-linked local issue %s: %w", local.ID, err)
 		}
 		if !changedAfterLastSync {
 			continue
@@ -1056,18 +1186,51 @@ func (e *Engine) fetchPrelinkedIssues(ctx context.Context, fetched []TrackerIssu
 		if _, ok := seen[strings.ToLower(identifier)]; ok {
 			continue
 		}
+		seen[identifier] = struct{}{}
+		seen[strings.ToLower(identifier)] = struct{}{}
+		candidates = append(candidates, hydrateCandidate{local: local, identifier: identifier})
+	}
 
-		extIssue, err := e.Tracker.FetchIssue(ctx, identifier)
-		if err != nil {
-			return hydrated, hydratedLocalIDs, err
+	identifiers := make([]string, len(candidates))
+	for i, cand := range candidates {
+		identifiers[i] = cand.identifier
+	}
+	remoteByID, batched, batchErr := e.batchFetchRemoteIssues(ctx, identifiers)
+	if batchErr != nil && isRateLimitExhausted(batchErr) {
+		// Match the per-issue path's contract: a hydration fetch failure
+		// fails the pull. Aborting here also keeps the sync from issuing
+		// further requests against a tripped circuit breaker.
+		return nil, hydratedLocalIDs, fmt.Errorf("hydrating pre-linked issues: %w", batchErr)
+	}
+	// Transient batch failure: fall back to per-issue fetches for the
+	// unresolved remainder — HEAD semantics, where a per-issue error fails
+	// the pull rather than silently skipping hydration.
+	perIssueFallback := batchErr != nil
+
+	var hydrated []TrackerIssue
+	for _, cand := range candidates {
+		var extIssue *TrackerIssue
+		if batched {
+			extIssue = remoteByID[cand.identifier]
+			if extIssue == nil && perIssueFallback {
+				var err error
+				extIssue, err = e.Tracker.FetchIssue(ctx, cand.identifier)
+				if err != nil {
+					return hydrated, hydratedLocalIDs, err
+				}
+			}
+		} else {
+			var err error
+			extIssue, err = e.Tracker.FetchIssue(ctx, cand.identifier)
+			if err != nil {
+				return hydrated, hydratedLocalIDs, err
+			}
 		}
 		if extIssue == nil {
 			continue
 		}
 		hydrated = append(hydrated, *extIssue)
-		hydratedLocalIDs[local.ID] = true
-		seen[identifier] = struct{}{}
-		seen[strings.ToLower(identifier)] = struct{}{}
+		hydratedLocalIDs[cand.local.ID] = true
 	}
 	return hydrated, hydratedLocalIDs, nil
 }
@@ -1078,6 +1241,13 @@ type dbProvider interface {
 
 func (e *Engine) externalRefChangedAfter(ctx context.Context, local *types.Issue, currentRef string, lastSync time.Time) (bool, error) {
 	if local == nil {
+		return false, nil
+	}
+	// Cheap pre-filter: any external_ref change bumps updated_at, so an
+	// issue untouched since lastSync cannot have a changed ref. This keeps
+	// the dolt_history query below off the per-issue hot path — without it,
+	// every linked issue pays a history-table scan on every sync (bd-kqt).
+	if !local.CreatedAt.After(lastSync) && !local.UpdatedAt.After(lastSync) {
 		return false, nil
 	}
 	provider, ok := e.Store.(dbProvider)
