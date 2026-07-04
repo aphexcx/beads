@@ -16,8 +16,9 @@ import (
 )
 
 var (
-	_ tracker.BatchPushTracker  = (*Tracker)(nil)
-	_ tracker.BatchIssueFetcher = (*Tracker)(nil)
+	_ tracker.BatchPushTracker   = (*Tracker)(nil)
+	_ tracker.BatchPushDryRunner = (*Tracker)(nil)
+	_ tracker.BatchIssueFetcher  = (*Tracker)(nil)
 )
 
 func init() {
@@ -668,6 +669,26 @@ func (t *Tracker) writeSnapshot(ctx context.Context, issueID string, entries []s
 // Result mapping: batch-create results are matched by title rather than array
 // index, since Linear's API does not guarantee response order matches input order.
 func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs map[string]bool) (*tracker.BatchPushResult, error) {
+	return t.executeBatchPush(ctx, issues, forceIDs, false)
+}
+
+// BatchPushDryRun implements tracker.BatchPushDryRunner. It runs the exact
+// BatchPush pipeline — state-cache builds, batched remote prefetch, and the
+// PushFieldsEqual unchanged-skip — but records outcomes instead of sending
+// mutations (bd-q3y). Sharing executeBatchPush keeps preview and wet-run
+// candidate outcomes from drifting (the bd-f0t failure mode): without this,
+// the engine's fallback preview reported "Would update" for every ref-bearing
+// bead, making the whole mirror look phantom-push-dirty on each dry-run.
+func (t *Tracker) BatchPushDryRun(ctx context.Context, issues []*types.Issue, forceIDs map[string]bool) (*tracker.BatchPushResult, error) {
+	return t.executeBatchPush(ctx, issues, forceIDs, true)
+}
+
+// executeBatchPush is the shared implementation behind BatchPush (dryRun =
+// false) and BatchPushDryRun (dryRun = true). Dry-run mode issues the same
+// read-side requests (per-team state caches, batched update-candidate
+// prefetch) so the preview reflects real resolvability, but replaces every
+// mutation with the result entry the wet run would produce.
+func (t *Tracker) executeBatchPush(ctx context.Context, issues []*types.Issue, forceIDs map[string]bool, dryRun bool) (*tracker.BatchPushResult, error) {
 	client := t.primaryClient()
 	if client == nil {
 		return nil, fmt.Errorf("no Linear client available")
@@ -742,6 +763,13 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 				continue
 			}
 
+			if dryRun {
+				// State resolved — the wet run would create this issue. No
+				// ExternalRef yet: it only exists after the real create.
+				result.Created = append(result.Created, tracker.BatchPushItem{LocalID: issue.ID})
+				continue
+			}
+
 			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
 			var labelIDs []string
 			created, _, createErr := client.CreateIssueIdempotent(ctx, issue.Title, issue.Description, priority, stateID, labelIDs, marker)
@@ -769,6 +797,12 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 					LocalID: issue.ID,
 					Message: fmt.Sprintf("resolving state for status %s: %v", issue.Status, stateErr),
 				})
+				continue
+			}
+
+			if dryRun {
+				// Same rationale as the single-create dry-run branch above.
+				result.Created = append(result.Created, tracker.BatchPushItem{LocalID: issue.ID})
 				continue
 			}
 
@@ -852,9 +886,11 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 
 		routeClient := routeByIdentifier[externalID]
 		if routeClient == nil {
-			if prefetchDegraded {
+			if prefetchDegraded && !dryRun {
 				// The batch never resolved this identifier — probe teams
-				// per-issue like the pre-batch code did.
+				// per-issue like the pre-batch code did. Wet-run only: a
+				// preview must not fan out per-issue trial fetches (bd-kqt),
+				// and routing is cosmetic when no mutation will be sent.
 				routeClient = t.clientForExternalID(ctx, externalID)
 			} else {
 				// Batch ran cleanly and no team has this issue — fall back
@@ -878,10 +914,12 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		}
 
 		remoteIssue := remoteByIdentifier[externalID]
-		if remoteIssue == nil && prefetchDegraded {
+		if remoteIssue == nil && prefetchDegraded && !dryRun {
 			// Lazy per-issue recovery for candidates the failed batch left
 			// unresolved: without it, changed or forced updates would send
 			// the mutation with the human identifier instead of the UUID.
+			// Wet-run only — the preview accepts the degraded-prefetch
+			// warning instead of grinding per-issue lookups (bd-kqt).
 			if fetched, lookupErr := routeClient.FetchIssueByIdentifier(ctx, externalID); lookupErr == nil && fetched != nil {
 				remoteIssue = fetched
 			}
@@ -910,6 +948,37 @@ func (t *Tracker) BatchPush(ctx context.Context, issues []*types.Issue, forceIDs
 		}
 		if stateID != "" {
 			updates["stateId"] = stateID
+		}
+
+		if dryRun {
+			// Record the outcome the wet run would produce for this issue,
+			// without sending the mutation. Placed after state resolution so
+			// state-mapping errors take the same precedence as the wet path.
+			if remoteIssue == nil {
+				if prefetchDegraded {
+					// The failed prefetch left the remote unknown, so the
+					// skip check can't run. Preview conservatively as an
+					// update — the degraded-prefetch warning on the result
+					// already tells the user the preview is incomplete.
+					result.Updated = append(result.Updated, tracker.BatchPushItem{LocalID: issue.ID, ExternalRef: extRef})
+					continue
+				}
+				// Clean prefetch and no configured team resolves the
+				// identifier (deleted remotely, unconfigured team, or a
+				// Project-URL ref): the wet run's mutation would fail
+				// server-side and land in Errors. Report the same outcome.
+				result.Errors = append(result.Errors, tracker.BatchPushError{
+					LocalID: issue.ID,
+					Message: fmt.Sprintf("%s not found in any configured Linear team; a push would fail", externalID),
+				})
+				continue
+			}
+			ref := extRef
+			if remoteIssue.URL != "" {
+				ref = remoteIssue.URL
+			}
+			result.Updated = append(result.Updated, tracker.BatchPushItem{LocalID: issue.ID, ExternalRef: ref})
+			continue
 		}
 
 		// Prefer the UUID from the prefetch; unresolved identifiers keep the

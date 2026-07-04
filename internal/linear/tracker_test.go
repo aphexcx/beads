@@ -253,6 +253,301 @@ func TestBatchPush_ForceBypassesSkip(t *testing.T) {
 	}
 }
 
+// TestBatchPushDryRun_SkipsUnchangedIssue is the bd-q3y regression test: a
+// dry-run preview must apply the same PushFieldsEqual skip check as the real
+// BatchPush. Before BatchPushDryRun existed, the engine's fallback preview
+// printed "Would update in Linear" for EVERY ref-bearing bead — reporting the
+// whole mirror as phantom-push-dirty on every `bd linear sync --dry-run` even
+// with zero local edits.
+func TestBatchPushDryRun_SkipsUnchangedIssue(t *testing.T) {
+	var mutationCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
+			// Remote content matches the local issue exactly (see
+			// TestBatchPush_SkipsUnchangedIssue for the field mapping).
+			json.NewEncoder(w).Encode(issueByIdentifierResp(
+				"remote-uuid", "TEAM-1", "My Issue", "", 0,
+				"state-open", "Backlog", "backlog",
+			))
+		case strings.Contains(req.Query, "issueUpdate"), strings.Contains(req.Query, "issueCreate"), strings.Contains(req.Query, "issueBatchCreate"):
+			mutationCalled = true
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	extRef := "https://linear.app/team/issue/TEAM-1"
+	local := &types.Issue{
+		ID:          "local-1",
+		Title:       "My Issue",
+		Status:      types.StatusOpen,
+		Priority:    4,
+		ExternalRef: &extRef,
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	result, err := tr.BatchPushDryRun(context.Background(), []*types.Issue{local}, nil)
+	if err != nil {
+		t.Fatalf("BatchPushDryRun: %v", err)
+	}
+	if mutationCalled {
+		t.Error("dry-run sent a mutation to Linear; previews must be read-only")
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0] != "local-1" {
+		t.Errorf("Skipped = %v, want [local-1]", result.Skipped)
+	}
+	if len(result.Updated) != 0 {
+		t.Errorf("Updated = %v, want [] (unchanged issue must not preview as an update)", result.Updated)
+	}
+}
+
+// TestBatchPushDryRun_ReportsChangedWithoutMutating verifies that a genuinely
+// content-dirty issue previews as Updated while the underlying issueUpdate
+// mutation is NOT sent.
+func TestBatchPushDryRun_ReportsChangedWithoutMutating(t *testing.T) {
+	var mutationCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
+			// Remote title differs from local — PushFieldsEqual must report dirty.
+			json.NewEncoder(w).Encode(issueByIdentifierResp(
+				"remote-uuid", "TEAM-1", "Stale Remote Title", "", 0,
+				"state-open", "Backlog", "backlog",
+			))
+		case strings.Contains(req.Query, "issueUpdate"):
+			mutationCalled = true
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	extRef := "https://linear.app/team/issue/TEAM-1"
+	local := &types.Issue{
+		ID:          "local-1",
+		Title:       "My Issue",
+		Status:      types.StatusOpen,
+		Priority:    4,
+		ExternalRef: &extRef,
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	result, err := tr.BatchPushDryRun(context.Background(), []*types.Issue{local}, nil)
+	if err != nil {
+		t.Fatalf("BatchPushDryRun: %v", err)
+	}
+	if mutationCalled {
+		t.Error("dry-run sent issueUpdate to Linear; previews must be read-only")
+	}
+	if len(result.Updated) != 1 || result.Updated[0].LocalID != "local-1" {
+		t.Errorf("Updated = %v, want one item for local-1", result.Updated)
+	}
+	if len(result.Skipped) != 0 {
+		t.Errorf("Skipped = %v, want []", result.Skipped)
+	}
+}
+
+// TestBatchPushDryRun_PreviewsCreateWithoutMutating verifies that an issue
+// without an external ref previews as Created and no create mutation is sent.
+func TestBatchPushDryRun_PreviewsCreateWithoutMutating(t *testing.T) {
+	var mutationCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "issueBatchCreate"), strings.Contains(req.Query, "CreateIssue"):
+			mutationCalled = true
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	local := &types.Issue{
+		ID:        "local-2",
+		Title:     "Brand New Issue",
+		Status:    types.StatusOpen,
+		Priority:  4,
+		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	result, err := tr.BatchPushDryRun(context.Background(), []*types.Issue{local}, nil)
+	if err != nil {
+		t.Fatalf("BatchPushDryRun: %v", err)
+	}
+	if mutationCalled {
+		t.Error("dry-run sent a create mutation to Linear; previews must be read-only")
+	}
+	if len(result.Created) != 1 || result.Created[0].LocalID != "local-2" {
+		t.Errorf("Created = %v, want one item for local-2", result.Created)
+	}
+}
+
+// TestBatchPushDryRun_ForceBypassesSkip verifies that forceIDs previews as
+// Updated even when content is equal, mirroring the wet-run force semantics —
+// still without sending the mutation.
+func TestBatchPushDryRun_ForceBypassesSkip(t *testing.T) {
+	var mutationCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
+			json.NewEncoder(w).Encode(issueByIdentifierResp(
+				"remote-uuid", "TEAM-1", "My Issue", "", 0,
+				"state-open", "Backlog", "backlog",
+			))
+		case strings.Contains(req.Query, "issueUpdate"):
+			mutationCalled = true
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	extRef := "https://linear.app/team/issue/TEAM-1"
+	local := &types.Issue{
+		ID:          "local-1",
+		Title:       "My Issue",
+		Status:      types.StatusOpen,
+		Priority:    4,
+		ExternalRef: &extRef,
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	result, err := tr.BatchPushDryRun(context.Background(), []*types.Issue{local}, map[string]bool{"local-1": true})
+	if err != nil {
+		t.Fatalf("BatchPushDryRun: %v", err)
+	}
+	if mutationCalled {
+		t.Error("dry-run sent issueUpdate to Linear; previews must be read-only even for forced issues")
+	}
+	if len(result.Updated) != 1 || result.Updated[0].LocalID != "local-1" {
+		t.Errorf("Updated = %v, want one item for local-1 (force bypasses skip)", result.Updated)
+	}
+}
+
+// TestBatchPushDryRun_UnresolvedIdentifierReportsError verifies preview/wet
+// parity for identifiers no configured team resolves (deleted remotely, moved
+// to an unconfigured team, or a Project-URL ref): the wet run's mutation would
+// fail server-side and land in Errors, so the preview must report the same
+// outcome instead of claiming "Would update".
+func TestBatchPushDryRun_UnresolvedIdentifierReportsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req GraphQLRequest
+		_ = json.Unmarshal(body, &req)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "TeamStates"):
+			json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "IssuesByIdentifiers"), strings.Contains(req.Query, "IssueByIdentifier"):
+			// Clean response, but no team resolves the identifier.
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"issues": map[string]interface{}{"nodes": []interface{}{}},
+				},
+			})
+		}
+	}))
+	defer server.Close()
+
+	cfg := DefaultMappingConfig()
+	cfg.ExplicitStateMap = map[string]string{"backlog": "open"}
+
+	extRef := "https://linear.app/team/issue/GONE-404"
+	local := &types.Issue{
+		ID:          "local-1",
+		Title:       "My Issue",
+		Status:      types.StatusOpen,
+		Priority:    4,
+		ExternalRef: &extRef,
+	}
+
+	tr := &Tracker{
+		teamIDs: []string{"team-1"},
+		clients: map[string]*Client{
+			"team-1": NewClient("key", "team-1").WithEndpoint(server.URL),
+		},
+		config: cfg,
+	}
+
+	result, err := tr.BatchPushDryRun(context.Background(), []*types.Issue{local}, nil)
+	if err != nil {
+		t.Fatalf("BatchPushDryRun: %v", err)
+	}
+	if len(result.Errors) != 1 || result.Errors[0].LocalID != "local-1" {
+		t.Errorf("Errors = %v, want one entry for local-1", result.Errors)
+	}
+	if len(result.Updated) != 0 {
+		t.Errorf("Updated = %v, want [] (unresolvable ref must not preview as an update)", result.Updated)
+	}
+}
+
 // TestBatchPush_BatchCreateMappingByTitle verifies that batch-create results are
 // matched by title rather than array index. Linear's API does not guarantee that
 // issueBatchCreate returns results in the same order as the inputs, so index-based
