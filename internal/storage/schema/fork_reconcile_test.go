@@ -439,8 +439,8 @@ func TestNoDuplicateMigrationVersions(t *testing.T) {
 	if want, got := 73, LatestVersion(); got != want {
 		t.Errorf("LatestVersion() = %d, want %d (upstream 0053 tail + fork 0070-0073)", got, want)
 	}
-	if want, got := 21, LatestIgnoredVersion(); got != want {
-		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored 0010 + fork 0020-0021)", got, want)
+	if want, got := 22, LatestIgnoredVersion(); got != want {
+		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored 0010 + fork 0020-0022)", got, want)
 	}
 }
 

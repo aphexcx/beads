@@ -309,6 +309,46 @@ INSERT INTO wisp_child_counters (parent_id, last_child) VALUES (%s, 7);
 		`SELECT COUNT(*) AS c FROM wisp_child_counters WHERE parent_id = 'schema-cli-rig'`, "0")
 }
 
+func TestIgnoredMigration0022MirrorsMain0072WispCommentDDL(t *testing.T) {
+	// bd-5rs: wisp tables are clone-local, so main 0072's wisp_comments
+	// ALTERs never run on a fresh clone (the replicated cursor is already
+	// past 0072) and ignored/0001 recreates the table without
+	// external_ref/updated_at. ignored/0022 is 0072's companion on the
+	// ignored chain — the replay path that actually reaches clones. This
+	// pins the two files to byte-identical wisp_comments DDL so they cannot
+	// drift apart.
+	mainSQL, err := os.ReadFile("migrations/0072_add_comment_external_ref.up.sql")
+	if err != nil {
+		t.Fatalf("read 0072 up migration: %v", err)
+	}
+	ignoredSQL, err := os.ReadFile("migrations/ignored/0022_add_wisp_comment_external_ref.up.sql")
+	if err != nil {
+		t.Fatalf("read ignored 0022 up migration: %v", err)
+	}
+
+	for _, want := range []string{
+		// Guards: each statement re-checks INFORMATION_SCHEMA so re-running
+		// on a lineage that already has the columns is a no-op.
+		"TABLE_NAME = 'wisp_comments'",
+		"COLUMN_NAME = 'external_ref'",
+		"COLUMN_NAME = 'updated_at'",
+		"INDEX_NAME = 'idx_wisp_comments_external_ref'",
+		"INFORMATION_SCHEMA.COLUMNS",
+		"INFORMATION_SCHEMA.STATISTICS",
+		// The prepared DDL itself.
+		"'ALTER TABLE wisp_comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '''''",
+		"'ALTER TABLE wisp_comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'",
+		"'CREATE INDEX idx_wisp_comments_external_ref ON wisp_comments (external_ref)'",
+	} {
+		if !strings.Contains(string(ignoredSQL), want) {
+			t.Errorf("ignored 0022 missing wisp_comments marker %q", want)
+		}
+		if !strings.Contains(string(mainSQL), want) {
+			t.Errorf("main 0072 missing wisp_comments marker %q (companion files drifted)", want)
+		}
+	}
+}
+
 func TestMigration0047HandlesLegacyWispDependenciesShape(t *testing.T) {
 	sql, err := os.ReadFile("migrations/0047_recompute_mixed_is_blocked.up.sql")
 	if err != nil {
