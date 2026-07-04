@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `bd version --json` now always includes the `commit` key (empty string when
+  unknown) so machine consumers — e.g. the Gas Town host's bd/library
+  version-compat gate — can rely on the field existing. When the binary was
+  installed from a module pseudo-version (`go install ...@v1.x.y-0.<ts>-<sha>`),
+  the commit is now derived from the pseudo-version suffix instead of being
+  omitted.
+
 ## [1.1.0-rc.1] - 2026-06-23
 
 ### Upgrade Notes
