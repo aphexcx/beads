@@ -108,7 +108,27 @@ func Load(beadsDir string) (*Config, error) {
 	return &cfg, nil
 }
 
+// EnvAllowEmbeddedOverServer, when set to a non-empty value, permits Save to
+// rewrite an existing server-mode metadata.json to embedded mode. Deliberate
+// mode downgrades only; see guardRewrite (bd-9oh).
+const EnvAllowEmbeddedOverServer = "BEADS_ALLOW_EMBEDDED_OVER_SERVER"
+
 func (c *Config) Save(beadsDir string) error {
+	return c.save(beadsDir, false)
+}
+
+// SaveAllowingModeFlip is Save without the server→embedded mode-flip guard.
+// Only explicitly destructive, user-confirmed flows (bd init --reinit-local)
+// should call it. The test-context tripwire still applies.
+func (c *Config) SaveAllowingModeFlip(beadsDir string) error {
+	return c.save(beadsDir, true)
+}
+
+func (c *Config) save(beadsDir string, allowModeFlip bool) error {
+	if err := c.guardRewrite(beadsDir, allowModeFlip); err != nil {
+		return err
+	}
+
 	configPath := ConfigPath(beadsDir)
 
 	saved := *c
@@ -125,6 +145,70 @@ func (c *Config) Save(beadsDir string) error {
 		return fmt.Errorf("writing config: %w", err)
 	}
 
+	return nil
+}
+
+// guardRewrite refuses metadata.json writes that would silently repoint or
+// hide an existing store (bd-9oh: a non-hermetic test run rewrote the rig's
+// server-mode metadata.json to embedded mode, and every bd command in the
+// checkout resolved to an empty embedded store until the file was restored
+// by hand).
+//
+// Two independent guards, both scoped to rewrites of an EXISTING
+// metadata.json (creating a fresh one is always allowed):
+//
+//  1. Test tripwire: test runs marked by BEADS_TEST_MODE (set by the
+//     repo's TestMains and inherited by bd subprocesses tests spawn) must
+//     not rewrite a pre-existing metadata.json unless the run declared
+//     hermetic isolation by setting BEADS_TEST_IGNORE_REPO_CONFIG
+//     (scripts/ci/lib/test-env.sh and isolated TestMains set it). Keyed on
+//     env vars rather than testing.Testing() so that test helpers which
+//     scrub the BEADS_* env to build a clean subprocess/in-process
+//     environment (e.g. snapshotBootstrapEnv) opt out of both sentinels
+//     together instead of losing only the exemption.
+//  2. Mode-flip guard: rewriting dolt_mode "server"/"proxied-server" to
+//     embedded hides the server-backed store. Requires the explicit
+//     SaveAllowingModeFlip entry point or BEADS_ALLOW_EMBEDDED_OVER_SERVER.
+func (c *Config) guardRewrite(beadsDir string, allowModeFlip bool) error {
+	configPath := ConfigPath(beadsDir)
+	data, err := os.ReadFile(configPath) // #nosec G304 - controlled path from config
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // no existing metadata.json — fresh create, nothing to protect
+		}
+		// Existing but unreadable: refusing is the only safe answer — we
+		// cannot tell whether the write would flip a server-mode store.
+		return fmt.Errorf("refusing to rewrite %s: cannot read existing file: %w", configPath, err)
+	}
+
+	if os.Getenv("BEADS_TEST_MODE") != "" &&
+		os.Getenv("BEADS_TEST_IGNORE_REPO_CONFIG") == "" {
+		return fmt.Errorf("refusing to rewrite existing %s from a test context: "+
+			"tests must not touch a real .beads (bd-9oh); run under the hermetic "+
+			"wrapper (scripts/test.sh) or set BEADS_TEST_IGNORE_REPO_CONFIG=1 in an "+
+			"isolated TestMain", configPath)
+	}
+
+	if allowModeFlip || os.Getenv(EnvAllowEmbeddedOverServer) != "" {
+		return nil
+	}
+
+	var existing Config
+	if json.Unmarshal(data, &existing) != nil {
+		return nil // corrupt existing file — allow repair writes
+	}
+	existingMode := strings.ToLower(existing.DoltMode)
+	existingIsServer := existingMode == DoltModeServer || existingMode == DoltModeProxiedServer
+	nextMode := strings.ToLower(c.DoltMode)
+	if nextMode == "" {
+		nextMode = DoltModeEmbedded
+	}
+	if existingIsServer && nextMode == DoltModeEmbedded {
+		return fmt.Errorf("refusing to rewrite %s from dolt_mode=%q to embedded mode: "+
+			"that hides the server-backed store from every client of this checkout (bd-9oh). "+
+			"If this downgrade is intentional, set %s=1 or use bd init --reinit-local",
+			configPath, existing.DoltMode, EnvAllowEmbeddedOverServer)
+	}
 	return nil
 }
 

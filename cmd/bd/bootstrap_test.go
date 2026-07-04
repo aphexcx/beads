@@ -341,8 +341,15 @@ func TestDetectBootstrapAction_ExplicitSyncRemotePreservesRemotesAPIURL(t *testi
 	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("sync.remote: "+syncRemote+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("BEADS_DIR", beadsDir)
-	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	// os.Setenv, NOT t.Setenv: snapshotBootstrapEnv above already scrubbed
+	// BEADS_* and its deferred restore() reinstates the pre-test values.
+	// t.Setenv here would record the post-scrub (unset) state as "original",
+	// and because t.Cleanup callbacks run AFTER the function's defers, that
+	// cleanup would re-unset these vars right after restore() reinstated
+	// them — permanently corrupting the suite env (surfaced by bd-9oh's
+	// Save tripwire as order-dependent failures in later tests).
+	_ = os.Setenv("BEADS_DIR", beadsDir)
+	_ = os.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
 	if err := config.Initialize(); err != nil {
 		t.Fatalf("config.Initialize failed: %v", err)
 	}

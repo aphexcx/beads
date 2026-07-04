@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,11 +149,26 @@ func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
 	// but dolt/ directory is gitignored. The init guard should recognize this
 	// as a fresh clone and allow init to proceed.
 
-	t.Run("server_mode_metadata_no_dolt_dir_allows_init", func(t *testing.T) {
+	t.Run("server_mode_metadata_unreachable_server_refuses_init", func(t *testing.T) {
+		// bd-9oh: an unreachable server must NOT be treated as "fresh clone,
+		// safe to init". That assumption let bd init silently rewrite a live
+		// server-mode metadata.json to embedded mode and hide the real store
+		// from every client of the checkout. The GH#2433 fresh-clone
+		// bootstrap path survives only when the server is reachable and the
+		// database is missing; when the server cannot be reached, init
+		// refuses and directs to bd dolt start / bd bootstrap /
+		// --reinit-local.
+
 		// Switch to server mode for this subtest
 		oldServerMode := serverMode
 		serverMode = true
 		defer func() { serverMode = oldServerMode }()
+
+		// Neutralize ambient port/mode env so the probe uses the port file
+		// below, not a developer machine's live Dolt server.
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+		t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+		t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
 
 		tmpDir := t.TempDir()
 		beadsDir := filepath.Join(tmpDir, ".beads")
@@ -172,11 +190,33 @@ func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// No dolt/ directory — simulates fresh clone with gitignored dolt/.
-		// No server running — simulates machine B with no local server.
+		// Point the port file at a port with no listener so the probe
+		// deterministically gets connection-refused.
+		if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"),
+			[]byte(fmt.Sprintf("%d", deadTCPPort(t))), 0644); err != nil {
+			t.Fatal(err)
+		}
+
 		err := checkExistingBeadsDataAt(beadsDir, "myproject")
-		if err != nil {
-			t.Errorf("fresh clone with metadata.json should allow init, got: %v", err)
+		if err == nil {
+			t.Fatal("unreachable server must refuse init over server-mode metadata.json (bd-9oh)")
+		}
+		// Deliberately NOT the benign already-initialized sentinel: the
+		// workspace state is unverified, so --init-if-missing must abort
+		// loudly instead of skipping with success over a possibly-
+		// uninitialized clone (codex review of bd-9oh).
+		if errors.Is(err, errWorkspaceAlreadyInitialized) {
+			t.Errorf("unverified refusal must NOT match errWorkspaceAlreadyInitialized (would let --init-if-missing skip silently), got: %v", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{"unreachable", "bd dolt start", "bd bootstrap", "--reinit-local"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("refusal message must contain %q, got:\n%s", want, msg)
+			}
+		}
+		// GH#3684 convention: never suggest the deprecated --force form.
+		if strings.Contains(msg, "init --force") {
+			t.Errorf("message must NOT suggest deprecated --force, got:\n%s", msg)
 		}
 	})
 
@@ -337,6 +377,19 @@ func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
 			t.Errorf("empty beads dir should allow init, got: %v", err)
 		}
 	})
+}
+
+// deadTCPPort returns a localhost TCP port with no listener: it binds an
+// ephemeral port, closes the listener, and returns the freed port.
+func deadTCPPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port
 }
 
 // GH#2363: Regression — AI agent followed "bd init --force" suggestion and wiped DB.

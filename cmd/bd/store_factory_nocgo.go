@@ -48,7 +48,12 @@ func acquireEmbeddedLock(_ string, _ bool) (util.Unlocker, error) {
 // newDoltStoreFromConfig creates a SQL-server-backed storage backend from config.
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
-	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
+	if err != nil {
+		// An existing-but-unreadable metadata.json must be reported as such,
+		// not misdiagnosed as a missing-CGO build (bd-9oh).
+		return nil, fmt.Errorf("loading %s: %w", configfile.ConfigPath(beadsDir), err)
+	}
+	if cfg != nil && cfg.IsDoltProxiedServerMode() {
 		// TODO: this needs to be uow provider
 		return nil, fmt.Errorf("proxy server store should be uow provider")
 		// 	return newProxiedServerStore(ctx, &dolt.Config{
@@ -57,7 +62,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 		// 		ProxiedServer: true,
 		// 	})
 	}
-	if err == nil && cfg != nil && cfg.IsDoltServerMode() {
+	if cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfig(ctx, beadsDir)
 	}
 	return nil, fmt.Errorf("%s", nocgoEmbeddedErrMsg)
@@ -66,7 +71,11 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 // newReadOnlyStoreFromConfig creates a read-only SQL-server-backed storage backend.
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
-	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
+	if err != nil {
+		// See newDoltStoreFromConfig (bd-9oh).
+		return nil, fmt.Errorf("loading %s: %w", configfile.ConfigPath(beadsDir), err)
+	}
+	if cfg != nil && cfg.IsDoltProxiedServerMode() {
 		// TODO: this needs to be uow provider
 		return nil, fmt.Errorf("proxy server store needs to be uow provider")
 		// return newProxiedServerStore(ctx, &dolt.Config{
@@ -76,7 +85,7 @@ func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.D
 		// 	ReadOnly:      true,
 		// })
 	}
-	if err == nil && cfg != nil && cfg.IsDoltServerMode() {
+	if cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	}
 	return nil, fmt.Errorf("%s", nocgoEmbeddedErrMsg)

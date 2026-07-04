@@ -92,7 +92,13 @@ func acquireEmbeddedLock(beadsDir string, serverMode bool) (util.Unlocker, error
 // auto-sanitized to underscores and the fix is persisted to metadata.json.
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
-	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
+	if err != nil {
+		// An existing-but-unreadable metadata.json must not silently degrade
+		// to an empty embedded store — that hides the configured store from
+		// the user (bd-9oh). Surface the problem instead.
+		return nil, fmt.Errorf("loading %s: %w", configfile.ConfigPath(beadsDir), err)
+	}
+	if cfg != nil && cfg.IsDoltProxiedServerMode() {
 		// TODO: this needs to be uow provider
 		return nil, fmt.Errorf("proxy server store should be uow provider")
 		// 	return newProxiedServerStore(ctx, &dolt.Config{
@@ -101,7 +107,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 		// 		ProxiedServer: true,
 		// 	})
 	}
-	if err == nil && cfg != nil && cfg.IsDoltServerMode() {
+	if cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfig(ctx, beadsDir)
 	}
 	database := configfile.DefaultDoltDatabase
@@ -165,7 +171,12 @@ func migrateHyphenatedDB(beadsDir string, cfg *configfile.Config, oldName, newNa
 // hydration from mutating foreign projects (GH#3231).
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
-	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
+	if err != nil {
+		// See newDoltStoreFromConfig: never silently fall back to embedded
+		// over an unreadable metadata.json (bd-9oh).
+		return nil, fmt.Errorf("loading %s: %w", configfile.ConfigPath(beadsDir), err)
+	}
+	if cfg != nil && cfg.IsDoltProxiedServerMode() {
 		// TODO: this needs to be uow provider
 		return nil, fmt.Errorf("proxy server store needs to be uow provider")
 		// return newProxiedServerStore(ctx, &dolt.Config{
@@ -175,7 +186,7 @@ func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.D
 		// 	ReadOnly:      true,
 		// })
 	}
-	if err == nil && cfg != nil && cfg.IsDoltServerMode() {
+	if cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	}
 	database := configfile.DefaultDoltDatabase
