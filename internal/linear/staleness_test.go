@@ -1,10 +1,13 @@
 package linear
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 func TestWriteAndReadLastPullTimestamp(t *testing.T) {
@@ -153,6 +156,213 @@ func TestGetStalenessInfo(t *testing.T) {
 			t.Fatal("expected IsStale=false")
 		}
 	})
+}
+
+func TestGetStalenessInfoWithFallback(t *testing.T) {
+	threshold := 20 * time.Minute
+
+	t.Run("file present ignores fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := WriteLastPullTimestamp(dir); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		info := GetStalenessInfoWithFallback(dir, threshold, func() time.Time {
+			called = true
+			return time.Time{}
+		})
+		if called {
+			t.Fatal("fallback must not be consulted when last_pull exists")
+		}
+		if info.NeverPulled || !info.IsFresh {
+			t.Fatalf("expected fresh from file, got %+v", info)
+		}
+	})
+
+	t.Run("missing file uses fresh fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		lastSync := time.Now().UTC().Add(-2 * time.Minute)
+		info := GetStalenessInfoWithFallback(dir, threshold, func() time.Time { return lastSync })
+		if info.NeverPulled {
+			t.Fatal("expected NeverPulled=false when fallback supplies a timestamp")
+		}
+		if !info.IsFresh || info.IsStale {
+			t.Fatalf("expected fresh for 2m-old fallback with 20m threshold, got %+v", info)
+		}
+		if !info.WithinDebounce {
+			t.Fatal("expected WithinDebounce=true for 2m-old fallback")
+		}
+		if !info.LastPull.Equal(lastSync) {
+			t.Fatalf("expected LastPull=%v, got %v", lastSync, info.LastPull)
+		}
+	})
+
+	t.Run("missing file uses stale fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		info := GetStalenessInfoWithFallback(dir, threshold, func() time.Time {
+			return time.Now().UTC().Add(-30 * time.Minute)
+		})
+		if info.NeverPulled {
+			t.Fatal("expected NeverPulled=false when fallback supplies a timestamp")
+		}
+		if !info.IsStale || info.IsFresh {
+			t.Fatalf("expected stale for 30m-old fallback with 20m threshold, got %+v", info)
+		}
+		if info.WithinDebounce {
+			t.Fatal("expected WithinDebounce=false for 30m-old fallback")
+		}
+	})
+
+	t.Run("missing file with zero fallback reports never pulled", func(t *testing.T) {
+		dir := t.TempDir()
+		info := GetStalenessInfoWithFallback(dir, threshold, func() time.Time { return time.Time{} })
+		if !info.NeverPulled || !info.IsStale {
+			t.Fatalf("expected NeverPulled+IsStale for zero fallback, got %+v", info)
+		}
+	})
+
+	t.Run("missing file with nil fallback reports never pulled", func(t *testing.T) {
+		dir := t.TempDir()
+		info := GetStalenessInfoWithFallback(dir, threshold, nil)
+		if !info.NeverPulled || !info.IsStale {
+			t.Fatalf("expected NeverPulled+IsStale for nil fallback, got %+v", info)
+		}
+	})
+
+	t.Run("malformed file consults fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, lastPullFileName), []byte("not-a-timestamp\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		info := GetStalenessInfoWithFallback(dir, threshold, func() time.Time {
+			return time.Now().UTC().Add(-2 * time.Minute)
+		})
+		if info.NeverPulled || !info.IsFresh {
+			t.Fatalf("expected fallback to cover malformed file, got %+v", info)
+		}
+	})
+
+	t.Run("stale file is not shadowed by fresh fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		oldTime := time.Now().UTC().Add(-30 * time.Minute).Format(time.RFC3339)
+		if err := os.WriteFile(filepath.Join(dir, lastPullFileName), []byte(oldTime+"\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		info := GetStalenessInfoWithFallback(dir, threshold, func() time.Time {
+			called = true
+			return time.Now().UTC()
+		})
+		if called {
+			t.Fatal("fallback must not be consulted when last_pull has a valid timestamp")
+		}
+		if info.NeverPulled || !info.IsStale || info.IsFresh {
+			t.Fatalf("expected stale from 30m-old file with 20m threshold, got %+v", info)
+		}
+	})
+}
+
+// stalenessStubStore is a minimal storage.Storage for the store-backed
+// staleness helpers; unimplemented methods panic via the nil embedded
+// interface.
+type stalenessStubStore struct {
+	storage.Storage
+	localMetadata map[string]string
+	config        map[string]string
+}
+
+func newStalenessStubStore() *stalenessStubStore {
+	return &stalenessStubStore{
+		localMetadata: make(map[string]string),
+		config:        make(map[string]string),
+	}
+}
+
+func (s *stalenessStubStore) GetLocalMetadata(_ context.Context, key string) (string, error) {
+	return s.localMetadata[key], nil
+}
+
+func (s *stalenessStubStore) SetLocalMetadata(_ context.Context, key, value string) error {
+	s.localMetadata[key] = value
+	return nil
+}
+
+func (s *stalenessStubStore) GetConfig(_ context.Context, key string) (string, error) {
+	return s.config[key], nil
+}
+
+func TestStoreLastPullFallback(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("empty store returns zero", func(t *testing.T) {
+		store := newStalenessStubStore()
+		if got := StoreLastPullFallback(ctx, store)(); !got.IsZero() {
+			t.Errorf("expected zero time from empty store, got %v", got)
+		}
+	})
+
+	t.Run("prefers last_pull_at stamp over last_sync", func(t *testing.T) {
+		store := newStalenessStubStore()
+		pullAt := time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC)
+		store.localMetadata[lastPullMetaKey] = pullAt.Format(time.RFC3339)
+		store.localMetadata["linear.last_sync"] = time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC).Format(time.RFC3339)
+		if got := StoreLastPullFallback(ctx, store)(); !got.Equal(pullAt) {
+			t.Errorf("expected last_pull_at %v to win, got %v", pullAt, got)
+		}
+	})
+
+	t.Run("legacy database falls back to last_sync metadata", func(t *testing.T) {
+		store := newStalenessStubStore()
+		lastSync := time.Date(2026, 7, 4, 12, 30, 0, 0, time.UTC)
+		store.localMetadata["linear.last_sync"] = lastSync.Format(time.RFC3339)
+		if got := StoreLastPullFallback(ctx, store)(); !got.Equal(lastSync) {
+			t.Errorf("expected last_sync fallback %v, got %v", lastSync, got)
+		}
+	})
+
+	t.Run("oldest databases fall back to config last_sync", func(t *testing.T) {
+		store := newStalenessStubStore()
+		lastSync := time.Date(2026, 6, 9, 20, 11, 39, 0, time.UTC)
+		store.config["linear.last_sync"] = lastSync.Format(time.RFC3339)
+		if got := StoreLastPullFallback(ctx, store)(); !got.Equal(lastSync) {
+			t.Errorf("expected config last_sync fallback %v, got %v", lastSync, got)
+		}
+	})
+
+	t.Run("malformed last_pull_at falls back to last_sync", func(t *testing.T) {
+		store := newStalenessStubStore()
+		store.localMetadata[lastPullMetaKey] = "not-a-timestamp"
+		lastSync := time.Date(2026, 7, 4, 12, 30, 0, 0, time.UTC)
+		store.localMetadata["linear.last_sync"] = lastSync.Format(time.RFC3339)
+		if got := StoreLastPullFallback(ctx, store)(); !got.Equal(lastSync) {
+			t.Errorf("expected last_sync fallback %v for malformed stamp, got %v", lastSync, got)
+		}
+	})
+}
+
+func TestRecordLastPullMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := newStalenessStubStore()
+
+	if err := RecordLastPullMetadata(ctx, store); err != nil {
+		t.Fatalf("RecordLastPullMetadata: %v", err)
+	}
+	raw := store.localMetadata[lastPullMetaKey]
+	if raw == "" {
+		t.Fatal("expected last_pull_at metadata to be written")
+	}
+	stamped, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("stamp %q not RFC3339: %v", raw, err)
+	}
+	if time.Since(stamped) > 5*time.Second {
+		t.Fatalf("stamp too old: %v", stamped)
+	}
+
+	// The stamp must satisfy the read side.
+	if got := StoreLastPullFallback(ctx, store)(); !got.Equal(stamped) {
+		t.Errorf("StoreLastPullFallback = %v, want stamped %v", got, stamped)
+	}
 }
 
 func TestFormatAge(t *testing.T) {

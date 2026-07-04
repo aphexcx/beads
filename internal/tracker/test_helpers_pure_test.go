@@ -249,12 +249,14 @@ type pureTestStore struct {
 	storage.Storage
 	issues        []*types.Issue
 	localMetadata map[string]string
+	config        map[string]string
 }
 
 func newPureTestStore(issues ...*types.Issue) *pureTestStore {
 	return &pureTestStore{
 		issues:        issues,
 		localMetadata: make(map[string]string),
+		config:        make(map[string]string),
 	}
 }
 
@@ -283,5 +285,14 @@ func (s *pureTestStore) GetLocalMetadata(_ context.Context, key string) (string,
 
 func (s *pureTestStore) SetLocalMetadata(_ context.Context, key, value string) error {
 	s.localMetadata[key] = value
+	return nil
+}
+
+func (s *pureTestStore) GetConfig(_ context.Context, key string) (string, error) {
+	return s.config[key], nil
+}
+
+func (s *pureTestStore) SetConfig(_ context.Context, key, value string) error {
+	s.config[key] = value
 	return nil
 }

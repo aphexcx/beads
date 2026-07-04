@@ -1360,6 +1360,20 @@ func LastSync(ctx context.Context, store storage.Storage, configPrefix string) s
 	return value
 }
 
+// LastSyncTime returns LastSync parsed as a time.Time, or the zero time
+// when the tracker has never synced or the recorded value is unparseable.
+func LastSyncTime(ctx context.Context, store storage.Storage, configPrefix string) time.Time {
+	raw := LastSync(ctx, store, configPrefix)
+	if raw == "" {
+		return time.Time{}
+	}
+	parsed, err := parseSyncTime(raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
+}
+
 // doPush exports beads issues to the external tracker.
 //
 // bd-ajn: pushFieldScopes carries per-issue field restrictions

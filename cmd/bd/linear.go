@@ -260,8 +260,8 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	if pullIfStale {
 		beadsDir := resolveBeadsDirForStaleness()
 		if beadsDir != "" {
-			if linear.IsWithinDebounce(beadsDir) {
-				info := linear.GetStalenessInfo(beadsDir, threshold)
+			info := linear.GetStalenessInfoWithFallback(beadsDir, threshold, linearStorePullFallback(rootCtx))
+			if info.WithinDebounce {
 				if jsonOutput {
 					return outputJSON(map[string]interface{}{
 						"is_fresh":  true,
@@ -274,8 +274,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 				return nil
 			}
 
-			if !linear.IsPullStale(beadsDir, threshold) {
-				info := linear.GetStalenessInfo(beadsDir, threshold)
+			if info.IsFresh {
 				if jsonOutput {
 					return outputJSON(map[string]interface{}{
 						"is_fresh":  true,
@@ -479,6 +478,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		if beadsDir := resolveBeadsDirForStaleness(); beadsDir != "" {
 			_ = linear.WriteLastPullTimestamp(beadsDir)
 		}
+		_ = linear.RecordLastPullMetadata(ctx, getStore())
 	}
 
 	if jsonOutput {
@@ -1339,6 +1339,22 @@ func resolveBeadsDirForStaleness() string {
 		return resolveCommandBeadsDir(dbPath)
 	}
 	return ""
+}
+
+// linearStorePullFallback returns a LastPullFallback that consults store
+// evidence of past pulls when .beads/last_pull is absent — databases synced
+// by bd versions that predate the file's stamps, and fresh clones, since the
+// file is per-machine and gitignored. Without it every such database reports
+// NeverPulled and forces a full network pull on each --pull-if-stale
+// (bd-stc). The store is opened lazily inside the closure so the
+// file-present path stays DB-free.
+func linearStorePullFallback(ctx context.Context) linear.LastPullFallback {
+	return func() time.Time {
+		if err := ensureStoreActive(); err != nil {
+			return time.Time{}
+		}
+		return linear.StoreLastPullFallback(ctx, getStore())()
+	}
 }
 
 // uuidRegex matches valid UUID format (with or without hyphens).

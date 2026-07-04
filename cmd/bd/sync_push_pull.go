@@ -578,6 +578,7 @@ func runLinearPull(cmd *cobra.Command, args []string) error {
 		if beadsDir := resolveBeadsDirForStaleness(); beadsDir != "" {
 			_ = linear.WriteLastPullTimestamp(beadsDir)
 		}
+		_ = linear.RecordLastPullMetadata(ctx, getStore())
 	}
 	outputSyncResult(result, dryRun)
 	return nil
