@@ -3340,8 +3340,8 @@ func TestEngineForcedPushSkipsWhenContentEqual(t *testing.T) {
 	// Last sync is older than the issue's UpdatedAt → conflict detector sees
 	// a local edit since last sync.
 	lastSync := now.Add(-1 * time.Hour)
-	if err := store.SetConfig(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
-		t.Fatalf("SetConfig() error: %v", err)
+	if err := store.SetLocalMetadata(ctx, "test.last_sync", lastSync.Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetLocalMetadata() error: %v", err)
 	}
 
 	base := newMockTracker("test")
@@ -3417,8 +3417,8 @@ func TestEngineForcedPushNonRemoteAwareStillForces(t *testing.T) {
 	if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
 		t.Fatalf("CreateIssue() error: %v", err)
 	}
-	if err := store.SetConfig(ctx, "test.last_sync", now.Add(-1*time.Hour).Format(time.RFC3339)); err != nil {
-		t.Fatalf("SetConfig() error: %v", err)
+	if err := store.SetLocalMetadata(ctx, "test.last_sync", now.Add(-1*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetLocalMetadata() error: %v", err)
 	}
 
 	tracker := newMockTracker("test")
@@ -3476,8 +3476,8 @@ func TestEngineForcedPushRemoteAwareWithDiffStillPushes(t *testing.T) {
 	if err := store.CreateIssue(ctx, issue, "test-actor"); err != nil {
 		t.Fatalf("CreateIssue() error: %v", err)
 	}
-	if err := store.SetConfig(ctx, "test.last_sync", now.Add(-1*time.Hour).Format(time.RFC3339)); err != nil {
-		t.Fatalf("SetConfig() error: %v", err)
+	if err := store.SetLocalMetadata(ctx, "test.last_sync", now.Add(-1*time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("SetLocalMetadata() error: %v", err)
 	}
 
 	base := newMockTracker("test")
