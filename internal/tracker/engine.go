@@ -1247,12 +1247,24 @@ func (e *Engine) externalRefChangedAfter(ctx context.Context, local *types.Issue
 	// issue untouched since lastSync cannot have a changed ref. This keeps
 	// the dolt_history query below off the per-issue hot path — without it,
 	// every linked issue pays a history-table scan on every sync (bd-kqt).
-	if !local.CreatedAt.After(lastSync) && !local.UpdatedAt.After(lastSync) {
+	//
+	// Store timestamps are DATETIME with second granularity and round to
+	// the nearest second, so a ref linked moments after lastSync (which
+	// keeps sub-second precision) can be stored up to half a second BEFORE
+	// it. Compare against a one-second guard band and let the authoritative
+	// history check below decide the near-lastSync cases — the raw
+	// comparison misread those updates as "untouched" and silently skipped
+	// hydration (bd-21h).
+	cutoff := lastSync.Add(-time.Second)
+	if !local.CreatedAt.After(cutoff) && !local.UpdatedAt.After(cutoff) {
 		return false, nil
 	}
 	provider, ok := e.Store.(dbProvider)
 	if !ok || provider.DB() == nil {
-		return local.CreatedAt.After(lastSync) || local.UpdatedAt.After(lastSync), nil
+		// No history support: the guard-banded pre-filter above already
+		// found a possible change, and possible must mean "hydrate" here —
+		// a spurious fetch is batched and cheap, a missed one loses data.
+		return true, nil
 	}
 
 	var previousRef sql.NullString
