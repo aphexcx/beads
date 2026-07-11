@@ -10,6 +10,9 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dbproxy/util"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	beadsmysql "github.com/steveyegge/beads/internal/storage/mysql"
+	"github.com/steveyegge/beads/internal/storage/postgres"
+	beadssqlite "github.com/steveyegge/beads/internal/storage/sqlite"
 )
 
 func usesSQLServer() bool {
@@ -49,9 +52,22 @@ func acquireEmbeddedLock(_ string, _ bool) (util.Unlocker, error) {
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
-		// An existing-but-unreadable metadata.json must be reported as such,
-		// not misdiagnosed as a missing-CGO build (bd-9oh).
-		return nil, fmt.Errorf("loading %s: %w", configfile.ConfigPath(beadsDir), err)
+		// Name the real cause: without this, a present-but-unloadable
+		// metadata.json surfaces as the misleading "embedded requires CGO"
+		// message below (bd-9oh).
+		return nil, fmt.Errorf("load %s: %w", configfile.ConfigPath(beadsDir), err)
+	}
+	if cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+		// Postgres needs no CGO (pure-Go pgx), so it works in the nocgo build too.
+		return postgres.NewFromConfig(ctx, beadsDir)
+	}
+	if cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
+		// MySQL (go-sql-driver) needs no CGO either.
+		return beadsmysql.NewFromConfig(ctx, beadsDir)
+	}
+	if cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
+		// SQLite (modernc.org/sqlite) is pure-Go; no CGO.
+		return beadssqlite.NewFromConfig(ctx, beadsDir)
 	}
 	if cfg != nil && cfg.IsDoltProxiedServerMode() {
 		// TODO: this needs to be uow provider
@@ -73,7 +89,16 @@ func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.D
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		// See newDoltStoreFromConfig (bd-9oh).
-		return nil, fmt.Errorf("loading %s: %w", configfile.ConfigPath(beadsDir), err)
+		return nil, fmt.Errorf("load %s: %w", configfile.ConfigPath(beadsDir), err)
+	}
+	if cfg != nil && cfg.GetBackend() == configfile.BackendPostgres {
+		return postgres.NewFromConfig(ctx, beadsDir)
+	}
+	if cfg != nil && cfg.GetBackend() == configfile.BackendMySQL {
+		return beadsmysql.NewFromConfig(ctx, beadsDir)
+	}
+	if cfg != nil && cfg.GetBackend() == configfile.BackendSQLite {
+		return beadssqlite.NewFromConfig(ctx, beadsDir)
 	}
 	if cfg != nil && cfg.IsDoltProxiedServerMode() {
 		// TODO: this needs to be uow provider

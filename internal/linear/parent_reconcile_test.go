@@ -386,13 +386,41 @@ func TestReconcileParents_MultiTeam(t *testing.T) {
 	}
 }
 
-// NOTE (sibling-integration branch only): TestReconcileParents_AbortsOnRateLimit
-// is omitted here because the bd-47l-rooted base of this composition predates
-// the rate-limit circuit-breaker (DefaultRateLimitFloor + ErrRateLimitExhausted)
-// landed in gastownhall/main. The test exists on the upstream PR
-// (feat/linear-epic-parent-child) where it does pass, and validates the
-// rate-limit-abort path. Re-add here once the integration base catches up to
-// gastownhall/main with the rate-limit work.
+// TestReconcileParents_AbortsOnRateLimit verifies that hitting the rate-
+// limit circuit breaker stops the pass immediately instead of grinding
+// through the remaining links and accumulating failures.
+func TestReconcileParents_AbortsOnRateLimit(t *testing.T) {
+	mock := newLinearMock(t)
+	mock.issues["TEAM-1"] = &Issue{ID: "uuid-child1", Identifier: "TEAM-1"}
+	mock.issues["TEAM-2"] = &Issue{ID: "uuid-child2", Identifier: "TEAM-2"}
+	mock.issues["TEAM-99"] = &Issue{ID: "uuid-parent", Identifier: "TEAM-99"}
+	mock.failNextRL = true // first request returns ErrRateLimitExhausted
+	server := httptest.NewServer(mock)
+	defer server.Close()
+
+	tr := newTestLinearTracker(t, server.URL)
+	stats, err := tr.ReconcileParents(context.Background(), []ParentLink{
+		{ChildIdentifier: "TEAM-1", ParentIdentifier: "TEAM-99"},
+		{ChildIdentifier: "TEAM-2", ParentIdentifier: "TEAM-99"},
+	}, false)
+	if err == nil {
+		t.Fatal("expected error from rate-limit abort, got nil")
+	}
+	if !strings.Contains(err.Error(), "rate limit") && !strings.Contains(err.Error(), "RateLimitExhausted") {
+		t.Errorf("expected rate-limit error, got: %v", err)
+	}
+	// Pass should bail out — at most the first child was processed; subsequent
+	// links should never reach IssueUpdate.
+	if len(mock.updates) > 0 {
+		t.Errorf("expected 0 updates after rate-limit abort, got %d", len(mock.updates))
+	}
+	if stats.Updated != 0 {
+		t.Errorf("Updated = %d, want 0 (no updates after abort)", stats.Updated)
+	}
+	if mock.rateLimited != 1 {
+		t.Errorf("expected exactly 1 rate-limited response (single failure → abort), got %d", mock.rateLimited)
+	}
+}
 
 // TestReconcileParents_BlankIdentifiersSkipped — defensive guard against
 // callers that build links with empty fields.

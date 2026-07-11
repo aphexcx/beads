@@ -284,6 +284,8 @@ func TestBatchPush_PrefetchesRemotesInOneBatch(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			_ = json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "TeamLabels"):
+			_ = json.NewEncoder(w).Encode(teamLabelsEmptyResp("team-1"))
 		case strings.Contains(req.Query, "IssuesByIdentifiers"):
 			r.Body = io.NopCloser(strings.NewReader(string(body)))
 			mock.handler(t)(w, r)
@@ -356,6 +358,8 @@ func TestBatchPush_DegradedPrefetchFallsBackPerIssue(t *testing.T) {
 		switch {
 		case strings.Contains(req.Query, "TeamStates"):
 			_ = json.NewEncoder(w).Encode(teamStatesResp("team-1", "state-open", "Backlog", "backlog"))
+		case strings.Contains(req.Query, "TeamLabels"):
+			_ = json.NewEncoder(w).Encode(teamLabelsEmptyResp("team-1"))
 		case strings.Contains(req.Query, "IssuesByIdentifiers"):
 			http.Error(w, "transient batch failure", http.StatusInternalServerError)
 		case strings.Contains(req.Query, "IssueByIdentifier"):

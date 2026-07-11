@@ -63,7 +63,7 @@ Examples:
   bd linear migrate-epic-to-project hw-sv1v
   bd linear migrate-epic-to-project hw-sv1v --legacy-issue=close`,
 	Args: cobra.ExactArgs(1),
-	Run:  runLinearMigrateEpic,
+	RunE: runLinearMigrateEpic,
 }
 
 func init() {
@@ -115,7 +115,7 @@ type unsyncedDescendant struct {
 	Reason string // "no external_ref" or "non-Linear external_ref"
 }
 
-func runLinearMigrateEpic(cmd *cobra.Command, args []string) {
+func runLinearMigrateEpic(cmd *cobra.Command, args []string) error {
 	beadID := args[0]
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	legacyMode, _ := cmd.Flags().GetString("legacy-issue")
@@ -123,20 +123,20 @@ func runLinearMigrateEpic(cmd *cobra.Command, args []string) {
 	switch legacyMode {
 	case "keep", "close":
 	case "delete":
-		FatalError("--legacy-issue=delete is not supported in v1 (no Linear DeleteIssue mutation wired); " +
+		return HandleError("--legacy-issue=delete is not supported in v1 (no Linear DeleteIssue mutation wired); " +
 			"use the Linear UI to delete manually, or use --legacy-issue=close")
 	default:
-		FatalError("invalid --legacy-issue %q (use keep or close)", legacyMode)
+		return HandleError("invalid --legacy-issue %q (use keep or close)", legacyMode)
 	}
 	if !dryRun {
 		CheckReadonly("linear migrate-epic-to-project")
 	}
 
 	if err := ensureStoreActive(); err != nil {
-		FatalError("database not available: %v", err)
+		return HandleError("database not available: %v", err)
 	}
 	if err := validateLinearConfig(nil); err != nil {
-		FatalError("%v", err)
+		return HandleError("%v", err)
 	}
 
 	ctx := rootCtx
@@ -144,25 +144,26 @@ func runLinearMigrateEpic(cmd *cobra.Command, args []string) {
 	lt := &linear.Tracker{}
 	lt.SetTeamIDs(teamIDs)
 	if err := lt.Init(ctx, store); err != nil {
-		FatalError("initializing Linear tracker: %v", err)
+		return HandleError("initializing Linear tracker: %v", err)
 	}
 
 	plan, err := planEpicMigration(ctx, lt, beadID, legacyMode, teamIDs)
 	if err != nil {
-		FatalError("%v", err)
+		return HandleError("%v", err)
 	}
 
 	printEpicMigrationPlan(plan, dryRun, legacyMode)
 
 	if dryRun {
-		return
+		return nil
 	}
 
 	if err := executeEpicMigration(ctx, lt, plan, legacyMode, actor); err != nil {
-		FatalError("migration failed: %v", err)
+		return HandleError("migration failed: %v", err)
 	}
 
 	fmt.Printf("\n✓ Migration complete: %s is now a Linear Project\n", plan.Bead.ID)
+	return nil
 }
 
 // planEpicMigration loads the epic, validates refusal cases, enumerates
@@ -774,6 +775,5 @@ func retireLegacyIssue(ctx context.Context, lt *linear.Tracker, identifier, proj
 	return nil
 }
 
-// ensure os is used (FatalError is in main package); keeps the import
-// list explicit for the file.
+// ensure os is used; keeps the import list explicit for the file.
 var _ = os.Stderr

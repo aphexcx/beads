@@ -148,6 +148,18 @@ Type Filtering (--push only):
     bd config set linear.exclude_labels "gt:agent"
   --relations               Import Linear relations as bd dependencies on pull
 
+Persistent push-direction ID filters (workflow artifacts, sandbox beads, etc.):
+  bd config set linear.exclude_id_prefix "hw-mol-"
+  bd config set linear.exclude_id_patterns "-wisp-,sandbox-,scratch-"
+
+  exclude_id_prefix is a single case-sensitive prefix on the bead ID.
+  exclude_id_patterns is a comma-separated list of case-sensitive substrings
+  (matched anywhere in the ID). Both are combined as a union: a bead
+  matching either rule is skipped from push (no create, no update). Beads
+  with an existing external_ref that NOW match are silently skipped on
+  future syncs; the Linear-side issue persists — archive/delete it manually
+  if desired.
+
 Conflict Resolution:
   By default, newer timestamp wins. Override with:
   --prefer-local    Always prefer local beads version
@@ -924,7 +936,10 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 		ContentEqual: func(local *types.Issue, remote *tracker.TrackerIssue) bool {
 			remoteIssue, ok := remote.Raw.(*linear.Issue)
 			if ok && remoteIssue != nil {
-				if !linear.PushFieldsEqual(local, remoteIssue, config) {
+				// Label equality is handled by the label-sync gate below
+				// (push-direction delta via snapshots) rather than
+				// PushFieldsEqual's plain set comparison — pass nil cache.
+				if !linear.PushFieldsEqual(local, remoteIssue, config, nil) {
 					return false
 				}
 				// Decision #12: label sync gate. When label sync is enabled,
@@ -1619,6 +1634,37 @@ func getLinearIDMode(ctx context.Context) string {
 	return mode
 }
 
+// linearConfigReader is the minimal slice of storage.Storage that the
+// linear-config helpers depend on. Lets tests inject a fake without
+// spinning up a Dolt server.
+type linearConfigReader interface {
+	GetConfig(ctx context.Context, key string) (string, error)
+}
+
+// applyLinearExcludeIDConfig reads linear.exclude_id_prefix and
+// linear.exclude_id_patterns from the given config reader and applies them
+// to opts. Both keys are push-direction-only filters; see the help text on
+// linearSyncCmd for the user-facing semantics.
+//
+// Empty values are no-ops. Patterns are comma-split, trimmed, with empty
+// entries dropped. If reader is nil (no store configured), this is a no-op.
+func applyLinearExcludeIDConfig(ctx context.Context, reader linearConfigReader, opts *tracker.SyncOptions) {
+	if reader == nil || opts == nil {
+		return
+	}
+	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_prefix"); v != "" {
+		opts.ExcludeIDPrefix = strings.TrimSpace(v)
+	}
+	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_patterns"); v != "" {
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				opts.ExcludeIDPatterns = append(opts.ExcludeIDPatterns, p)
+			}
+		}
+	}
+}
+
 // getLinearHashLength returns the configured hash length for Linear imports.
 // Values are clamped to the supported range 3-8.
 func getLinearHashLength(ctx context.Context) int {
@@ -1718,36 +1764,6 @@ func pullHasLabelDelta(lt *linear.Tracker, local *types.Issue, remote *types.Iss
 	return false
 }
 
-// linearConfigReader is the minimal slice of storage.Storage that the
-// linear-config helpers depend on. Lets tests inject a fake without
-// spinning up a Dolt server.
-type linearConfigReader interface {
-	GetConfig(ctx context.Context, key string) (string, error)
-}
-
-// applyLinearExcludeIDConfig reads linear.exclude_id_prefix and
-// linear.exclude_id_patterns from the given config reader and applies them
-// to opts. Push-direction-only filters; see the help text on linearSyncCmd.
-//
-// Empty values are no-ops. Patterns are comma-split, trimmed, with empty
-// entries dropped. If reader is nil (no store configured), this is a no-op.
-func applyLinearExcludeIDConfig(ctx context.Context, reader linearConfigReader, opts *tracker.SyncOptions) {
-	if reader == nil || opts == nil {
-		return
-	}
-	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_prefix"); v != "" {
-		opts.ExcludeIDPrefix = strings.TrimSpace(v)
-	}
-	if v, _ := reader.GetConfig(ctx, "linear.exclude_id_patterns"); v != "" {
-		for _, p := range strings.Split(v, ",") {
-			p = strings.TrimSpace(p)
-			if p != "" {
-				opts.ExcludeIDPatterns = append(opts.ExcludeIDPatterns, p)
-			}
-		}
-	}
-}
-
 // syncIsScoped returns true when the user explicitly constrained THIS
 // invocation to a specific subset of beads (via --parent, --issues, or
 // --type). The parent reconcile pass is skipped on scoped syncs because
@@ -1781,6 +1797,14 @@ func syncIsScoped(opts *tracker.SyncOptions) bool {
 // dependencies into Linear's parent issue field. Idempotent — no API call
 // when the remote parent already matches.
 //
+// Two scenarios this fixes:
+//
+//  1. Fresh tree push: when a child is pushed before its parent in the same
+//     sync, the create call has no parentId to send. After all issues have
+//     external_refs, this pass closes the loop.
+//  2. Orphan repair: existing Linear issues created in earlier bd versions
+//     (or by interrupted syncs) without a parent get wired up retroactively.
+//
 // In dry-run mode the read-only fetches still run and the per-link mutation
 // plan is printed as [dry-run] lines, but no IssueUpdate is issued. Lets
 // users preview the orphan-repair scope before committing to a wet sync.
@@ -1790,6 +1814,9 @@ func syncIsScoped(opts *tracker.SyncOptions) bool {
 // polluted with stray fmt.Printf lines. Warnings and errors still go
 // through the warnings slice, which IS surfaced in JSON output via
 // SyncResult.Warnings.
+//
+// Warnings (per-link failures, missing refs) are appended to the engine's
+// warning slice so the user sees them in the standard sync output.
 func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jsonOutput bool, warnings *[]string) {
 	if lt == nil || store == nil {
 		return
@@ -1803,8 +1830,10 @@ func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jso
 		return
 	}
 	stats, err := lt.ReconcileParents(ctx, links, dryRun)
-	// Print mutation summary; suppress when --json is requested so the
-	// JSON envelope stays clean.
+	// Print mutation summary first; an abort (e.g. rate-limit circuit
+	// breaker) may have completed some updates before bailing, and the
+	// user should see that work wasn't lost. Suppress when --json is
+	// requested so the JSON envelope stays clean.
 	if stats != nil && !jsonOutput {
 		if dryRun {
 			if stats.WouldUpdate > 0 {

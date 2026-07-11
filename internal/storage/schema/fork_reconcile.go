@@ -73,6 +73,16 @@ func reconcileForkLineageCursors(ctx context.Context, db DBConn) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if !mainChanged {
+		// No pre-merge fork main cursor (or row 54 was upstream's own lease
+		// migration — see the disambiguation in reconcileForkMainCursor).
+		// Since the upstream-20260710 merge, upstream also owns an ignored
+		// migration 0011 (cleanup_orphaned_child_counters), so the ignored
+		// fingerprint row 11 is only meaningful together with the main one:
+		// running the ignored pass on a genuine upstream database would trip
+		// its refuse-to-rewrite guard.
+		return false, nil
+	}
 	ignoredChanged, err := reconcileForkIgnoredCursor(ctx, db)
 	if err != nil {
 		return mainChanged, err
@@ -87,6 +97,22 @@ func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
 	has54, err := cursorRowExists(ctx, db, mainSource.cursorTable, forkPreMergeMainMax)
 	if err != nil || !has54 {
 		return false, err
+	}
+
+	// Post-merge disambiguation: since the upstream-20260710 merge, upstream
+	// ALSO owns a migration 0054 (add_lease_columns, schema v54), so row 54
+	// alone no longer proves pre-merge fork lineage. Fork 0054 was
+	// create_attachments and never touched issues; upstream's 0054 adds
+	// issues.lease_expires_at. If the lease column is present, row 54 came
+	// from upstream's chain (a genuine upstream database, or a fork database
+	// already reconciled that then applied upstream 0054) — nothing to
+	// rewrite, and the strict MAX(version) check below must not fire.
+	hasLease, err := columnExists(ctx, db, "issues", "lease_expires_at")
+	if err != nil {
+		return false, fmt.Errorf("disambiguating fork lineage (issues.lease_expires_at): %w", err)
+	}
+	if hasLease {
+		return false, nil
 	}
 
 	current, err := mainSource.currentVersion(ctx, db)
@@ -358,6 +384,21 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 	has11, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, forkPreMergeIgnoredMax)
 	if err != nil {
 		return report, err
+	}
+
+	// Post-merge disambiguation (see reconcileForkMainCursor): since the
+	// upstream-20260710 merge, upstream owns a main 0054 (add_lease_columns)
+	// and an ignored 0011 (cleanup_orphaned_child_counters), so those cursor
+	// rows are only fork fingerprints on a database that has NOT applied
+	// upstream's 0054 (issues.lease_expires_at absent).
+	if has54 || has11 {
+		hasLease, leaseErr := columnExists(ctx, db, "issues", "lease_expires_at")
+		if leaseErr != nil {
+			return report, leaseErr
+		}
+		if hasLease {
+			has54, has11 = false, false
+		}
 	}
 
 	if has54 || has11 {

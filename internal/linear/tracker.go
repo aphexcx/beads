@@ -399,6 +399,9 @@ func (t *Tracker) UpdateIssueWithRemote(ctx context.Context, externalID string, 
 		return nil, fmt.Errorf("cannot determine Linear team for issue %s", externalID)
 	}
 
+	// Label pushes are handled by the label-sync reconciler below (gated on
+	// linear.label_sync_enabled, snapshot-based) rather than the plain
+	// label-cache mapping — see reconcileAndBuildLabelUpdate.
 	mapper := t.FieldMapper()
 	updates := mapper.IssueToTracker(issue)
 
@@ -715,6 +718,23 @@ func (t *Tracker) executeBatchPush(ctx context.Context, issues []*types.Issue, f
 		return nil, fmt.Errorf("building state cache: no cache for primary team %s", t.teamIDs[0])
 	}
 
+	teamLabelCaches := make(map[string]*LabelCache, len(t.teamIDs))
+	for _, teamID := range t.teamIDs {
+		teamClient := t.clients[teamID]
+		if teamClient == nil {
+			continue
+		}
+		lc, err := BuildLabelCache(ctx, teamClient)
+		if err != nil {
+			return nil, fmt.Errorf("building label cache for team %s: %w", teamID, err)
+		}
+		teamLabelCaches[teamID] = lc
+	}
+	primaryLabelCache := teamLabelCaches[t.teamIDs[0]]
+	if primaryLabelCache == nil {
+		return nil, fmt.Errorf("building label cache: no cache for primary team %s", t.teamIDs[0])
+	}
+
 	result := &tracker.BatchPushResult{}
 
 	var toCreate []*types.Issue
@@ -771,7 +791,12 @@ func (t *Tracker) executeBatchPush(ctx context.Context, issues []*types.Issue, f
 			}
 
 			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
-			var labelIDs []string
+			labelIDs, unknown := ResolveLabelIDs(issue, primaryLabelCache, t.config)
+			for _, name := range unknown {
+				msg := fmt.Sprintf("linear: bead %s: label %q not found on Linear team (skipped)", issue.ID, name)
+				fmt.Fprintf(os.Stderr, "%s\n", msg)
+				result.Warnings = append(result.Warnings, msg)
+			}
 			created, _, createErr := client.CreateIssueIdempotent(ctx, issue.Title, issue.Description, priority, stateID, labelIDs, marker)
 			if createErr != nil {
 				result.Errors = append(result.Errors, tracker.BatchPushError{
@@ -809,12 +834,20 @@ func (t *Tracker) executeBatchPush(ctx context.Context, issues []*types.Issue, f
 			marker := GenerateIdempotencyMarker(issue.ID, issue.CreatedBy, issue.CreatedAt.UnixNano())
 			desc := AppendIdempotencyMarker(issue.Description, marker)
 
+			labelIDs, unknown := ResolveLabelIDs(issue, primaryLabelCache, t.config)
+			for _, name := range unknown {
+				msg := fmt.Sprintf("linear: bead %s: label %q not found on Linear team (skipped)", issue.ID, name)
+				fmt.Fprintf(os.Stderr, "%s\n", msg)
+				result.Warnings = append(result.Warnings, msg)
+			}
+
 			input := IssueCreateInput{
 				TeamID:      client.TeamID,
 				Title:       issue.Title,
 				Description: desc,
 				Priority:    priority,
 				StateID:     stateID,
+				LabelIDs:    labelIDs,
 			}
 			if client.ProjectID != "" {
 				input.ProjectID = client.ProjectID
@@ -925,17 +958,22 @@ func (t *Tracker) executeBatchPush(ctx context.Context, issues []*types.Issue, f
 			}
 		}
 
+		teamLabelCache := primaryLabelCache
+		if lc, ok := teamLabelCaches[routeClient.TeamID]; ok && lc != nil {
+			teamLabelCache = lc
+		}
+
 		// Skip issues that haven't changed since the last push, unless forced.
 		// This mirrors the ContentEqual / UpdatedAt skip logic in the single-issue
 		// push path (engine.go doPush) to avoid redundant API writes.
 		if !forceIDs[issue.ID] && remoteIssue != nil {
-			if PushFieldsEqual(issue, remoteIssue, t.config) {
+			if PushFieldsEqual(issue, remoteIssue, t.config, teamLabelCache) {
 				result.Skipped = append(result.Skipped, issue.ID)
 				continue
 			}
 		}
 
-		mapper := t.FieldMapper()
+		mapper := &linearFieldMapper{config: t.config, labelCache: teamLabelCache}
 		updates := mapper.IssueToTracker(issue)
 
 		stateID, stateErr := ResolveStateIDForBeadsStatus(teamCache, issue.Status, t.config)
@@ -1057,6 +1095,22 @@ func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {
 	return fmt.Sprintf("https://linear.app/issue/%s", issue.Identifier)
 }
 
+func skipOptionalPushStateMapping(status types.Status, err error, custom []types.CustomStatus) bool {
+	if !strings.Contains(err.Error(), "has no configured Linear state") {
+		return false
+	}
+	switch status {
+	case types.StatusBlocked, types.StatusDeferred, types.StatusPinned, types.StatusHooked:
+		return true
+	}
+	for _, cs := range custom {
+		if types.Status(cs.Name) == status {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidatePushStateMappings ensures push has explicit, non-ambiguous status
 // mappings for every configured team before any mutation occurs.
 //
@@ -1097,6 +1151,14 @@ func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 			statusesToCheck = append(statusesToCheck, s)
 		}
 	}
+	// Upstream #3772: also validate configured custom statuses (status.custom)
+	// so a rig that defines them learns about unresolvable mappings up front.
+	for _, cs := range t.config.CustomStatuses {
+		st := types.Status(cs.Name)
+		if !core[st] && !explicitlyMapped[st] {
+			statusesToCheck = append(statusesToCheck, st)
+		}
+	}
 
 	for _, teamID := range t.teamIDs {
 		client := t.clients[teamID]
@@ -1133,11 +1195,12 @@ func (t *Tracker) ValidatePushStateMappings(ctx context.Context) error {
 				_, resolveErr = ResolveStateIDForBeadsStatus(cache, status, t.config)
 			}
 			if resolveErr != nil {
-				// Blocked exception: missing-state allowed when blocked is NOT
-				// explicitly mapped. With explicit opt-in via linear.state_map.blocked,
-				// fail loudly here instead of waiting for the first blocked-issue push.
-				if status == types.StatusBlocked && !explicitlyMapped[status] &&
-					strings.Contains(resolveErr.Error(), "has no configured Linear state") {
+				// Optional-status exception (blocked/deferred/pinned/hooked/custom):
+				// missing-state allowed when the status is NOT explicitly mapped.
+				// With explicit opt-in via linear.state_map.<status>, fail loudly
+				// here instead of waiting for the first push of that status.
+				if !explicitlyMapped[status] &&
+					skipOptionalPushStateMapping(status, resolveErr, t.config.CustomStatuses) {
 					continue
 				}
 				return resolveErr
@@ -1793,6 +1856,16 @@ func resolveLabelIDs(ctx context.Context, c labelClient, names []string, scope L
 		out[n] = l // l.Name == n (CreateLabel just stored it with this name)
 	}
 	return out, nil
+}
+
+// BuildLabelCacheFromTracker builds a LabelCache using the tracker's primary client.
+// This allows CLI push hooks to compare label sets without reaching into the client.
+func BuildLabelCacheFromTracker(ctx context.Context, t *Tracker) (*LabelCache, error) {
+	client := t.primaryClient()
+	if client == nil {
+		return nil, fmt.Errorf("Linear tracker not initialized")
+	}
+	return BuildLabelCache(ctx, client)
 }
 
 // configLoaderAdapter wraps storage.Storage to implement linear.ConfigLoader.

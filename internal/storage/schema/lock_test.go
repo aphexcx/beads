@@ -105,8 +105,10 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	// bd-dn6 fork-lineage reconciliation probes both cursor tables for the
 	// pre-merge fork fingerprint rows (main 54, ignored 11); neither exists
 	// in this mocked world, so both cursors are left alone.
+	// reconcileForkLineageCursors: no main fork fingerprint (row 54), so the
+	// ignored-chain probe is skipped entirely (post-merge gating — upstream
+	// also owns an ignored 0011 now).
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
-	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
 	expectDoltStatusRows(mock)
 	expectDoltStatusRows(mock)
 	// MigrateUp probes the aux-rekey crash sentinel (bd-578h9.16); this
@@ -120,11 +122,36 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectContentHashColumnExists(mock)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
+	if latest == 53 {
+		// The v53 pre-repair probes the six rig/agent columns on issues and
+		// then the local wisp_dependencies table; this mocked world has all
+		// issue columns and no local wisp_dependencies table, so no ALTERs follow.
+		for _, col := range []string{"hook_bead", "role_bead", "agent_state", "last_activity", "role_type", "rig"} {
+			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
+				WithArgs("issues", col).
+				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+		}
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+			WithArgs("wisp_dependencies").
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	}
+	// Per-step commit (#4566) snapshots the working set before the migration
+	// runs so it can force-stage only the tables this step newly dirties.
+	expectDoltStatusRows(mock)
 	mock.ExpectExec("(?s).*").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO schema_migrations (version, content_hash) VALUES (?, ?)")).
 		WithArgs(latest, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Per-step commit (#4566): re-read the working set (no table newly dirtied
+	// in this mocked world), force-stage the cursor table, and commit the step.
+	expectDoltStatusRows(mock)
+	mock.ExpectExec(regexp.QuoteMeta("CALL DOLT_ADD('-f', ?)")).
+		WithArgs("schema_migrations").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?)")).
+		WithArgs(sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
 	// rekeyDependencyIDs probes whether each edge table has an id column; this
@@ -152,6 +179,8 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
+// expectColumnExists mocks the INFORMATION_SCHEMA.COLUMNS probe still used by
+// the dependency/aux id-column re-key paths (dep_id_backfill.go).
 func expectColumnExists(mock sqlmock.Sqlmock, present bool) {
 	n := 0
 	if present {
@@ -162,9 +191,12 @@ func expectColumnExists(mock sqlmock.Sqlmock, present bool) {
 }
 
 // expectContentHashColumnExists mocks the idempotent ensureContentHashColumn
-// probe, reporting that the content_hash column already exists (so no ALTER runs).
+// probe, reporting that the content_hash column already exists (so no ALTER
+// runs). The probe is a single-table SHOW COLUMNS, not an
+// INFORMATION_SCHEMA scan.
 func expectContentHashColumnExists(mock sqlmock.Sqlmock) {
-	expectColumnExists(mock, true)
+	mock.ExpectQuery(`SHOW COLUMNS FROM \w+ LIKE 'content_hash'`).
+		WillReturnRows(showColumnsRows("content_hash"))
 }
 
 func expectScalar(mock sqlmock.Sqlmock, query, column string, value any) {
