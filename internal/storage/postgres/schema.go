@@ -5,9 +5,19 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strings"
 )
+
+// schemaAdvisoryLockKey derives a stable Postgres advisory-lock key from a
+// workspace schema name. Distinct schemas map to distinct keys so per-workspace
+// InitSchema calls serialize against themselves but never against each other.
+func schemaAdvisoryLockKey(schema string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("bd.initschema:" + schema))
+	return int64(h.Sum64())
+}
 
 // ddl is the Postgres backend schema, embedded verbatim from
 // internal/storage/postgres/schema.sql. It is applied statement-by-statement by
@@ -16,7 +26,7 @@ import (
 const ddl = `-- bd Postgres backend schema.
 -- Machine-translated from Dolt ` + "`" + `SHOW CREATE TABLE` + "`" + ` output at HEAD (all
 -- migrations applied), using the conformance type map documented in
--- docs/STORAGE-BACKENDS.md:
+-- docs/architecture/storage-backends.md:
 --   varchar/char/text/longtext -> text   (see collation note below)
 --   datetime                   -> timestamp(0)       (naive whole-second UTC)
 --   tinyint(1)                 -> smallint
@@ -488,6 +498,33 @@ func InitSchema(ctx context.Context, db *sql.DB, schema string) error {
 		return fmt.Errorf("postgres: acquire connection: %w", err)
 	}
 	defer conn.Close()
+
+	// InitSchema runs on EVERY open and re-applies idempotent DDL (CREATE OR
+	// REPLACE FUNCTION, CREATE INDEX IF NOT EXISTS, ...). Idempotent is not the
+	// same as concurrency-safe: concurrent opens rewriting the same pg catalog
+	// tuples collide with "tuple concurrently updated" (SQLSTATE XX000). When a
+	// gc controller drives this store, the dispatcher, session reconciler, and
+	// agent subprocesses open bd concurrently, so the race is routine and it
+	// surfaces as spurious bd failures (e.g. the reconciler's assigned-work probe
+	// failing and orphan-draining live sessions). Serialize DDL application per
+	// schema with a session advisory lock so only one initializer touches the
+	// catalog at a time; distinct schemas hash to distinct keys and never block
+	// each other. Held on this connection and released before it returns to the
+	// pool.
+	lockKey := schemaAdvisoryLockKey(schema)
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
+		return fmt.Errorf("postgres: acquire schema-init advisory lock: %w", err)
+	}
+	// The unlock must run even when ctx is already canceled: with a done ctx,
+	// database/sql returns before touching the driver, the connection goes back
+	// to the pool healthy, and its backend session keeps holding the advisory
+	// lock — wedging every later open of this schema. WithoutCancel guarantees
+	// the unlock is attempted; if it fails on the wire instead, the driver marks
+	// the connection bad, the backend session dies with it, and Postgres releases
+	// the lock anyway, so the error is safe to drop.
+	defer func() {
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, lockKey)
+	}()
 
 	if _, err := conn.ExecContext(ctx, `CREATE SCHEMA IF NOT EXISTS "`+schema+`"`); err != nil {
 		return fmt.Errorf("postgres: create schema %q: %w", schema, err)

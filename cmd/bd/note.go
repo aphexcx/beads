@@ -67,6 +67,10 @@ Examples:
 			return HandleErrorRespectJSON("note text is empty")
 		}
 
+		if usesProxiedServer() {
+			return runNoteProxiedServer(rootCtx, id, noteText)
+		}
+
 		ctx := rootCtx
 
 		result, err := resolveAndGetIssueForMutation(ctx, store, id)

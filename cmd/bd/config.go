@@ -246,6 +246,17 @@ var configGetCmd = &cobra.Command{
 
 		key := args[0]
 
+		if key == "backup.enabled" {
+			// backup.enabled has an auto-detected effective value that
+			// differs from the stored value: when unset it auto-enables
+			// in embedded mode with a git remote, and is forced OFF in
+			// sql-server mode (see isBackupAutoEnabled). Reporting the raw
+			// stored "false"/"not set" here misled operators during the
+			// 2026-07 shared-dolt incident, so show the EFFECTIVE value
+			// and its source.
+			return runConfigGetBackupEnabled()
+		}
+
 		if config.IsYamlOnlyKey(key) {
 			// User-global keys (e.g. metrics.*) must be read from the user-global
 			// config.yaml only — the same source the runtime uses for metrics
@@ -341,6 +352,45 @@ var configGetCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// runConfigGetBackupEnabled reports the EFFECTIVE value of
+// backup.enabled together with its source, rather than the raw stored
+// value. The stored value is misleading because isBackupAutoEnabled()
+// derives the runtime value: unset → auto-enabled in embedded mode
+// when a git remote exists, and forced OFF in sql-server mode.
+func runConfigGetBackupEnabled() error {
+	const key = "backup.enabled"
+	source := config.GetValueSource(key)
+	effective := isBackupAutoEnabled()
+
+	var sourceDesc string
+	switch source {
+	case config.SourceEnvVar:
+		sourceDesc = "env var"
+	case config.SourceConfigFile:
+		sourceDesc = "config.yaml"
+	default: // SourceDefault — value came from auto-detection
+		switch {
+		case usesSQLServer():
+			sourceDesc = "default (auto: off in sql-server mode)"
+		case effective:
+			sourceDesc = "default (auto: on — git remote detected)"
+		default:
+			sourceDesc = "default (auto: off — no git remote)"
+		}
+	}
+
+	if jsonOutput {
+		return outputJSON(map[string]interface{}{
+			"key":       key,
+			"value":     effective,
+			"effective": effective,
+			"source":    string(source),
+		})
+	}
+	fmt.Printf("%t (%s)\n", effective, sourceDesc)
+	return nil
 }
 
 var configListCmd = &cobra.Command{

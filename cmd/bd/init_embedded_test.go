@@ -1114,9 +1114,9 @@ func TestEmbeddedInit(t *testing.T) {
 	t.Run("auto_commit_bypasses_hooks", func(t *testing.T) {
 		dir := t.TempDir()
 		initGitRepoAt(t, dir)
-		preCommitPath := filepath.Join(dir, ".git", "hooks", "pre-commit")
-		preCommit := "#!/bin/sh\necho hook-fired >> .hook-ran\nexit 1\n"
-		if err := os.WriteFile(preCommitPath, []byte(preCommit), 0755); err != nil {
+		hookPath := filepath.Join(dir, ".git", "hooks", "prepare-commit-msg")
+		hook := "#!/bin/sh\necho hook-fired >> .hook-ran\nexit 1\n"
+		if err := os.WriteFile(hookPath, []byte(hook), 0755); err != nil {
 			t.Fatal(err)
 		}
 		unsetHooksPath := exec.Command("git", "config", "--unset", "core.hooksPath")
@@ -1463,7 +1463,9 @@ func TestEmbeddedInit(t *testing.T) {
 	t.Run("files_created", func(t *testing.T) {
 		dir, beadsDir, _ := bdInit(t, bd, "--prefix", "fc", "--skip-hooks")
 		requireFile(t, filepath.Join(beadsDir, "config.yaml"))
-		requireFile(t, filepath.Join(beadsDir, "interactions.jsonl"))
+		if _, err := os.Stat(filepath.Join(beadsDir, "interactions.jsonl")); !os.IsNotExist(err) {
+			t.Fatalf("interactions.jsonl should be created only when audit.enabled is true, got stat err %v", err)
+		}
 		requireFile(t, filepath.Join(dir, "AGENTS.md"))
 		requireFile(t, filepath.Join(dir, ".agents", "skills", "beads", "SKILL.md"))
 		requireFile(t, filepath.Join(dir, ".agents", "skills", "beads", "agents", "openai.yaml"))

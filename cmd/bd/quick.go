@@ -40,6 +40,10 @@ Example:
 
 		CheckReadonly("q")
 
+		if usesProxiedServer() {
+			return runQuickProxiedServer(cmd, rootCtx, args)
+		}
+
 		title := strings.Join(args, " ")
 
 		priorityStr, _ := cmd.Flags().GetString("priority")

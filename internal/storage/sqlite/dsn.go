@@ -13,6 +13,14 @@ import "strings"
 //     inter-process contention.
 //   - _txlock=immediate: writers take the write lock up front and fail fast rather
 //     than deadlocking mid-transaction on lock upgrade.
+//   - case_sensitive_like(1): LIKE parity with the other backends. Dolt/MySQL use
+//     the utf8mb4_0900_bin table collation and Postgres uses collation "C", so
+//     `id LIKE 'bd-A%'` is case-sensitive there; SQLite's default LIKE is
+//     ASCII-case-INsensitive, which silently diverged on raw-cased operands
+//     (--id-prefix filtering, parent-descendant `id LIKE parent || '.%'`,
+//     GetNextChildID's child scan). Intentionally case-insensitive searches are
+//     unaffected: they wrap both sides in LOWER(). _pragma params are applied by
+//     modernc on EVERY new connection, so the whole pool gets it (bd-oyvc2.10).
 //
 // _time_format=datetime is required for Dolt parity, not a nicety. Without it modernc
 // binds every time.Time through t.String() ("2026-07-09 12:34:56.123 +0000 UTC"), a
@@ -32,5 +40,5 @@ func dsn(path string) string {
 	if strings.HasPrefix(path, "file:") {
 		return path
 	}
-	return "file:" + path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_txlock=immediate&_time_format=datetime"
+	return "file:" + path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=case_sensitive_like(1)&_txlock=immediate&_time_format=datetime"
 }

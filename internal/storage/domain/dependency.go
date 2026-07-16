@@ -23,6 +23,24 @@ type DependencyTypeConflictError struct {
 	RequestedType string
 }
 
+// DependencyHierarchyConflictError is returned when a blocking dependency
+// would gate an issue on one of its own ancestors or descendants. Either shape
+// can never clear under the parent-child close/blocking semantics.
+type DependencyHierarchyConflictError struct {
+	IssueID           string
+	BlockerID         string
+	BlockerIsAncestor bool
+}
+
+func (e *DependencyHierarchyConflictError) Error() string {
+	if e.BlockerIsAncestor {
+		return fmt.Sprintf("%s cannot be blocked by its ancestor %s: %s cannot close until its descendants finish, so the gate would never clear",
+			e.IssueID, e.BlockerID, e.BlockerID)
+	}
+	return fmt.Sprintf("%s cannot be blocked by its descendant %s: blocked status cascades to descendants, so %s would inherit the block and never close",
+		e.IssueID, e.BlockerID, e.BlockerID)
+}
+
 func (e *DependencyTypeConflictError) Error() string {
 	return fmt.Sprintf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
 		e.IssueID, e.DependsOnID, e.ExistingType, e.RequestedType)
@@ -37,7 +55,9 @@ const (
 )
 
 type DepInsertOpts struct {
-	UseWispsTable bool
+	UseWispsTable      bool
+	HierarchyValidated bool // Set only after ValidateBlockingHierarchy on the same repository/UOW.
+	CycleValidated     bool // Set only after HasCycle or a whole-graph check on the same repository/UOW.
 }
 
 type DepListOpts struct {
@@ -87,6 +107,7 @@ type BulkAddDepsResult struct {
 }
 
 type DependencySQLRepository interface {
+	ValidateBlockingHierarchy(ctx context.Context, dep *types.Dependency) error
 	Insert(ctx context.Context, dep *types.Dependency, actor string, opts DepInsertOpts) error
 	Delete(ctx context.Context, issueID, dependsOnID, actor string, opts DepInsertOpts) (DepDeleteResult, error)
 	HasCycle(ctx context.Context, issueID, dependsOnID string) (bool, error)
@@ -175,8 +196,15 @@ func (u *dependencyUseCaseImpl) add(ctx context.Context, dep *types.Dependency, 
 	if dep.IssueID == dep.DependsOnID {
 		return fmt.Errorf("cannot add self-dependency: %s cannot depend on itself", dep.IssueID)
 	}
+	if err := u.depRepo.ValidateBlockingHierarchy(ctx, dep); err != nil {
+		var hierarchyConflict *DependencyHierarchyConflictError
+		if errors.As(err, &hierarchyConflict) {
+			return err
+		}
+		return fmt.Errorf("add dep: hierarchy check: %w", err)
+	}
 
-	if isBlockingDep(dep.Type) {
+	if isSchedulingDep(dep.Type) {
 		cycle, err := u.depRepo.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
 		if err != nil {
 			return fmt.Errorf("add dep: cycle check: %w", err)
@@ -189,12 +217,16 @@ func (u *dependencyUseCaseImpl) add(ctx context.Context, dep *types.Dependency, 
 		}
 	}
 
-	if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
+	if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp, HierarchyValidated: true, CycleValidated: true}); err != nil {
 		// The retype conflict is a user-facing error whose message already
 		// matches embedded verbatim; pass it through unwrapped so the CLI does
 		// not prepend "add dep: insert:" (#4547 F-1).
 		var conflict *DependencyTypeConflictError
 		if errors.As(err, &conflict) {
+			return err
+		}
+		var hierarchyConflict *DependencyHierarchyConflictError
+		if errors.As(err, &hierarchyConflict) {
 			return err
 		}
 		return fmt.Errorf("add dep: insert: %w", err)
@@ -432,6 +464,10 @@ func isBlockingDep(t types.DependencyType) bool {
 	return t == types.DepBlocks || t == types.DepConditionalBlocks
 }
 
+func isSchedulingDep(t types.DependencyType) bool {
+	return isBlockingDep(t) || t == types.DepParentChild
+}
+
 func (u *dependencyUseCaseImpl) IsBlocked(ctx context.Context, issueID string) (bool, []string, error) {
 	return u.isBlocked(ctx, issueID, false)
 }
@@ -482,7 +518,10 @@ func (u *dependencyUseCaseImpl) addBulk(ctx context.Context, deps []*types.Depen
 	if len(deps) == 0 {
 		return BulkAddDepsResult{Added: []*types.Dependency{}}, nil
 	}
-	insertOpts := DepInsertOpts{UseWispsTable: useWisp}
+	insertOpts := DepInsertOpts{UseWispsTable: useWisp, HierarchyValidated: true, CycleValidated: true}
+	// Validate the entire input shape before the first write. Multi-edge callers
+	// run in a UOW, but this also avoids an avoidable partial prefix for direct
+	// use-case consumers.
 	for i, dep := range deps {
 		if dep == nil {
 			return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: dep must not be nil", i)
@@ -490,35 +529,55 @@ func (u *dependencyUseCaseImpl) addBulk(ctx context.Context, deps []*types.Depen
 		if dep.IssueID == "" || dep.DependsOnID == "" {
 			return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: IssueID and DependsOnID must be non-empty", i)
 		}
-		if !opts.SkipPerEdgeCycleCheck && isBlockingDep(dep.Type) {
-			cycle, err := u.depRepo.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
-			if err != nil {
-				return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: cycle check: %w", i, err)
-			}
-			if cycle {
-				return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: adding %s -> %s would create a cycle", i, dep.IssueID, dep.DependsOnID)
-			}
-		}
-		if err := u.depRepo.Insert(ctx, dep, actor, insertOpts); err != nil {
-			return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: insert: %w", i, err)
-		}
 	}
-	if opts.SkipPerEdgeCycleCheck {
-		var pairs [][2]string
-		for _, dep := range deps {
-			if !isBlockingDep(dep.Type) {
+	// Parent-child edges must be visible before blocking edges in the same
+	// request. The shared repository guard can then evaluate existing + planned
+	// ancestry without widening #4034 into #4035's combined-graph cycle check.
+	for phase := 0; phase < 2; phase++ {
+		parentPhase := phase == 0
+		for i, dep := range deps {
+			if (dep.Type == types.DepParentChild) != parentPhase {
 				continue
 			}
-			pairs = append(pairs, [2]string{dep.IssueID, dep.DependsOnID})
+			if err := u.depRepo.ValidateBlockingHierarchy(ctx, dep); err != nil {
+				var hierarchyConflict *DependencyHierarchyConflictError
+				if errors.As(err, &hierarchyConflict) {
+					return BulkAddDepsResult{}, err
+				}
+				return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: hierarchy check: %w", i, err)
+			}
+			if !opts.SkipPerEdgeCycleCheck && isSchedulingDep(dep.Type) {
+				cycle, err := u.depRepo.HasCycle(ctx, dep.IssueID, dep.DependsOnID)
+				if err != nil {
+					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: cycle check: %w", i, err)
+				}
+				if cycle {
+					return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: adding %s -> %s would create a cycle", i, dep.IssueID, dep.DependsOnID)
+				}
+			}
+			if err := u.depRepo.Insert(ctx, dep, actor, insertOpts); err != nil {
+				var hierarchyConflict *DependencyHierarchyConflictError
+				if errors.As(err, &hierarchyConflict) {
+					return BulkAddDepsResult{}, err
+				}
+				return BulkAddDepsResult{}, fmt.Errorf("add deps[%d]: insert: %w", i, err)
+			}
 		}
-		if len(pairs) > 0 {
-			cyclePath, err := u.depRepo.CycleThroughEdges(ctx, pairs)
-			if err != nil {
-				return BulkAddDepsResult{}, fmt.Errorf("add deps: final cycle check: %w", err)
-			}
-			if cyclePath != "" {
-				return BulkAddDepsResult{}, fmt.Errorf("add deps: dependency cycle would be created: %s", cyclePath)
-			}
+	}
+	var pairs [][2]string
+	for _, dep := range deps {
+		if !isSchedulingDep(dep.Type) {
+			continue
+		}
+		pairs = append(pairs, [2]string{dep.IssueID, dep.DependsOnID})
+	}
+	if len(pairs) > 0 {
+		cyclePath, err := u.depRepo.CycleThroughEdges(ctx, pairs)
+		if err != nil {
+			return BulkAddDepsResult{}, fmt.Errorf("add deps: final cycle check: %w", err)
+		}
+		if cyclePath != "" {
+			return BulkAddDepsResult{}, fmt.Errorf("add deps: dependency cycle would be created: %s", cyclePath)
 		}
 	}
 	return BulkAddDepsResult{Added: deps}, nil

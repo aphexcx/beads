@@ -195,15 +195,15 @@ func (t *sqlkitTx) GetDependencyRecords(ctx context.Context, issueID string) ([]
 	return deps, rows.Err()
 }
 
-// CycleThroughEdges reports a blocking cycle through one of the new edges. The
+// CycleThroughEdges reports a scheduling cycle through one of the new edges. The
 // graph merges both dependency tables so uncommitted wisp and permanent edges
 // are gated together.
 func (t *sqlkitTx) CycleThroughEdges(ctx context.Context, edges [][2]string) (string, error) {
 	graph := make(map[string][]string)
-	if err := issueops.AppendBlockingGraphInTx(ctx, t.tx, []string{"dependencies"}, graph); err != nil {
+	if err := issueops.AppendSchedulingGraphInTx(ctx, t.tx, []string{"dependencies"}, graph); err != nil {
 		return "", err
 	}
-	if err := issueops.AppendBlockingGraphInTx(ctx, t.tx, []string{"wisp_dependencies"}, graph); err != nil {
+	if err := issueops.AppendSchedulingGraphInTx(ctx, t.tx, []string{"wisp_dependencies"}, graph); err != nil {
 		return "", err
 	}
 	return issueops.CycleThroughEdgesInGraph(graph, edges), nil

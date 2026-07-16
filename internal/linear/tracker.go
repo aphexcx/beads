@@ -967,7 +967,14 @@ func (t *Tracker) executeBatchPush(ctx context.Context, issues []*types.Issue, f
 		// This mirrors the ContentEqual / UpdatedAt skip logic in the single-issue
 		// push path (engine.go doPush) to avoid redundant API writes.
 		if !forceIDs[issue.ID] && remoteIssue != nil {
-			if PushFieldsEqual(issue, remoteIssue, t.config, teamLabelCache) {
+			// BatchPush receives pre-formatted descriptions from the sync
+			// engine (FormatDescription hook). Clear structured fields before
+			// comparison so PushFieldsEqual does not re-append them.
+			comparableIssue := *issue
+			comparableIssue.AcceptanceCriteria = ""
+			comparableIssue.Design = ""
+			comparableIssue.Notes = ""
+			if PushFieldsEqual(&comparableIssue, remoteIssue, t.config, teamLabelCache) {
 				result.Skipped = append(result.Skipped, issue.ID)
 				continue
 			}
