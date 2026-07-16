@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -236,18 +237,27 @@ func TestBatchFetchIssues_ExhaustionOutranksTransientError(t *testing.T) {
 	}))
 	defer team1.Close()
 	team2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		// Remaining below the default floor (100) trips the circuit breaker.
+		// Remaining below the default floor (100) plus a valid future reset
+		// arms the circuit breaker for the next request on this client.
 		w.Header().Set("X-RateLimit-Requests-Remaining", "1")
+		w.Header().Set("X-RateLimit-Requests-Reset", strconv.FormatInt(time.Now().Add(time.Hour).UnixMilli(), 10))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
 	}))
 	defer team2.Close()
 
+	// Arm team-2's breaker: consume one low-budget response so the team walk
+	// below fails with ErrRateLimitExhausted when it reaches team-2.
+	client2 := NewClient("key", "team-2").WithEndpoint(team2.URL)
+	if _, err := client2.FetchIssueByIdentifier(context.Background(), "TEAM-9"); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+
 	tr := &Tracker{
 		teamIDs: []string{"team-1", "team-2"},
 		clients: map[string]*Client{
 			"team-1": NewClient("key", "team-1").WithEndpoint(team1.URL),
-			"team-2": NewClient("key", "team-2").WithEndpoint(team2.URL),
+			"team-2": client2,
 		},
 	}
 

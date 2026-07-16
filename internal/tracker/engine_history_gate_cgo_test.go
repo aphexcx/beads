@@ -84,12 +84,14 @@ func TestEmbeddedDoltExternalRefChangedAfterUsesHistoryFastPath(t *testing.T) {
 
 	e := &Engine{Store: store}
 
-	// local's own timestamps predate asOf, so the coarse fallback heuristic
-	// would (wrongly) say "unchanged" here.
+	// local's timestamps land after asOf so the cheap updated_at pre-filter
+	// (bd-kqt) lets the check through to the history query. From there the
+	// coarse fallback heuristic would say "changed" unconditionally; only
+	// the precise history path can distinguish the two assertions below.
 	local := &types.Issue{
 		ID:        issue.ID,
 		CreatedAt: asOf.Add(-time.Hour),
-		UpdatedAt: asOf.Add(-time.Hour),
+		UpdatedAt: asOf.Add(time.Hour),
 	}
 
 	changed, err := e.externalRefChangedAfter(ctx, local, "new-ref", asOf)
@@ -97,7 +99,7 @@ func TestEmbeddedDoltExternalRefChangedAfterUsesHistoryFastPath(t *testing.T) {
 		t.Fatalf("externalRefChangedAfter: %v", err)
 	}
 	if !changed {
-		t.Fatal("expected changed=true: external_ref differs from its value as of asOf, even though local's timestamps predate asOf")
+		t.Fatal("expected changed=true: external_ref differs from its value as of asOf")
 	}
 
 	// Complementary check: currentRef matching the historical value as of
@@ -158,10 +160,12 @@ func TestDoltStoreExternalRefChangedAfterUsesHistoryFastPath(t *testing.T) {
 	}
 
 	e := &Engine{Store: store}
+	// UpdatedAt after asOf clears the cheap updated_at pre-filter (bd-kqt)
+	// so the history fast path is what answers.
 	local := &types.Issue{
 		ID:        issue.ID,
 		CreatedAt: asOf.Add(-time.Hour),
-		UpdatedAt: asOf.Add(-time.Hour),
+		UpdatedAt: asOf.Add(time.Hour),
 	}
 
 	changed, err := e.externalRefChangedAfter(ctx, local, "new-ref", asOf)
