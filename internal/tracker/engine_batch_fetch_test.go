@@ -6,12 +6,9 @@ package tracker
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"testing"
 	"time"
-
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
@@ -355,15 +352,6 @@ func TestShouldSyncSubresources(t *testing.T) {
 	}
 }
 
-// dbBackedStore layers a *sql.DB onto pureTestStore so the engine's
-// dbProvider assertion sees a history-capable store.
-type dbBackedStore struct {
-	*pureTestStore
-	db *sql.DB
-}
-
-func (s *dbBackedStore) DB() *sql.DB { return s.db }
-
 // snapshotProbeStore layers storage.LinearIssueSnapshotStore over
 // pureTestStore, recording reads and writes so tests can assert which
 // issues paid the per-issue field-scoped detection cost and which received
@@ -480,11 +468,6 @@ func TestDetectConflictsSkipsFieldScopedWorkWhenBothSidesClean(t *testing.T) {
 
 func TestExternalRefChangedAfterSkipsHistoryQueryWhenClean(t *testing.T) {
 	ctx := context.Background()
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
 
 	lastSync := time.Now()
 	ref := "https://mock.test/MOCK-1"
@@ -495,7 +478,8 @@ func TestExternalRefChangedAfterSkipsHistoryQueryWhenClean(t *testing.T) {
 		UpdatedAt:   lastSync.Add(-1 * time.Hour),
 	}
 
-	e := NewEngine(newMockTracker("mock"), &dbBackedStore{pureTestStore: newPureTestStore(clean), db: db}, "test-actor")
+	store := &historyQuerierStore{prevRef: ref, prevFound: true}
+	e := NewEngine(newMockTracker("mock"), store, "test-actor")
 	changed, err := e.externalRefChangedAfter(ctx, clean, ref, lastSync)
 	if err != nil {
 		t.Fatalf("externalRefChangedAfter: %v", err)
@@ -503,10 +487,8 @@ func TestExternalRefChangedAfterSkipsHistoryQueryWhenClean(t *testing.T) {
 	if changed {
 		t.Error("clean issue reported as ref-changed")
 	}
-	// No expectations were registered: any dolt_history query would have
-	// errored the call above; this confirms none was issued.
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("unexpected queries: %v", err)
+	if store.calls != 0 {
+		t.Errorf("clean issue issued %d history queries, want 0 (bd-kqt pre-filter)", store.calls)
 	}
 
 	// A dirty issue must still consult history.
@@ -516,8 +498,6 @@ func TestExternalRefChangedAfterSkipsHistoryQueryWhenClean(t *testing.T) {
 		CreatedAt:   lastSync.Add(-2 * time.Hour),
 		UpdatedAt:   lastSync.Add(1 * time.Minute),
 	}
-	mock.ExpectQuery("SELECT external_ref").
-		WillReturnRows(sqlmock.NewRows([]string{"external_ref"}).AddRow(ref))
 	changed, err = e.externalRefChangedAfter(ctx, dirty, ref, lastSync)
 	if err != nil {
 		t.Fatalf("externalRefChangedAfter(dirty): %v", err)
@@ -525,7 +505,7 @@ func TestExternalRefChangedAfterSkipsHistoryQueryWhenClean(t *testing.T) {
 	if changed {
 		t.Error("dirty issue with unchanged ref reported as ref-changed")
 	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Errorf("history query expectations: %v", err)
+	if store.calls != 1 {
+		t.Errorf("dirty issue issued %d history queries, want exactly 1", store.calls)
 	}
 }

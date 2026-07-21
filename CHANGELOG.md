@@ -495,6 +495,11 @@ gate that rc.1 introduced, and ships the validated upgrade documentation.
 
 ### Added
 
+- **feat(linear):** Bidirectional label sync between Linear and beads (opt-in).
+  Set `linear.label_sync_enabled = true` to enable. Label adds, removes, and
+  Linear-side renames now propagate in both directions with proper conflict
+  resolution. Replaces today's destructive Linear-authoritative pull-side label
+  sync. See `docs/superpowers/specs/2026-04-27-linear-label-sync-design.md`.
 - **`bd init --reinit-local` / `--discard-remote`** — named-intent flags for local re-initialization and explicit remote-history override. Replaces the overloaded `--force`. See [`bd help init-safety`](engdocs/adr/0002-init-safety-invariants.md) and [`docs/recovery/init-safety.md`](docs/recovery/init-safety.md).
 - **`bd init-safety`** — documents the init flag surface + destroy-token format. Referenced by every init refusal message.
 - **Stable exit codes for init refusals** — `10` remote divergence, `11` local exists, `12` destroy-token missing. Grep-safe for CI.

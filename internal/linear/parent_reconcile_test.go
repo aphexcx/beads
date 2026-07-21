@@ -29,7 +29,7 @@ type linearMockHandler struct {
 	issues      map[string]*Issue          // identifier → issue (for fetch)
 	updates     map[string]json.RawMessage // child UUID → input JSON (recorded)
 	fetches     map[string]int             // identifier → fetch call count
-	failNextRL  bool                       // when true, next fetch returns ErrRateLimitExhausted
+	failNextRL  bool                       // when true, next response reports budget below the breaker floor
 	rateLimited int                        // count of rate-limited responses returned
 }
 
@@ -50,10 +50,12 @@ func (h *linearMockHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 
-	// If failNextRL is set, return rate-limit-exhausted on this single
-	// response (header drives the circuit breaker in Execute). The breaker
-	// only arms when the reset header carries a valid future timestamp, so
-	// send one alongside the low remaining count.
+	// If failNextRL is set, this single response reports remaining budget
+	// below the circuit-breaker floor. The client records the headers on
+	// its shared rate-limit state and the NEXT request fails with
+	// ErrRateLimitExhausted. The breaker only arms when the reset header
+	// carries a valid future timestamp, so send one alongside the low
+	// remaining count.
 	if h.failNextRL {
 		h.failNextRL = false
 		h.rateLimited++
@@ -399,11 +401,17 @@ func TestReconcileParents_AbortsOnRateLimit(t *testing.T) {
 	mock.issues["TEAM-1"] = &Issue{ID: "uuid-child1", Identifier: "TEAM-1"}
 	mock.issues["TEAM-2"] = &Issue{ID: "uuid-child2", Identifier: "TEAM-2"}
 	mock.issues["TEAM-99"] = &Issue{ID: "uuid-parent", Identifier: "TEAM-99"}
-	mock.failNextRL = true // first request returns ErrRateLimitExhausted
+	mock.failNextRL = true // next response reports the budget below the floor
 	server := httptest.NewServer(mock)
 	defer server.Close()
 
 	tr := newTestLinearTracker(t, server.URL)
+	// Arm the circuit breaker: consume the low-budget response so its
+	// headers land on the shared rate-limit state. The reconciler's first
+	// request then fails with ErrRateLimitExhausted before reaching Linear.
+	if _, err := tr.primaryClient().FetchIssueByIdentifier(context.Background(), "TEAM-1"); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
 	stats, err := tr.ReconcileParents(context.Background(), []ParentLink{
 		{ChildIdentifier: "TEAM-1", ParentIdentifier: "TEAM-99"},
 		{ChildIdentifier: "TEAM-2", ParentIdentifier: "TEAM-99"},
