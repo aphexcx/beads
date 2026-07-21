@@ -62,6 +62,12 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		// prepared ALTERs don't apply — use direct DDL on the fresh schema,
 		// which never has these columns yet.
 		return cliMigration0072AddCommentExternalRef
+	case "0055_move_leases_to_table.up.sql":
+		// Direct DDL for the same reason as 0054. A fresh bundle has no live
+		// leases to copy (0054 just added empty columns), so this is pure
+		// schema delta: create the ephemeral leases table, drop the issues/
+		// wisps lease columns 0054 added. row_lock stays (see the migration).
+		return cliMigration0055MoveLeasesToTable
 	default:
 		return sqlText
 	}
@@ -95,6 +101,20 @@ CREATE INDEX idx_issues_lease ON issues (status, lease_expires_at);
 ALTER TABLE wisps ADD COLUMN lease_expires_at DATETIME;
 ALTER TABLE wisps ADD COLUMN heartbeat_at DATETIME;
 ALTER TABLE wisps ADD COLUMN row_lock BIGINT NOT NULL DEFAULT 0;`
+
+const cliMigration0055MoveLeasesToTable = `CREATE TABLE leases (
+    issue_id VARCHAR(255) PRIMARY KEY,
+    holder VARCHAR(255) NOT NULL,
+    granted_at DATETIME NOT NULL,
+    lease_expires_at DATETIME NOT NULL,
+    heartbeat_at DATETIME NOT NULL,
+    INDEX idx_leases_expires (lease_expires_at)
+);
+ALTER TABLE issues DROP INDEX idx_issues_lease;
+ALTER TABLE issues DROP COLUMN lease_expires_at;
+ALTER TABLE issues DROP COLUMN heartbeat_at;
+ALTER TABLE wisps DROP COLUMN lease_expires_at;
+ALTER TABLE wisps DROP COLUMN heartbeat_at;`
 
 const cliMigration0041SplitDependenciesTarget = `DELETE FROM dolt_nonlocal_tables;
 CALL DOLT_COMMIT('-Am', 'disable nonlocal tables for fk migrations');

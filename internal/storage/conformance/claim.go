@@ -2,8 +2,6 @@ package conformance
 
 import (
 	"errors"
-	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -12,10 +10,10 @@ import (
 	"github.com/steveyegge/beads/internal/types"
 )
 
-// Claim / lease behavior (Gas Station v1.1 dead-worker recovery). Every backend
+// Claim / lease behavior (Gas Station v1.1 dead-worker recovery). Each backend
 // routes ClaimIssue/ClaimReadyIssue/HeartbeatIssue/ReclaimExpiredLeases through the
-// shared issueops implementations, so these assertions hold identically on the Dolt
-// reference and every SQL backend. issueops.WithLeaseTTL pins the lease deterministically
+// shared issueops implementations, so these assertions hold identically on Dolt and
+// SQLite. issueops.WithLeaseTTL pins the lease deterministically
 // so the reclaim path is testable without wall-clock waits.
 
 // testClaim: claiming an open issue stamps assignee, in_progress, started_at, and a
@@ -95,100 +93,65 @@ func testClaimReadyIssue(t *testing.T, f Factory) {
 	}
 }
 
-// requireMultiWriter skips the caller unless the backend backs concurrent writers on
-// separate connections. Postgres and MySQL use a multi-connection pool; SQLite pins its
-// pool to a single connection (sqliteDialect.Open sets MaxOpenConns(1)) and embedded-Dolt
-// serializes writers, so a "concurrent" claim race there only ever exercises the trivial
-// serialized path. The dialect name is the profile signal: sqlkit-backed SQL stores
-// expose DialectName(); the Dolt reference does not, so it skips via the type assertion.
-func requireMultiWriter(t *testing.T, s storage.DoltStorage) {
-	t.Helper()
-	dn, ok := s.(interface{ DialectName() string })
-	if !ok {
-		t.Skip("backend does not expose a SQL dialect; concurrent multi-writer claim race not applicable")
+// testClaimReadyIssueLabelFilters: the claim path is FENCED by the label filters it is
+// given. --label-any (LabelsAny, OR-set) used to be dropped on the ready/claim path, so a
+// worker asking for its own lane could atomically claim another lane's work while
+// believing it was fenced. Asserts the OR-set works alone, AND-combines with the Labels
+// AND-set and with --parent, and — the safety property — that an exhausted filter claims
+// NOTHING rather than falling back to unfenced ready work.
+func testClaimReadyIssueLabelFilters(t *testing.T, f Factory) {
+	s := f(t)
+	// clf-free is unlabeled and top-priority: it wins any claim whose label filter was
+	// dropped, so every assertion below doubles as a check that the filter was applied.
+	must(t, s.CreateIssue(ctx(), withDefaults(&types.Issue{ID: "clf-free", Title: "unfenced", Priority: 0}), "a"))
+	must(t, s.CreateIssue(ctx(), withDefaults(&types.Issue{ID: "clf-p.1", Title: "other lane", Priority: 1}), "a"))
+	must(t, s.CreateIssue(ctx(), withDefaults(&types.Issue{ID: "clf-p.2", Title: "my lane", Priority: 3}), "a"))
+	must(t, s.CreateIssue(ctx(), withDefaults(&types.Issue{ID: "clf-x", Title: "my lane, other parent", Priority: 2}), "a"))
+	must(t, s.AddLabel(ctx(), "clf-p.1", "lane-b", "a"))
+	must(t, s.AddLabel(ctx(), "clf-p.2", "lane-a", "a"))
+	must(t, s.AddLabel(ctx(), "clf-p.2", "tier:opus", "a"))
+	must(t, s.AddLabel(ctx(), "clf-x", "lane-a", "a"))
+
+	claim := func(filter types.WorkFilter) *types.Issue {
+		t.Helper()
+		claimed, err := s.ClaimReadyIssue(ctx(), filter, "worker")
+		must(t, err)
+		return claimed
 	}
-	switch dn.DialectName() {
-	case "postgres", "mysql":
-		// multi-connection pool: a genuine cross-connection race.
-	default:
-		t.Skipf("dialect %q is single-writer (pool pinned to one connection); concurrent claim race not applicable", dn.DialectName())
+	parent := "clf-p"
+
+	// --label-any + --parent: the only child carrying lane-a, even though clf-p.1 is the
+	// higher-priority child and clf-x is the higher-priority lane-a issue.
+	got := claim(types.WorkFilter{LabelsAny: []string{"lane-a", "lane-c"}, ParentID: &parent})
+	if got == nil || got.ID != "clf-p.2" {
+		t.Fatalf("claim(--label-any lane-a,lane-c --parent clf-p) = %v, want clf-p.2", issueID(got))
+	}
+
+	// AND-set + OR-set: the AND-set is unsatisfiable, so nothing is claimable — an
+	// unfenced claim would take clf-free.
+	if got := claim(types.WorkFilter{Labels: []string{"tier:nobody"}, LabelsAny: []string{"lane-a"}}); got != nil {
+		t.Errorf("claim(--label tier:nobody --label-any lane-a) = %v, want no claim", issueID(got))
+	}
+
+	// --label-any alone still fences: clf-x, not the unlabeled higher-priority clf-free.
+	if got := claim(types.WorkFilter{LabelsAny: []string{"lane-a"}}); got == nil || got.ID != "clf-x" {
+		t.Fatalf("claim(--label-any lane-a) = %v, want clf-x", issueID(got))
+	}
+
+	// Lane exhausted: claim NOTHING rather than falling back to the unfenced clf-free.
+	if got := claim(types.WorkFilter{LabelsAny: []string{"lane-a"}}); got != nil {
+		t.Errorf("claim(--label-any lane-a) with the lane exhausted = %v, want no claim", issueID(got))
+	}
+	if got := claim(types.WorkFilter{}); got == nil || got.ID != "clf-free" {
+		t.Errorf("unfiltered claim = %v, want clf-free (it must still be claimable)", issueID(got))
 	}
 }
 
-// testClaimReadyIssueConcurrentExclusivity races many workers, each on its own pooled
-// connection, to claim a small pool of ready issues and asserts every issue is claimed by
-// exactly one worker. This is the multi-writer property the SQL backends exist for — the
-// whole reason to run bd on Postgres/MySQL instead of single-writer Dolt — and the shared
-// claim path's cross-process exclusivity (a conditional-UPDATE CAS: only the writer whose
-// UPDATE finds the row still unassigned wins; the losers' ClaimReadyIssue retries the next
-// ready candidate) is otherwise only asserted, never raced. Gated to the multi-connection
-// backends; see requireMultiWriter.
-func testClaimReadyIssueConcurrentExclusivity(t *testing.T, f Factory) {
-	s := f(t)
-	requireMultiWriter(t, s)
-
-	const readyCount = 8
-	for i := 0; i < readyCount; i++ {
-		must(t, s.CreateIssue(ctx(), withDefaults(&types.Issue{
-			ID:       fmt.Sprintf("ccx-%d", i),
-			Title:    "ready",
-			Priority: 1,
-		}), "a"))
+func issueID(i *types.Issue) string {
+	if i == nil {
+		return "<nil>"
 	}
-
-	const workers = 24 // > readyCount, so workers must contend and most must lose a race
-
-	var (
-		mu     sync.Mutex
-		claims = make(map[string]string) // issueID -> claiming worker
-		dupes  []string
-		errs   []error
-	)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(worker string) {
-			defer wg.Done()
-			<-start // barrier: release all workers together to maximize contention
-			// Drain: keep claiming until no ready work remains. Bounded so a bug that
-			// kept returning issues can never hang the suite.
-			for attempt := 0; attempt < readyCount+workers; attempt++ {
-				claimed, err := s.ClaimReadyIssue(ctx(), types.WorkFilter{}, worker)
-				if err != nil {
-					mu.Lock()
-					errs = append(errs, err)
-					mu.Unlock()
-					return
-				}
-				if claimed == nil {
-					return // no ready work left to claim
-				}
-				if claimed.Assignee != worker || claimed.Status != types.StatusInProgress {
-					t.Errorf("claimed %s not owned by claimer: assignee=%q status=%q", claimed.ID, claimed.Assignee, claimed.Status)
-				}
-				mu.Lock()
-				if prev, ok := claims[claimed.ID]; ok {
-					dupes = append(dupes, fmt.Sprintf("%s claimed by both %s and %s", claimed.ID, prev, worker))
-				} else {
-					claims[claimed.ID] = worker
-				}
-				mu.Unlock()
-			}
-		}(fmt.Sprintf("worker-%d", w))
-	}
-	close(start)
-	wg.Wait()
-
-	for _, e := range errs {
-		t.Errorf("ClaimReadyIssue errored under concurrency: %v", e)
-	}
-	for _, d := range dupes {
-		t.Errorf("claim exclusivity violated — %s", d)
-	}
-	if len(claims) != readyCount {
-		t.Errorf("distinct claimed issues = %d, want %d (every ready issue claimed exactly once, none lost)", len(claims), readyCount)
-	}
+	return i.ID
 }
 
 // testHeartbeatRenewsLease: a heartbeat extends the lease (and keeps the claim).
@@ -282,5 +245,66 @@ func testReclaimSkipsFreshLease(t *testing.T, f Factory) {
 	must(t, err)
 	if got.Status != types.StatusInProgress || got.Assignee != "liveworker" {
 		t.Errorf("fresh claim disturbed: status=%q assignee=%q", got.Status, got.Assignee)
+	}
+}
+
+// testUnclaimIfAssigneeMatch: a conditional release with the correct expected
+// assignee clears the claim exactly once (assignee empty, status open). A repeat
+// of the same conditional release finds the claim already gone and fails with
+// storage.ErrAssigneeMismatch instead of silently succeeding — the "exactly
+// once" property a release-if-current caller (e.g. a supervisor returning a
+// dead worker's bead) depends on.
+func testUnclaimIfAssigneeMatch(t *testing.T, f Factory) {
+	s := f(t)
+	must(t, s.CreateIssue(ctx(), withDefaults(&types.Issue{ID: "ur-1", Title: "T"}), "a"))
+	must(t, s.ClaimIssue(ctx(), "ur-1", "worker1"))
+
+	must(t, s.UnclaimIssueIfAssignee(ctx(), "ur-1", "releaser", "worker1"))
+	got, err := s.GetIssue(ctx(), "ur-1")
+	must(t, err)
+	if got.Assignee != "" {
+		t.Errorf("after conditional release: assignee = %q, want empty", got.Assignee)
+	}
+	if got.Status != types.StatusOpen {
+		t.Errorf("after conditional release: status = %q, want open", got.Status)
+	}
+
+	err = s.UnclaimIssueIfAssignee(ctx(), "ur-1", "releaser", "worker1")
+	if !errors.Is(err, storage.ErrAssigneeMismatch) {
+		t.Errorf("repeat conditional release: err = %v, want ErrAssigneeMismatch", err)
+	}
+}
+
+// testUnclaimIfAssigneeStale: a conditional release whose expected assignee is
+// stale (someone else holds the claim) is a loud no-op: it returns
+// storage.ErrAssigneeMismatch naming the current holder, leaves the claim
+// untouched, and records no "unclaimed" event. This is the CAS that makes
+// release-if-current safe across processes — a stale releaser can never clobber
+// another worker's live claim.
+func testUnclaimIfAssigneeStale(t *testing.T, f Factory) {
+	s := f(t)
+	must(t, s.CreateIssue(ctx(), withDefaults(&types.Issue{ID: "ur-2", Title: "T"}), "a"))
+	must(t, s.ClaimIssue(ctx(), "ur-2", "worker2"))
+
+	err := s.UnclaimIssueIfAssignee(ctx(), "ur-2", "releaser", "worker1")
+	if !errors.Is(err, storage.ErrAssigneeMismatch) {
+		t.Errorf("stale conditional release: err = %v, want ErrAssigneeMismatch", err)
+	}
+
+	got, err := s.GetIssue(ctx(), "ur-2")
+	must(t, err)
+	if got.Assignee != "worker2" {
+		t.Errorf("stale release clobbered claim: assignee = %q, want worker2", got.Assignee)
+	}
+	if got.Status != types.StatusInProgress {
+		t.Errorf("stale release changed status to %q, want in_progress", got.Status)
+	}
+
+	events, err := s.GetEvents(ctx(), "ur-2", 0)
+	must(t, err)
+	for _, e := range events {
+		if e.EventType == types.EventType("unclaimed") {
+			t.Errorf("stale conditional release recorded an unclaimed event: %+v", e)
+		}
 	}
 }

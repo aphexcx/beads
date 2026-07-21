@@ -35,6 +35,10 @@ Examples:
 			}
 		}()
 
+		if usesProxiedServer() {
+			return runLinkProxiedServer(cmd, rootCtx, args)
+		}
+
 		id1 := args[0]
 		id2 := args[1]
 		depType, _ := cmd.Flags().GetString("type")

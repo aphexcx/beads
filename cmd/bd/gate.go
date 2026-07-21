@@ -31,9 +31,11 @@ Gate types:
   timer   - Expires after timeout (Phase 2)
   gh:run  - Waits for GitHub workflow (Phase 3)
   gh:pr   - Waits for PR merge (Phase 3)
-  bead    - Waits for cross-rig bead to close (Phase 4)
+  bead    - Waits for another bead to close (Phase 4)
 
-For bead gates, await_id format is <rig>:<bead-id> (e.g., "other-project:op-abc123").
+For bead gates, await_id is a bead ID in this rig's database (e.g., "bd-abc123").
+The historical cross-rig form <rig>:<bead-id> can no longer be evaluated
+(multi-rig routing removed) and stays pending until resolved manually.
 
 Examples:
   bd gate list           # Show all open gates
@@ -45,11 +47,16 @@ Examples:
 
 // gateListCmd lists gate issues
 var gateListCmd = &cobra.Command{
-	Use:   "list",
+	Use:   "list [issue-id]",
 	Short: "List gate issues",
-	Long: `List all gate issues in the current beads database.
+	Long: `List gate issues.
+
+With no argument, lists all gate issues in the current beads database.
+With an [issue-id] argument, lists ONLY the gates that block that issue
+(its own dependency gates) — not every gate in the database.
 
 By default, shows only open gates. Use --all to include closed gates.`,
+	Args:          cobra.MaximumNArgs(1),
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -60,8 +67,35 @@ By default, shows only open gates. Use --all to include closed gates.`,
 			}
 		}()
 
+		if usesProxiedServer() {
+			return runGateListProxiedServer(cmd, rootCtx, args)
+		}
+
 		allFlag, _ := cmd.Flags().GetBool("all")
 		limit, _ := cmd.Flags().GetInt("limit")
+
+		ctx := rootCtx
+
+		// Bead-scoped: list only the gates that block this specific issue
+		// (its dependency gates), never the whole database. Without this an
+		// issue-id argument was silently ignored and the DB-wide list was
+		// returned, which could lead a caller to act on unrelated gates.
+		if len(args) == 1 {
+			target, err := store.GetIssue(ctx, args[0])
+			if err != nil {
+				return HandleErrorRespectJSON("issue not found: %s", args[0])
+			}
+			deps, err := store.GetDependencies(ctx, target.ID)
+			if err != nil {
+				return HandleErrorRespectJSON("%v", err)
+			}
+			gates := filterIssueGates(deps, allFlag, limit)
+			if jsonOutput {
+				return outputJSON(gates)
+			}
+			displayGates(gates, allFlag)
+			return nil
+		}
 
 		gateType := types.IssueType("gate")
 		filter := types.IssueFilter{
@@ -72,8 +106,6 @@ By default, shows only open gates. Use --all to include closed gates.`,
 		if !allFlag {
 			filter.ExcludeStatus = []types.Status{types.StatusClosed}
 		}
-
-		ctx := rootCtx
 
 		issues, err := store.SearchIssues(ctx, "", filter)
 		if err != nil {
@@ -87,6 +119,27 @@ By default, shows only open gates. Use --all to include closed gates.`,
 		displayGates(issues, allFlag)
 		return nil
 	},
+}
+
+// filterIssueGates selects the gate-type issues from an issue's dependency set,
+// honoring the same open/closed and limit semantics as the DB-wide list path.
+// Pulled out as a pure helper so the bead-scoping logic is unit-testable without
+// a live store.
+func filterIssueGates(deps []*types.Issue, all bool, limit int) []*types.Issue {
+	var gates []*types.Issue
+	for _, d := range deps {
+		if d == nil || d.IssueType != types.IssueType("gate") {
+			continue
+		}
+		if !all && d.Status == types.StatusClosed {
+			continue
+		}
+		gates = append(gates, d)
+		if limit > 0 && len(gates) >= limit {
+			break
+		}
+	}
+	return gates
 }
 
 // displayGates formats and displays gate issues, separating open and closed gates
@@ -179,6 +232,9 @@ This is used by 'bd done --phase-complete' to register for gate wake notificatio
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("gate add-waiter is not supported in proxied-server mode")
+		}
 		CheckReadonly("gate add-waiter")
 
 		evt := metrics.NewCommandEvent("gate-add-waiter")
@@ -250,6 +306,9 @@ Examples:
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("gate create is not supported in proxied-server mode")
+		}
 		CheckReadonly("gate create")
 
 		evt := metrics.NewCommandEvent("gate-create")
@@ -350,6 +409,9 @@ This is similar to 'bd show' but validates that the issue is a gate.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("gate show is not supported in proxied-server mode")
+		}
 		evt := metrics.NewCommandEvent("gate-show")
 		defer func() {
 			if c := metrics.Global(); c != nil {
@@ -415,6 +477,9 @@ Use --reason to provide context for why the gate was resolved.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("gate resolve is not supported in proxied-server mode")
+		}
 		CheckReadonly("gate resolve")
 
 		evt := metrics.NewCommandEvent("gate-resolve")
@@ -495,6 +560,9 @@ Examples:
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("gate check is not supported in proxied-server mode")
+		}
 		CheckReadonly("gate check")
 
 		evt := metrics.NewCommandEvent("gate-check")
@@ -564,7 +632,7 @@ Examples:
 			case gate.AwaitType == "timer":
 				result.resolved, result.escalated, result.reason, result.err = checkTimer(gate, now)
 			case gate.AwaitType == "bead":
-				result.resolved, result.reason = checkBeadGate(ctx, gate.AwaitID)
+				result.resolved, result.reason = checkBeadGate(ctx, store, gate.AwaitID)
 			default:
 				// Skip unsupported gate types (human gates need manual resolution)
 				continue
@@ -869,14 +937,43 @@ func checkTimer(gate *types.Issue, now time.Time) (resolved, escalated bool, rea
 	return false, false, fmt.Sprintf("expires in %s", remaining), nil
 }
 
-// checkBeadGate checks if a cross-rig bead gate is satisfied.
-// await_id format: <rig>:<bead-id> (e.g., "other-project:op-abc123")
+// issueGetter is the one storage method checkBeadGate needs, split out so
+// tests can fake the lookup without standing up a Dolt store.
+type issueGetter interface {
+	GetIssue(ctx context.Context, id string) (*types.Issue, error)
+}
+
+// checkBeadGate checks if a bead gate is satisfied.
 // Returns (satisfied, reason).
 //
-// Multi-rig routing has been removed, so cross-rig bead gates cannot be resolved.
-// This always returns false with a descriptive message.
-func checkBeadGate(_ context.Context, awaitID string) (bool, string) {
-	return false, fmt.Sprintf("cross-rig bead gate %q cannot be checked (multi-rig routing removed)", awaitID)
+// A plain await_id (no colon) names a bead in THIS rig's database: the gate
+// resolves once that bead closes — the common case, an agent idle-waiting on
+// local work (wy-hgms2; the old unconditional cross-rig refusal left every
+// local bead gate permanently pending and its waiters asleep).
+//
+// The historical cross-rig form <rig>:<bead-id> cannot be evaluated since
+// multi-rig routing was removed; it stays pending with a descriptive message.
+func checkBeadGate(ctx context.Context, st issueGetter, awaitID string) (bool, string) {
+	if awaitID == "" {
+		return false, "bead gate has no await_id"
+	}
+	if strings.Contains(awaitID, ":") {
+		return false, fmt.Sprintf("cross-rig bead gate %q cannot be checked (multi-rig routing removed)", awaitID)
+	}
+	if st == nil {
+		return false, fmt.Sprintf("bead gate %q: no local store available", awaitID)
+	}
+	issue, err := st.GetIssue(ctx, awaitID)
+	if err != nil {
+		return false, fmt.Sprintf("bead gate %q: %v", awaitID, err)
+	}
+	if issue == nil {
+		return false, fmt.Sprintf("bead gate %q: bead not found", awaitID)
+	}
+	if issue.Status == types.StatusClosed {
+		return true, fmt.Sprintf("bead %s closed", awaitID)
+	}
+	return false, fmt.Sprintf("bead %s is %s", awaitID, issue.Status)
 }
 
 // closeGate closes a gate issue with the given reason

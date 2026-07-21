@@ -12,7 +12,7 @@ import (
 // GetEventsInTx retrieves events for an issue. If limit <= 0, all events are returned.
 //
 //nolint:gosec // G201: table is hardcoded via WispTableRouting
-func GetEventsInTx(ctx context.Context, tx *sql.Tx, issueID string, limit int) ([]*types.Event, error) {
+func GetEventsInTx(ctx context.Context, tx DBTX, issueID string, limit int) ([]*types.Event, error) {
 	_, _, eventTable, _ := WispTableRouting(IsActiveWispInTx(ctx, tx, issueID))
 
 	query := fmt.Sprintf(`

@@ -4,11 +4,13 @@ package types
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Issue represents a trackable work item.
@@ -45,9 +47,11 @@ type Issue struct {
 	CloseReason     string     `json:"close_reason,omitempty"`      // Reason provided when closing
 	ClosedBySession string     `json:"closed_by_session,omitempty"` // Claude Code session that closed this issue
 
-	// ===== Leasing (claim TTL + heartbeat; migration 0054) =====
-	// NULL when there is no active lease. row_lock is an internal serialization
-	// mechanism and is intentionally NOT surfaced here.
+	// ===== Leasing (claim TTL + heartbeat; migrations 0054/0055) =====
+	// Hydrated from the ephemeral, node-local leases table (bd-lrgn1), not
+	// from issues columns. NULL when there is no active lease on this node.
+	// row_lock is an internal serialization mechanism (an issues column) and
+	// is intentionally NOT surfaced here.
 	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"` // When the current claim's lease expires
 	HeartbeatAt    *time.Time `json:"heartbeat_at,omitempty"`     // Last heartbeat from the lease owner
 
@@ -211,6 +215,26 @@ func (w hashFieldWriter) flag(b bool, label string) {
 	w.h.Write([]byte{0})
 }
 
+// MaxFieldLen is the maximum length (in characters) of the assignee, owner, and
+// label fields, matching their VARCHAR(255) columns.
+const MaxFieldLen = 255
+
+// ErrFieldTooLong is returned when assignee, owner, or a label exceeds
+// MaxFieldLen characters. Callers can errors.Is it instead of matching a raw
+// backend "data too long" string.
+var ErrFieldTooLong = errors.New("field exceeds maximum length")
+
+// CheckFieldLen returns ErrFieldTooLong (wrapped with context) when val exceeds
+// MaxFieldLen characters. name is the field label used in the message. Length is
+// counted in runes, not bytes, so a multibyte value up to MaxFieldLen characters
+// fits the VARCHAR(255) column and passes.
+func CheckFieldLen(name, val string) error {
+	if n := utf8.RuneCountInString(val); n > MaxFieldLen {
+		return fmt.Errorf("%w: %s is %d characters (max %d)", ErrFieldTooLong, name, n, MaxFieldLen)
+	}
+	return nil
+}
+
 // Validate checks if the issue has valid field values (built-in statuses only)
 func (i *Issue) Validate() error {
 	return i.ValidateWithCustomStatuses(nil)
@@ -260,6 +284,14 @@ func (i *Issue) ValidateWithCustom(customStatuses, customTypes []string) error {
 	if i.Ephemeral && i.NoHistory {
 		return fmt.Errorf("ephemeral and no_history are mutually exclusive")
 	}
+	// Bound the VARCHAR(255) assignment columns up front so callers get a typed
+	// ErrFieldTooLong rejection instead of a raw backend "data too long" error.
+	if err := CheckFieldLen("assignee", i.Assignee); err != nil {
+		return err
+	}
+	if err := CheckFieldLen("owner", i.Owner); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -303,6 +335,14 @@ func (i *Issue) ValidateForImport(customStatuses []string) error {
 		if !json.Valid(i.Metadata) {
 			return fmt.Errorf("metadata must be valid JSON")
 		}
+	}
+	// Bound the VARCHAR(255) assignment columns on the import path too, so an
+	// over-length assignee/owner is rejected here instead of by the backend.
+	if err := CheckFieldLen("assignee", i.Assignee); err != nil {
+		return err
+	}
+	if err := CheckFieldLen("owner", i.Owner); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1240,6 +1280,7 @@ type IssueFilter struct {
 	DescriptionContains string
 	NotesContains       string
 	ExternalRefContains string
+	ExternalRef         *string // exact match on external_ref
 
 	// Date ranges
 	CreatedAfter  *time.Time

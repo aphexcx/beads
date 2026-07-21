@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage/depid"
+	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -88,13 +89,32 @@ type AddDependencyOpts struct {
 	// that intentionally trade validation cost for bulk graph wiring speed.
 	SkipCycleCheck bool
 	TargetKind     *DepTargetKind
+	// PrecheckedTarget, when non-nil, replaces the in-tx target read: the
+	// target is known to exist with this type and status. Callers that set
+	// it must also set TargetKind, since target classification otherwise
+	// queries tx too.
+	PrecheckedTarget *DepTargetPrecheck
+}
+
+// DepTargetPrecheck carries a target-issue row the caller has already read
+// from the transaction that can see it. Dolt server mode splits one logical
+// transaction across two SQL sessions (versioned tables vs dolt-ignored wisp
+// tables); when the dependency write table lives on one session and the
+// target issue on the other, a target read on tx misses rows created earlier
+// in the same logical transaction. The caller reads the target on its own
+// session and passes the row here; existence validation, cross-type blocking
+// validation, and the direct is_blocked mark then use these values instead
+// of querying the target table on tx.
+type DepTargetPrecheck struct {
+	IssueType string
+	Status    string
 }
 
 // AddDependencyInTx validates and inserts a dependency within an existing
 // transaction. It handles:
 //   - Wisp routing (auto-detected or caller-provided)
 //   - Source/target existence validation
-//   - Cross-type blocking validation (GH#1495)
+//   - Hierarchy deadlock validation for blocking deps (GH#1495, bd-wg7ve)
 //   - Cycle detection via recursive CTE across both dependency tables
 //   - Idempotent same-type updates (metadata only)
 //   - Type conflict detection
@@ -146,9 +166,13 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 		return fmt.Errorf("failed to check issue existence: %w", err)
 	}
 
-	// Validate target issue exists (skip for external and cross-prefix refs).
+	// Validate target issue exists (skip for external and cross-prefix refs,
+	// and for targets the caller already read on their own transaction).
 	var targetType string
-	if !strings.HasPrefix(dep.DependsOnID, "external:") && !opts.IsCrossPrefix {
+	switch {
+	case opts.PrecheckedTarget != nil:
+		targetType = opts.PrecheckedTarget.IssueType
+	case !strings.HasPrefix(dep.DependsOnID, "external:") && !opts.IsCrossPrefix:
 		//nolint:gosec // G201: targetTable is from WispTableRouting ("issues" or "wisps")
 		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT issue_type FROM %s WHERE id = ?`, targetTable), dep.DependsOnID).Scan(&targetType); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -158,16 +182,9 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 		}
 	}
 
-	// Cross-type blocking validation (GH#1495): tasks can only block tasks,
-	// epics can only block epics.
-	if dep.Type == types.DepBlocks && targetType != "" {
-		sourceIsEpic := sourceType == string(types.TypeEpic)
-		targetIsEpic := targetType == string(types.TypeEpic)
-		if sourceIsEpic != targetIsEpic {
-			if sourceIsEpic {
-				return fmt.Errorf("epics can only block other epics, not tasks")
-			}
-			return fmt.Errorf("tasks can only block other tasks, not epics")
+	if targetType != "" {
+		if err := CheckBlockingHierarchyInTx(ctx, tx, dep, depTables); err != nil {
+			return err
 		}
 	}
 
@@ -232,7 +249,7 @@ func AddDependencyInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, a
 		return fmt.Errorf("affected by add dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, aerr)
 	}
 	if dep.Type == types.DepBlocks || dep.Type == types.DepConditionalBlocks {
-		if err := markDirectBlockingDependencySourceInTx(ctx, tx, dep.IssueID, srcIsWisp, dep.DependsOnID, kind); err != nil {
+		if err := markDirectBlockingDependencySourceInTx(ctx, tx, dep.IssueID, srcIsWisp, dep.DependsOnID, kind, opts.PrecheckedTarget); err != nil {
 			return fmt.Errorf("mark direct is_blocked after add dependency %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
 		}
 		affectedIssues, affectedWisps = RemoveSourceFromAffected(dep.IssueID, srcIsWisp, affectedIssues, affectedWisps)
@@ -275,7 +292,7 @@ func removeID(ids []string, remove string) []string {
 }
 
 //nolint:gosec // G201: table names are selected from fixed issue/wisp tables.
-func markDirectBlockingDependencySourceInTx(ctx context.Context, tx *sql.Tx, source string, srcIsWisp bool, target string, targetKind DepTargetKind) error {
+func markDirectBlockingDependencySourceInTx(ctx context.Context, tx *sql.Tx, source string, srcIsWisp bool, target string, targetKind DepTargetKind, precheckedTarget *DepTargetPrecheck) error {
 	sourceTable := "issues"
 	if srcIsWisp {
 		sourceTable = "wisps"
@@ -288,6 +305,22 @@ func markDirectBlockingDependencySourceInTx(ctx context.Context, tx *sql.Tx, sou
 		targetTable = "wisps"
 	default:
 		return nil
+	}
+
+	if precheckedTarget != nil {
+		// The target row lives on another session; the EXISTS gate below
+		// would miss it there. Its openness is already known, so gate in Go
+		// and mark the source (whose table always matches tx) directly.
+		if types.Status(precheckedTarget.Status) == types.StatusClosed || types.Status(precheckedTarget.Status) == types.StatusPinned {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE %s s SET s.is_blocked = 1, s.updated_at = s.updated_at
+			WHERE s.id = ?
+			  AND s.is_blocked = 0
+			  AND s.status <> 'closed' AND s.status <> 'pinned'
+		`, sourceTable), source)
+		return err
 	}
 
 	// MySQL 8.0+ rejects UPDATE <T> ... WHERE EXISTS (SELECT FROM <T> ...)
@@ -311,32 +344,51 @@ func markDirectBlockingDependencySourceInTx(ctx context.Context, tx *sql.Tx, sou
 	return err
 }
 
-// CheckDependencyCycleInTx rejects self-dependencies and blocking dependency
-// cycles before a dependency insert. The caller may pass a restricted depTables
-// list for a known storage bucket; nil uses all dependency tables.
-func CheckDependencyCycleInTx(ctx context.Context, tx *sql.Tx, dep *types.Dependency, depTables []string) error {
+// CheckDependencyCycleInTx rejects self-dependencies and cycles across the
+// combined blocks, conditional-blocks, and parent-child graph before insert.
+// The caller may pass a restricted depTables list for a known storage bucket;
+// nil uses all dependency tables.
+func CheckDependencyCycleInTx(ctx context.Context, tx DBTX, dep *types.Dependency, depTables []string) error {
 	if dep.IssueID == dep.DependsOnID {
-		return fmt.Errorf("cannot add self-dependency: %s cannot depend on itself", dep.IssueID)
+		return fmt.Errorf("%w: %s cannot depend on itself", domain.ErrSelfDependency, dep.IssueID)
 	}
-	if dep.Type != types.DepBlocks && dep.Type != types.DepConditionalBlocks {
+	if !isSchedulingEdge(dep.Type) {
 		return nil
 	}
+	wouldCycle, err := WouldCreateSchedulingCycleInTx(ctx, tx, dep.IssueID, dep.DependsOnID, depTables)
+	if err != nil {
+		return fmt.Errorf("failed to check for dependency cycle: %w", err)
+	}
+	if wouldCycle {
+		return domain.ErrDependencyCycle
+	}
+	return nil
+}
+
+// WouldCreateSchedulingCycleInTx reports whether adding issueID -> dependsOnID
+// would close a cycle in the combined scheduling graph. It is shared by the
+// classic and domain storage stacks so both traverse the same dependency types
+// and typed target columns.
+func WouldCreateSchedulingCycleInTx(ctx context.Context, tx DBTX, issueID, dependsOnID string, depTables []string) (bool, error) {
 	if len(depTables) == 0 {
 		depTables = cycleDetectionTables()
 	}
 	var reachable int
 	query := cycleReachabilityQuery(depTables)
-	if err := tx.QueryRowContext(ctx, query, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
-		return fmt.Errorf("failed to check for dependency cycle: %w", err)
+	if err := tx.QueryRowContext(ctx, query, dependsOnID, issueID).Scan(&reachable); err != nil {
+		return false, err
 	}
-	if reachable > 0 {
-		return fmt.Errorf("adding dependency would create a cycle")
-	}
-	return nil
+	return reachable > 0, nil
 }
 
 // cycleReachabilityQuery uses UNION distinct recursion so cyclic and diamond
 // graphs terminate by unique reachable node instead of enumerating paths.
+//
+// The walked edge set is the union of scheduling-relevant edges: blocks,
+// conditional-blocks, and parent-child. Parent-child is included because a
+// blocked parent propagates its blocked state to its children in the
+// ready-work computation, so a chain mixing blocks and parent-child edges
+// can form a logical livelock that prevents anything from being ready.
 func cycleReachabilityQuery(depTables []string) string {
 	if len(depTables) == 1 {
 		return fmt.Sprintf(`
@@ -345,7 +397,7 @@ func cycleReachabilityQuery(depTables []string) string {
 				UNION
 				SELECT %s
 				FROM reachable r
-				JOIN %s d ON d.issue_id = r.node AND d.type IN ('blocks', 'conditional-blocks')
+				JOIN %s d ON d.issue_id = r.node AND d.type IN ('blocks', 'conditional-blocks', 'parent-child')
 			)
 			SELECT COUNT(*) FROM reachable WHERE node = ?
 		`, DepTargetExpr, depTables[0])
@@ -353,7 +405,7 @@ func cycleReachabilityQuery(depTables []string) string {
 
 	var unions []string
 	for _, t := range depTables {
-		unions = append(unions, fmt.Sprintf("SELECT issue_id, %s AS depends_on_id FROM %s WHERE type IN ('blocks', 'conditional-blocks')", DepTargetExpr, t))
+		unions = append(unions, fmt.Sprintf("SELECT issue_id, %s AS depends_on_id FROM %s WHERE type IN ('blocks', 'conditional-blocks', 'parent-child')", DepTargetExpr, t))
 	}
 	unionQuery := strings.Join(unions, " UNION ")
 	return fmt.Sprintf(`
@@ -370,6 +422,79 @@ func cycleReachabilityQuery(depTables []string) string {
 
 func cycleDetectionTables() []string {
 	return []string{"dependencies", "wisp_dependencies"}
+}
+
+// isSchedulingEdge reports whether a dependency type belongs to the static
+// combined-cycle set: blocks, conditional-blocks, and parent-child. Waits-for
+// also affects readiness but is intentionally outside this validation rule.
+func isSchedulingEdge(t types.DependencyType) bool {
+	switch t {
+	case types.DepBlocks, types.DepConditionalBlocks, types.DepParentChild:
+		return true
+	default:
+		return false
+	}
+}
+
+// CheckBlockingHierarchyInTx rejects blocking dependencies between an issue
+// and its own ancestor or descendant. Cross-prefix/external targets must be
+// filtered by the caller because no local hierarchy can connect them.
+func CheckBlockingHierarchyInTx(ctx context.Context, tx DBTX, dep *types.Dependency, depTables []string) error {
+	if dep.Type != types.DepBlocks && dep.Type != types.DepConditionalBlocks {
+		return nil
+	}
+	if dep.IssueID == dep.DependsOnID {
+		return nil // The dedicated self-dependency check owns this error.
+	}
+	if len(depTables) == 0 {
+		depTables = cycleDetectionTables()
+	}
+	blockerIsAncestor, err := isAncestorInTx(ctx, tx, dep.IssueID, dep.DependsOnID, depTables)
+	if err != nil {
+		return fmt.Errorf("failed to check blocker ancestry: %w", err)
+	}
+	if blockerIsAncestor {
+		return &domain.DependencyHierarchyConflictError{
+			IssueID: dep.IssueID, BlockerID: dep.DependsOnID, BlockerIsAncestor: true,
+		}
+	}
+	blockerIsDescendant, err := isAncestorInTx(ctx, tx, dep.DependsOnID, dep.IssueID, depTables)
+	if err != nil {
+		return fmt.Errorf("failed to check blocker ancestry: %w", err)
+	}
+	if blockerIsDescendant {
+		return &domain.DependencyHierarchyConflictError{
+			IssueID: dep.IssueID, BlockerID: dep.DependsOnID,
+		}
+	}
+	return nil
+}
+
+// isAncestorInTx reports whether candidate is an ancestor of node along
+// parent-child dependency edges (walking child -> parent only, so siblings
+// and cousins in the same hierarchy do not match). Uses UNION distinct
+// recursion so diamond/cyclic parentage terminates by unique reachable node.
+func isAncestorInTx(ctx context.Context, tx DBTX, node, candidate string, depTables []string) (bool, error) {
+	var unions []string
+	for _, t := range depTables {
+		unions = append(unions, fmt.Sprintf("SELECT issue_id, %s AS parent_id FROM %s WHERE type = 'parent-child'", DepTargetExpr, t))
+	}
+	//nolint:gosec // G201: depTables are fixed dependency table names from cycleDetectionTables/opts.
+	query := fmt.Sprintf(`
+		WITH RECURSIVE ancestors(node) AS (
+			SELECT ?
+			UNION
+			SELECT d.parent_id
+			FROM ancestors a
+			JOIN (%s) d ON d.issue_id = a.node
+		)
+		SELECT COUNT(*) FROM ancestors WHERE node = ?
+	`, strings.Join(unions, " UNION "))
+	var n int
+	if err := tx.QueryRowContext(ctx, query, node, candidate).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func DeleteWispFromDependenciesInTx(ctx context.Context, tx *sql.Tx, wispID string) error {
@@ -796,8 +921,8 @@ func GetIssuesByIDsInTx(ctx context.Context, tx DBTX, ids []string, wispSet map[
 			inClause := strings.Join(placeholders, ",")
 
 			rows, err := tx.QueryContext(ctx, fmt.Sprintf(
-				`SELECT %s FROM %s WHERE id IN (%s)`,
-				IssueSelectColumns, pair.table, inClause), args...)
+				`SELECT %s FROM %s %s WHERE id IN (%s)`,
+				IssueSelectColumns, pair.table, sqlbuild.LeaseJoin(pair.table), inClause), args...)
 			if err != nil {
 				return nil, fmt.Errorf("get issues by IDs from %s: %w", pair.table, err)
 			}

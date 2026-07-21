@@ -668,6 +668,46 @@ func TestEmbeddedUpdate(t *testing.T) {
 		if !strings.Contains(out, "already assigned to") {
 			t.Errorf("expected 'already assigned to' error, got: %s", out)
 		}
+		// The refusal must steer toward the holder, not teach an
+		// unclaim-then-claim eviction of a live claim (bd-at6rc / wy-zs5s2).
+		if !strings.Contains(out, "coordinate with the holder") {
+			t.Errorf("refusal should say coordinate-with-holder, got: %s", out)
+		}
+		if strings.Contains(out, "to release it before re-claiming") {
+			t.Errorf("refusal must not suggest plain unclaim of a foreign claim, got: %s", out)
+		}
+		// Nor may it name unclaim or --force at all: copy that names an
+		// eviction command gets pattern-matched by batch agents into
+		// `unclaim --force; claim` — a stronger steamroller than the one
+		// this fix removed (wy-yuclk).
+		if strings.Contains(out, "unclaim") || strings.Contains(out, "--force") {
+			t.Errorf("claim refusal must not name an eviction command, got: %s", out)
+		}
+	})
+
+	// A batch where one claim is lost and another is won must exit non-zero, so
+	// the lost claim is not hidden from exit-code automation (beads audit
+	// finding #10). The winner is still committed.
+	t.Run("update_claim_batch_partial_loss_exits_nonzero", func(t *testing.T) {
+		lost := bdCreate(t, bd, dir, "Batch lost", "--type", "task")
+		won := bdCreate(t, bd, dir, "Batch won", "--type", "task")
+		// Pre-assign `lost` to someone else so the default actor's claim loses.
+		bdUpdate(t, bd, dir, lost.ID, "--assignee", "alice")
+
+		out := bdUpdateFail(t, bd, dir, lost.ID, won.ID, "--claim")
+		if !strings.Contains(out, "already assigned to") {
+			t.Errorf("expected 'already assigned to' error in batch output, got: %s", out)
+		}
+		// The winning claim still lands despite the batch exiting non-zero.
+		gotWon := bdShow(t, bd, dir, won.ID)
+		if gotWon.Status != types.StatusInProgress {
+			t.Errorf("winning claim %s: status = %s, want in_progress", won.ID, gotWon.Status)
+		}
+		// The lost issue is untouched.
+		gotLost := bdShow(t, bd, dir, lost.ID)
+		if gotLost.Assignee != "alice" {
+			t.Errorf("lost issue %s assignee = %q, want alice (unchanged)", lost.ID, gotLost.Assignee)
+		}
 	})
 
 	// ===== Parent Reparenting =====
