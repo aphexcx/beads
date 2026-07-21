@@ -138,3 +138,6 @@ bd_test
 
 # Beads / Dolt files (added by bd init)
 .beads/proxieddb/
+
+# Gas City
+!.beads/identity.toml
