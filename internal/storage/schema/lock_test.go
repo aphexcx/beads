@@ -263,8 +263,14 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectColumnExists(mock, false)
 	expectColumnExists(mock, false)
 	// rekeyAuxRowIDs reads the ignored cursor to see whether its clone-local
-	// marker is pending; at latest it is not, so the re-key no-ops.
+	// marker is pending; at latest it is not. It then reads the clone-local
+	// re-key state — the crash sentinel and the #4380 drift record, either of
+	// which would re-admit the pass; this mocked world has no local_metadata
+	// table, so the read stops at the table-existence probe and the re-key
+	// no-ops.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", latestIgnored)
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS ignored_schema_migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectContentHashColumnExists(mock)

@@ -1,0 +1,12 @@
+prefix: bd
+issue-prefix: bd
+dolt.idle-timeout: "0"
+
+dolt:
+  auto-start: "false"
+
+storage.backend: dolt
+dolt.server: "127.0.0.1"
+dolt.port: 3307
+
+export.auto: "false"

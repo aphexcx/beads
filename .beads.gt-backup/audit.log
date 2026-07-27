@@ -1,0 +1,7 @@
+{"timestamp":"2026-03-25T06:02:09Z","operation":"burn","pinned_bead_id":"bd-1ob","detached_molecule":"bd-wisp-726p","reason":"polecat nuked: cleaning stale molecule","previous_state":"hooked"}
+{"timestamp":"2026-03-25T06:05:25Z","operation":"burn","pinned_bead_id":"bd-1ob","detached_molecule":"bd-wisp-8ubb","reason":"polecat nuked: cleaning stale molecule","previous_state":"hooked"}
+{"timestamp":"2026-03-25T06:09:32Z","operation":"burn","pinned_bead_id":"bd-1ob","detached_molecule":"bd-wisp-27bf","reason":"polecat nuked: cleaning stale molecule","previous_state":"hooked"}
+{"timestamp":"2026-03-25T06:12:39Z","operation":"burn","pinned_bead_id":"bd-1ob","detached_molecule":"bd-wisp-697h","reason":"polecat nuked: cleaning stale molecule","previous_state":"hooked"}
+{"timestamp":"2026-03-31T04:41:00Z","operation":"burn","pinned_bead_id":"bd-1ob","detached_molecule":"bd-wisp-j8i4","reason":"force re-sling: burning stale molecules","previous_state":"open"}
+{"timestamp":"2026-07-01T23:19:40Z","operation":"burn","pinned_bead_id":"bd-7tu","detached_molecule":"bd-wisp-0g6","reason":"force re-sling: burning stale molecules","previous_state":"open"}
+{"timestamp":"2026-07-02T00:28:02Z","operation":"burn","pinned_bead_id":"bd-f0t","detached_molecule":"bd-wisp-koo","reason":"force re-sling: burning stale molecules","previous_state":"open"}

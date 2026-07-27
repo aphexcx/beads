@@ -88,6 +88,11 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
+	// failed0053DirtyTablesAreRecoverable (dolt#11131 recovery gate) reads the
+	// current version first; at 42 (!= 52) the exemption declines and the
+	// dirty-table error path continues unchanged.
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
+
 	// pendingMigrationDirtyTables re-reads the current version and finds
 	// migration 0043 touches the dirty `dependencies` table.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
