@@ -297,6 +297,25 @@ func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
 		return false, nil
 	}
 
+	// Upstream 0055 (move_leases_to_table) DROPS the lease columns 0054
+	// added, destroying the disambiguating evidence above on exactly the
+	// stores that have migrated furthest. Row 55 is equivalent evidence: the
+	// pre-merge fork chain ended at 54, so only upstream's chain can have
+	// recorded a migration 0055 — and a store that ran upstream 0055
+	// necessarily ran upstream 0054 first, making row 54 upstream's lease
+	// migration rather than the fork fingerprint. Observed on the hw clone
+	// after the 2026-08 upmerge applied 0055 (hw-augjs): row 54 + no lease
+	// columns + MAX=73 tripped the refusal below on every subsequent open,
+	// wedging that clone's still-pending ignored chain; row 54's recorded
+	// content hash there is upstream 0054's, proving the misread.
+	has55, err := cursorRowExists(ctx, db, mainSource.cursorTable, 55)
+	if err != nil {
+		return false, fmt.Errorf("disambiguating fork lineage (row 55): %w", err)
+	}
+	if has55 {
+		return false, nil
+	}
+
 	current, err := mainSource.currentVersion(ctx, db)
 	if err != nil {
 		return false, err
@@ -579,6 +598,18 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 			return report, leaseErr
 		}
 		if hasLease {
+			has54, has11 = false, false
+		}
+	}
+	if has54 || has11 {
+		// Same 0055 complement as reconcileForkMainCursor: once upstream
+		// 0055 has dropped the lease columns, row 55 carries the
+		// upstream-lineage evidence.
+		has55, err := cursorRowExists(ctx, db, mainSource.cursorTable, 55)
+		if err != nil {
+			return report, err
+		}
+		if has55 {
 			has54, has11 = false, false
 		}
 	}

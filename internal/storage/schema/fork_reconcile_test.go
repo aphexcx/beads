@@ -78,6 +78,7 @@ func expectForkMainVerification(t *testing.T, mock sqlmock.Sqlmock) {
 	t.Helper()
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 	expectMaxVersion(mock, "schema_migrations", 54)
 	expectTableProbe(mock, "linear_label_snapshots", true)
 	expectColumnProbe(mock, "comments", "external_ref", true)
@@ -169,6 +170,7 @@ func TestReconcileForkMainCursor_MaxBeyond54_Errors(t *testing.T) {
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 	expectMaxVersion(mock, "schema_migrations", 73)
 
 	_, err = reconcileForkMainCursor(context.Background(), db)
@@ -213,6 +215,7 @@ func TestReconcileForkMainCursor_MissingForkArtifact_Errors(t *testing.T) {
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 	expectMaxVersion(mock, "schema_migrations", 54)
 	expectTableProbe(mock, "linear_label_snapshots", false) // fork DDL missing
 
@@ -231,6 +234,7 @@ func TestReconcileForkMainCursor_HashMismatch_Errors(t *testing.T) {
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 	expectMaxVersion(mock, "schema_migrations", 54)
 	expectTableProbe(mock, "linear_label_snapshots", true)
 	expectColumnProbe(mock, "comments", "external_ref", true)
@@ -254,6 +258,7 @@ func TestReconcileForkMainCursor_NullHashes_FallBackToProbes(t *testing.T) {
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 	expectMaxVersion(mock, "schema_migrations", 54)
 	expectTableProbe(mock, "linear_label_snapshots", true)
 	expectColumnProbe(mock, "comments", "external_ref", true)
@@ -295,6 +300,7 @@ func TestReconcileForkMainCursor_PreSquashDrift_RepairsAndCommits(t *testing.T) 
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 	expectMaxVersion(mock, "schema_migrations", 54)
 	expectTableProbe(mock, "linear_label_snapshots", true)
 	expectColumnProbe(mock, "comments", "external_ref", true)
@@ -347,6 +353,7 @@ func TestReconcileForkMainCursor_DriftWithDirtyIssues_Errors(t *testing.T) {
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 	expectMaxVersion(mock, "schema_migrations", 54)
 	expectTableProbe(mock, "linear_label_snapshots", true)
 	expectColumnProbe(mock, "comments", "external_ref", true)
@@ -384,6 +391,7 @@ func TestVerifyForkLineageState_MixedCursor_Inconsistent(t *testing.T) {
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1) // row 54 despite MAX=73
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 
 	report, err := VerifyForkLineageState(context.Background(), db)
 	if err != nil {
@@ -492,4 +500,36 @@ type mockMySQLTableNotExistErr struct{}
 
 func (e *mockMySQLTableNotExistErr) Error() string {
 	return "Error 1146 (42S02): table not found: schema_migrations"
+}
+
+// TestReconcileForkMainCursor_PostUpmergeLeaselessShape_NoOp pins the hw-augjs
+// regression: after the 2026-08 upmerge applies upstream 0055, every fork
+// store shows row 54 with NO issues.lease_expires_at (0055 dropped it) and
+// MAX(version)=73. The lease-column disambiguation alone misread that as a
+// pre-merge fork fingerprint and refused — permanently, on every open with any
+// pending work (hw's ignored chain was wedged at 11 by exactly this). Row 55
+// is the surviving upstream-lineage evidence and must end the check quietly.
+func TestReconcileForkMainCursor_PostUpmergeLeaselessShape_NoOp(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+	expectColumnProbe(mock, "issues", "lease_expires_at", false)
+	expectCursorRowProbe(mock, "schema_migrations", 55, 1)
+	// No further expectations: row 55 proves upstream lineage; nothing may be
+	// verified, rewritten, or refused.
+
+	changed, err := reconcileForkMainCursor(context.Background(), db)
+	if err != nil {
+		t.Fatalf("reconcileForkMainCursor: %v (must not refuse the post-upmerge shape)", err)
+	}
+	if changed {
+		t.Fatal("changed = true, want false for a post-upmerge upstream-lineage cursor")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
 }
