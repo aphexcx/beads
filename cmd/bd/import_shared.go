@@ -54,7 +54,6 @@ type ImportOptions struct {
 	Strict                     bool
 	RenameOnImport             bool
 	ClearDuplicateExternalRefs bool
-	OrphanHandling             string
 	DeletionIDs                []string
 	SkipPrefixValidation       bool
 	ProtectLocalExportIDs      map[string]time.Time
@@ -105,6 +104,14 @@ type ImportChange struct {
 	Changes string `json:"changes,omitempty"`
 }
 
+// importIssueLookup is the read seam the import pre-filters and dry-run
+// classifiers need. The classic storage.DoltStorage satisfies it, and so does
+// the proxied unit of work's domain.IssueUseCase, so both modes classify
+// incoming rows against local state with the same code.
+type importIssueLookup interface {
+	GetIssuesByIDs(ctx context.Context, ids []string) ([]*types.Issue, error)
+}
+
 // importIssuesCore imports issues into the Dolt store.
 // This is a bridge function that delegates to the Dolt store's batch creation.
 func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, issues []*types.Issue, opts ImportOptions) (*ImportResult, error) {
@@ -141,7 +148,6 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 	staleRejectedSet := make(map[string]struct{})
 	actor := getActorWithGit()
 	batchOpts := storage.BatchCreateOptions{
-		OrphanHandling:                 storage.OrphanAllow,
 		SkipPrefixValidation:           opts.SkipPrefixValidation,
 		ConflictSkip:                   opts.ConflictSkip,
 		RejectStaleUpserts:             !opts.AllowStale,
@@ -170,6 +176,15 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 		return nil, err
 	}
 
+	return assembleImportResult(issues, staleSkippedIDs, changePlan, staleRejectedSet, skippedDependencies), nil
+}
+
+// assembleImportResult folds the batch write's in-transaction outcomes (stale
+// rejections, skipped dependencies) into the pre-filter's classification,
+// producing the report both the classic and the proxied import return. Kept
+// as ONE function so the two modes cannot drift on how a stale-rejected row
+// is attributed.
+func assembleImportResult(issues []*types.Issue, staleSkippedIDs []string, changePlan importChangePlan, staleRejectedSet map[string]struct{}, skippedDependencies []string) *ImportResult {
 	importedIDs := make([]string, 0, len(issues))
 	for _, issue := range issues {
 		if _, rejected := staleRejectedSet[issue.ID]; rejected {
@@ -198,7 +213,7 @@ func importIssuesCore(ctx context.Context, _ string, store storage.DoltStorage, 
 		SkippedDependencies: skippedDependencies,
 		UpdatedIssues:       updatedIssues,
 		TieKeptLocalIDs:     changePlan.TieKeptLocal,
-	}, nil
+	}
 }
 
 // importIssuesChunked writes a large import in bounded transactions of
@@ -372,7 +387,7 @@ func writeImportRowChunks(ctx context.Context, store storage.DoltStorage, ordere
 		if err := store.CreateIssuesWithFullOptions(ctx, ordered[start:end], actor, rowOpts); err != nil {
 			return fmt.Errorf("import chunk %d/%d failed, %d issues already committed (committed rows are durable; re-run the import to resume — it converges): %w", chunk, chunks, start, err)
 		}
-		fmt.Fprintf(importProgress, "bd import: %d/%d issues committed\n", end, total)
+		fmt.Fprintf(importProgress, "bd import: %d/%d issues committed\n", end, total) //nolint:gosec // G705: stderr, not a browser context
 	}
 	return nil
 }
@@ -415,7 +430,7 @@ func wireDeferredImportDeps(ctx context.Context, store storage.DoltStorage, defe
 		if err := store.CreateIssuesWithFullOptions(ctx, depRows[start:end], actor, depOpts); err != nil {
 			return fmt.Errorf("import dependency pass chunk %d/%d failed (all %d issue rows are committed; re-run the import to resume — it converges): %w", chunk, depChunks, rowTotal, err)
 		}
-		fmt.Fprintf(importProgress, "bd import: deferred dependencies wired for %d/%d issues\n", end, depTotal)
+		fmt.Fprintf(importProgress, "bd import: deferred dependencies wired for %d/%d issues\n", end, depTotal) //nolint:gosec // G705: stderr, not a browser context
 	}
 	return nil
 }
@@ -644,9 +659,18 @@ type importChangePlan struct {
 	// every stored column for these (second-granularity timestamp tie),
 	// while their aux data still merges.
 	TieKeptLocal []string
+	// NewIDs lists incoming rows with no local match (would-create), deduped
+	// by ID for display and excluding title-only rows that carry no ID at
+	// all. NewCount is the authoritative row count for those same rows: it
+	// counts every classified-new row, including duplicate IDs and ID-less
+	// rows, so dry-run counts sum to the number of rows considered instead
+	// of undercounting when NewIDs collapses duplicates.
+	NewIDs []string
+	// NewCount is the number of incoming rows classified as new. See NewIDs.
+	NewCount int
 }
 
-func filterStaleImportIssues(ctx context.Context, store storage.DoltStorage, issues []*types.Issue) ([]*types.Issue, []string, importChangePlan, error) {
+func filterStaleImportIssues(ctx context.Context, store importIssueLookup, issues []*types.Issue) ([]*types.Issue, []string, importChangePlan, error) {
 	var plan importChangePlan
 	ids := make([]string, 0, len(issues))
 	seen := make(map[string]struct{}, len(issues))
@@ -660,7 +684,31 @@ func filterStaleImportIssues(ctx context.Context, store storage.DoltStorage, iss
 		seen[issue.ID] = struct{}{}
 		ids = append(ids, issue.ID)
 	}
+
+	newIDsSeen := make(map[string]struct{})
+	addNew := func(id string) {
+		plan.NewCount++
+		if id == "" {
+			// Title-only rows have no ID to look up or report — they always
+			// create, but there's nothing to add to the display list.
+			return
+		}
+		if _, dup := newIDsSeen[id]; dup {
+			return
+		}
+		newIDsSeen[id] = struct{}{}
+		plan.NewIDs = append(plan.NewIDs, id)
+	}
+
 	if len(ids) == 0 {
+		// There is no ID to look up, but title-only rows still create on
+		// execution. Classify each non-nil row before the short-circuit so a
+		// dry run reports it as created rather than unchanged.
+		for _, issue := range issues {
+			if issue != nil {
+				addNew(issue.ID)
+			}
+		}
 		return issues, nil, plan, nil
 	}
 
@@ -674,20 +722,45 @@ func filterStaleImportIssues(ctx context.Context, store storage.DoltStorage, iss
 			localByID[issue.ID] = issue
 		}
 	}
+
 	if len(localByID) == 0 {
+		// Nothing matched locally, so every considered row is new.
+		for _, issue := range issues {
+			if issue == nil {
+				continue
+			}
+			addNew(issue.ID)
+		}
 		return issues, nil, plan, nil
 	}
 
 	filtered := make([]*types.Issue, 0, len(issues))
 	skippedIDs := make([]string, 0)
 	for _, issue := range issues {
-		if issue == nil || issue.ID == "" || issue.UpdatedAt.IsZero() {
+		if issue == nil {
+			filtered = append(filtered, issue)
+			continue
+		}
+		if issue.ID == "" || issue.UpdatedAt.IsZero() {
+			// No incoming timestamp to stale-check (or, for a title-only
+			// row, no ID at all): these rows still write on execution, so
+			// classify them via an existence lookup instead of silently
+			// falling through as unchanged (GH#4901 follow-up).
+			if local, ok := localByID[issue.ID]; ok {
+				plan.Updates = append(plan.Updates, ImportChange{
+					ID:      issue.ID,
+					Changes: importRowChangeSummary(local, issue),
+				})
+			} else {
+				addNew(issue.ID)
+			}
 			filtered = append(filtered, issue)
 			continue
 		}
 		local, ok := localByID[issue.ID]
 		if !ok {
 			filtered = append(filtered, issue)
+			addNew(issue.ID)
 			continue
 		}
 		// Compare at second granularity: updated_at is DATETIME(0) in the
@@ -709,6 +782,110 @@ func filterStaleImportIssues(ctx context.Context, store storage.DoltStorage, iss
 		filtered = append(filtered, issue)
 	}
 	return filtered, skippedIDs, plan, nil
+}
+
+// classifyImportIssuesExistence classifies incoming rows as created or
+// updated purely by whether their ID already exists locally, without the
+// staleness policy: the --allow-stale dry-run path (like the real
+// --allow-stale write) imports every row regardless of timestamp ordering,
+// so no row is ever stale-skipped or tie-kept — existence is the only
+// question.
+func classifyImportIssuesExistence(ctx context.Context, store importIssueLookup, issues []*types.Issue) (importChangePlan, error) {
+	var plan importChangePlan
+	ids := make([]string, 0, len(issues))
+	seen := make(map[string]struct{}, len(issues))
+	for _, issue := range issues {
+		if issue == nil || issue.ID == "" {
+			continue
+		}
+		if _, ok := seen[issue.ID]; ok {
+			continue
+		}
+		seen[issue.ID] = struct{}{}
+		ids = append(ids, issue.ID)
+	}
+	localByID := make(map[string]*types.Issue)
+	if len(ids) > 0 {
+		localIssues, err := store.GetIssuesByIDs(ctx, ids)
+		if err != nil {
+			return plan, fmt.Errorf("check existing issues before import: %w", err)
+		}
+		for _, issue := range localIssues {
+			if issue != nil && issue.ID != "" {
+				localByID[issue.ID] = issue
+			}
+		}
+	}
+
+	newIDsSeen := make(map[string]struct{})
+	for _, issue := range issues {
+		if issue == nil {
+			continue
+		}
+		local, ok := localByID[issue.ID]
+		if !ok {
+			plan.NewCount++
+			if issue.ID == "" {
+				continue
+			}
+			if _, dup := newIDsSeen[issue.ID]; dup {
+				continue
+			}
+			newIDsSeen[issue.ID] = struct{}{}
+			plan.NewIDs = append(plan.NewIDs, issue.ID)
+			continue
+		}
+		plan.Updates = append(plan.Updates, ImportChange{
+			ID:      issue.ID,
+			Changes: importRowChangeSummary(local, issue),
+		})
+	}
+	return plan, nil
+}
+
+// classifyDryRunImport runs the same id lookup as a real import, without
+// writing anything, so --dry-run can report create/update/skip counts
+// instead of treating every row as a create (GH#4901).
+func classifyDryRunImport(ctx context.Context, store importIssueLookup, issues []*types.Issue, allowStale bool) (*ImportResult, error) {
+	if len(issues) == 0 {
+		return &ImportResult{}, nil
+	}
+	if allowStale {
+		// Matches the real path: --allow-stale skips the stale guard
+		// entirely, so a row is never stale-skipped or tie-kept here — but a
+		// row matching an existing local issue still writes as an update,
+		// not a create (GH#4901 follow-up).
+		plan, err := classifyImportIssuesExistence(ctx, store, issues)
+		if err != nil {
+			return nil, err
+		}
+		return &ImportResult{
+			Created:       plan.NewCount,
+			Updated:       len(plan.Updates),
+			ImportedIDs:   plan.NewIDs,
+			UpdatedIssues: plan.Updates,
+		}, nil
+	}
+
+	filtered, staleSkippedIDs, plan, err := filterStaleImportIssues(ctx, store, issues)
+	if err != nil {
+		return nil, err
+	}
+	// TieKeptLocal rows are not rewritten (the stale-guarded upsert keeps
+	// every stored column), so they belong in Unchanged, not Updated —
+	// they're still reported separately via TieKeptLocalIDs.
+	created := plan.NewCount
+	updated := len(plan.Updates)
+	return &ImportResult{
+		Created:         created,
+		Updated:         updated,
+		Unchanged:       len(filtered) - created - updated,
+		Skipped:         len(staleSkippedIDs),
+		ImportedIDs:     plan.NewIDs,
+		StaleSkippedIDs: staleSkippedIDs,
+		UpdatedIssues:   plan.Updates,
+		TieKeptLocalIDs: plan.TieKeptLocal,
+	}, nil
 }
 
 // importRowChangeSummary summarizes the differences between the local issue
@@ -870,14 +1047,7 @@ func parseJSONLFile(path string) ([]*types.Issue, map[string]string, error) {
 			continue
 		}
 
-		// v0.35–v0.37 exported "wisp" (bool), renamed to "ephemeral" in v0.38+.
-		// map old field name so the flag is preserved on import.
-		if _, hasWisp := peek["wisp"]; hasWisp && !issue.Ephemeral {
-			var wisp bool
-			if err := json.Unmarshal(peek["wisp"], &wisp); err == nil && wisp {
-				issue.Ephemeral = true
-			}
-		}
+		applyImportWispPlane(peek, &issue)
 
 		issue.SetDefaults()
 		issues = append(issues, &issue)
@@ -887,6 +1057,65 @@ func parseJSONLFile(path string) ([]*types.Issue, map[string]string, error) {
 	}
 
 	return issues, configEntries, nil
+}
+
+// applyImportWispPlane resolves which storage plane (wisps vs issues table) a
+// parsed import record routes to, shared by every JSONL parse loop
+// (parseImportRecords for `bd import` in both storage modes, parseJSONLFile
+// for bootstrap / init --from-jsonl / auto-import).
+//
+// The "wisp_plane" peek key is the EXPLICIT wisps-plane marker (bd-r9uce):
+// export writes it for rows that live in the wisps table, precisely because
+// row flags cannot be trusted for the plane decision — a promoted no-history
+// wisp is a durable issues-table row that may still carry no_history=true
+// (PromoteFromEphemeralInTx used to clear only Ephemeral, and wild data
+// with that shape persists). Routing such a record by flags re-planes it
+// into the wisps table, after which its cross-plane relations are dropped
+// by the batch import and the row itself is no longer durable — silent data
+// loss across export→import→export.
+//
+// The marker is deliberately a FRESH key, not a reuse of the legacy "wisp"
+// boolean (lion, #5368 review): every pre-fix v0.38+ binary's alias branch
+// is `hasWisp && !Ephemeral => Ephemeral=true`, so stamping "wisp" on a
+// genuine no-history wisp would make every current binary import it as
+// ephemeral — purge-eligible and excluded from that rig's next default
+// export — turning the common rollout-skew case lossy. Readers that predate
+// the fresh key simply ignore it and fall back to flag routing, the
+// data-safe degradation in both skew directions. So:
+//
+//   - "wisp_plane": true      => wisps plane, whatever the flags say.
+//   - key absent or false     => a no_history=true record is pinned to the
+//     ISSUES plane (the promoted shape). The flag itself is preserved on the
+//     row — clearing it would change the content hash and break the
+//     byte-identity of export→import→export — only the routing is pinned.
+//   - legacy "wisp": true     => the v0.35–v0.37 spelling of "ephemeral"
+//     (those exports predate no_history): Ephemeral is restored — the alias
+//     behavior import has always had, preserved verbatim.
+func applyImportWispPlane(peek map[string]json.RawMessage, issue *types.Issue) {
+	// A malformed marker is treated as absent (best-effort, like the
+	// legacy-alias parse always was).
+	planeMarker := false
+	if raw, ok := peek["wisp_plane"]; ok {
+		_ = json.Unmarshal(raw, &planeMarker)
+	}
+	if planeMarker {
+		wisp := true
+		issue.WispPlaneOverride = &wisp
+		return
+	}
+	if legacy, ok := peek["wisp"]; ok && !issue.Ephemeral {
+		// Legacy v0.35–v0.37 alias for "ephemeral", preserved verbatim.
+		var wisp bool
+		if err := json.Unmarshal(legacy, &wisp); err == nil && wisp {
+			issue.Ephemeral = true
+			return
+		}
+	}
+	if issue.NoHistory && !issue.Ephemeral {
+		// Promoted no-history wisp: durable row, stray flag. Pin it durable.
+		durable := false
+		issue.WispPlaneOverride = &durable
+	}
 }
 
 // importFromLocalJSONLFull imports issues and memories from a local JSONL file

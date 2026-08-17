@@ -142,8 +142,8 @@ func TestForkLineageReconciliationEndToEnd(t *testing.T) {
 		exec("INSERT INTO ignored_schema_migrations (version, content_hash) VALUES (?, ?)", i+1, hex.EncodeToString(sum[:]))
 	}
 	forkIgnored := map[int]string{
-		10: "ignored/0020_create_linear_issue_snapshots.up.sql",
-		11: "ignored/0021_create_linear_project_snapshots.up.sql",
+		10: "ignored/0025_create_linear_issue_snapshots.up.sql",
+		11: "ignored/0026_create_linear_project_snapshots.up.sql",
 	}
 	for _, v := range []int{10, 11} {
 		data := execFile(forkIgnored[v])
@@ -193,8 +193,8 @@ func TestForkLineageReconciliationEndToEnd(t *testing.T) {
 		"fork 0072":             {"schema_migrations", 72, "0072_add_comment_external_ref.up.sql"},
 		"fork 0073":             {"schema_migrations", 73, "0073_create_attachments.up.sql"},
 		"upstream ignored 0010": {"ignored_schema_migrations", 10, "ignored/0010_drop_wisp_id_defaults.up.sql"},
-		"fork ignored 0020":     {"ignored_schema_migrations", 20, "ignored/0020_create_linear_issue_snapshots.up.sql"},
-		"fork ignored 0021":     {"ignored_schema_migrations", 21, "ignored/0021_create_linear_project_snapshots.up.sql"},
+		"fork ignored 0025":     {"ignored_schema_migrations", 25, "ignored/0025_create_linear_issue_snapshots.up.sql"},
+		"fork ignored 0026":     {"ignored_schema_migrations", 26, "ignored/0026_create_linear_project_snapshots.up.sql"},
 	}
 	for desc, tc := range cursorHashes {
 		var recorded sql.NullString

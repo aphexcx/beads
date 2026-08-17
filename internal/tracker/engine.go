@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -108,6 +109,25 @@ type PushHooks struct {
 	// without enumerating fields.
 	DescribeDiff func(local *types.Issue, remote *TrackerIssue) []string
 
+	// ContentHash, if set, returns a stable fingerprint of the issue's pushable
+	// fields. When present, the engine binds the hash to the issue's external_ref
+	// and TargetScope (when provided), and persists that fingerprint in local_metadata
+	// after each successful create/update (and whenever ContentEqual reports a
+	// match). It consults the fingerprint BEFORE fetching the remote issue: if the
+	// stored content and target still match, the remote fetch and update are
+	// skipped entirely. This avoids the per-issue GET that ContentEqual alone
+	// still incurs, so a no-op `--push-only` run does not drain the API rate limit
+	// (gastownhall/beads#4214). Returning "" disables the short-circuit for that
+	// issue (the engine falls back to the fetch + ContentEqual path).
+	ContentHash func(local *types.Issue) string
+
+	// TargetScope returns the canonical remote namespace in which external issue
+	// identifiers are resolved. Trackers whose refs may omit that namespace (for
+	// example github:42 omits host and repository) should provide it so changing
+	// remote configuration invalidates the push cache. If nil or empty, only the
+	// external_ref identifies the target.
+	TargetScope func() string
+
 	// ShouldPush filters issues during push. Return false to skip.
 	// Called in addition to type/state/ephemeral filters. Use for prefix filtering, etc.
 	// If nil, all issues (matching other filters) are pushed.
@@ -132,7 +152,7 @@ type PushHooks struct {
 // integrations follow, eliminating duplication between Linear, GitLab, etc.
 type Engine struct {
 	Tracker   IssueTracker
-	Store     storage.Storage
+	Store     lifecycleStorage
 	Actor     string
 	PullHooks *PullHooks
 	PushHooks *PushHooks
@@ -149,8 +169,13 @@ type Engine struct {
 	warnings []string
 }
 
+type lifecycleStorage interface {
+	storage.Storage
+	storage.IssueLifecycleStore
+}
+
 // NewEngine creates a new sync engine for the given tracker and storage.
-func NewEngine(tracker IssueTracker, store storage.Storage, actor string) *Engine {
+func NewEngine(tracker IssueTracker, store lifecycleStorage, actor string) *Engine {
 	return &Engine{
 		Tracker: tracker,
 		Store:   store,
@@ -850,16 +875,22 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				updates["metadata"] = raw
 			}
 
-			if err := e.Store.RunInTransaction(ctx, fmt.Sprintf("bd: pull update %s", existing.ID), func(tx storage.Transaction) error {
-				if err := tx.UpdateIssue(ctx, existing.ID, updates, e.Actor); err != nil {
-					return err
-				}
+			if err := e.Store.RunInIssueLifecycleTransaction(ctx, fmt.Sprintf("bd: pull update %s", existing.ID), func(tx storage.IssueLifecycleTransaction) error {
+				// bd-ajn: the snapshot-backed label reconciler replaces the
+				// legacy Linear-authoritative sync when the tracker provides it.
 				if e.PullHooks != nil && e.PullHooks.ReconcileLabels != nil {
+					if err := applyPullIssueFields(ctx, tx, existing.ID, updates, e.Actor); err != nil {
+						return err
+					}
 					return e.PullHooks.ReconcileLabels(ctx, tx, existing.ID, conv.Issue.Labels, &extIssue, e.Actor)
 				}
-				return legacySyncIssueLabels(ctx, tx, existing.ID, conv.Issue.Labels, e.Actor)
+				return applyPullIssueUpdate(ctx, tx, existing.ID, updates, conv.Issue.Labels, e.Actor)
 			}); err != nil {
 				e.warn("Failed to update %s: %v", existing.ID, err)
+				stats.Errors++
+				if pulledIDs != nil {
+					pulledIDs[existing.ID] = true
+				}
 				continue
 			}
 			stats.Updated++
@@ -988,6 +1019,28 @@ func referencesMatch(local *types.Issue, ref string) bool {
 		localRef = strings.TrimSpace(*local.ExternalRef)
 	}
 	return localRef == strings.TrimSpace(ref)
+}
+
+// applyPullIssueUpdate keeps a pulled update atomic with its labels.
+func applyPullIssueUpdate(ctx context.Context, tx storage.IssueLifecycleTransaction, id string, updates map[string]interface{}, labels []string, actor string) error {
+	if err := applyPullIssueFields(ctx, tx, id, updates, actor); err != nil {
+		return err
+	}
+	return legacySyncIssueLabels(ctx, tx, id, labels, actor)
+}
+
+// applyPullIssueFields applies a pulled issue's fields while preserving the
+// caller's control over related collections such as labels.
+//
+// A pull always forces close policy. The remote tracker is authoritative for
+// the status it reports, and it knows nothing about local-only children or
+// local-only blockers — refusing an upstream close because of them would wedge
+// sync on state the remote cannot see and the operator did not create. Both the
+// pull and the conflict reimport route through here, so this is the one place
+// that decision lives.
+func applyPullIssueFields(ctx context.Context, tx storage.IssueLifecycleTransaction, id string, updates map[string]interface{}, actor string) error {
+	updates[issueops.OpForceClosePolicy] = true
+	return tx.UpdateIssue(ctx, id, updates, actor)
 }
 
 func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
@@ -1402,6 +1455,65 @@ func LastSyncTime(ctx context.Context, store storage.Storage, configPrefix strin
 	return parsed
 }
 
+// pushHashKey returns the local_metadata key under which the last-pushed
+// content hash for an issue is stored, namespaced per tracker (e.g.
+// "github.pushhash.bd-123"). local_metadata is dolt-ignored, so these hashes
+// are clone-local and reset on clone/branch-checkout/server-restart; that only
+// costs one fetch+ContentEqual pass to repopulate, never a missed update.
+func (e *Engine) pushHashKey(issueID string) string {
+	return e.Tracker.ConfigPrefix() + ".pushhash." + issueID
+}
+
+// pushCacheValue binds the content fingerprint to the remote target and its
+// configured namespace. A local issue can be relinked, or a repo-less ref can
+// resolve under a newly configured namespace, without changing any pushable
+// content. Treating the content hash alone as valid in either case would skip
+// the first update to the new target. Length prefixes keep fields unambiguous.
+func (e *Engine) pushCacheValue(issue *types.Issue, externalRef string) string {
+	if e.PushHooks == nil || e.PushHooks.ContentHash == nil {
+		return ""
+	}
+	content := e.PushHooks.ContentHash(issue)
+	if content == "" {
+		return ""
+	}
+	target := strings.TrimSpace(externalRef)
+	if target == "" {
+		return ""
+	}
+	scope := ""
+	if e.PushHooks.TargetScope != nil {
+		scope = strings.TrimSpace(e.PushHooks.TargetScope())
+	}
+	return fmt.Sprintf("v3:%d:%s%d:%s%s", len(content), content, len(scope), scope, target)
+}
+
+// storedPushHashMatches reports whether the persisted push hash for issue still
+// equals its current content-and-target fingerprint. When true, a push is
+// provably a no-op and both the remote fetch and the update can be skipped.
+func (e *Engine) storedPushHashMatches(ctx context.Context, issue *types.Issue, externalRef string) bool {
+	current := e.pushCacheValue(issue, externalRef)
+	if current == "" {
+		return false
+	}
+	stored, err := e.Store.GetLocalMetadata(ctx, e.pushHashKey(issue.ID))
+	return err == nil && stored != "" && stored == current
+}
+
+// recordPushHash persists the current content-and-target fingerprint for issue
+// so subsequent pushes can short-circuit via storedPushHashMatches. No-op when
+// ContentHash is unset or returns "", or when the target is empty. Never called
+// during dry-run.
+func (e *Engine) recordPushHash(ctx context.Context, issue *types.Issue, externalRef string) {
+	h := e.pushCacheValue(issue, externalRef)
+	if h == "" {
+		return
+	}
+	if err := e.Store.SetLocalMetadata(ctx, e.pushHashKey(issue.ID), h); err != nil {
+		e.warn("Failed to record push hash for %s: %v", issue.ID, err)
+	}
+}
+
 // doPush exports beads issues to the external tracker.
 //
 // bd-ajn: pushFieldScopes carries per-issue field restrictions
@@ -1576,6 +1688,18 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			continue
 		}
 
+		extRef := derefStr(issue.ExternalRef)
+
+		// Content unchanged since last push: a wet run would skip this issue
+		// without even fetching it (see the storedPushHashMatches fast path
+		// below), so the dry-run preview must say so too
+		// (gastownhall/beads#4214). Creates and forced pushes fall through to
+		// the full preview flow.
+		if opts.DryRun && !willCreate && !forceIDs[issue.ID] && e.storedPushHashMatches(ctx, issue, extRef) {
+			stats.Skipped++
+			continue
+		}
+
 		// FormatDescription hook: apply to a copy so we don't mutate local data.
 		pushIssue := e.formatPushIssue(issue)
 
@@ -1615,6 +1739,8 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			for _, w := range created.Warnings {
 				e.warn("%s (%s)", w, issue.ID)
 			}
+			// Remember what we just pushed so the next sync can skip the fetch.
+			e.recordPushHash(ctx, issue, ref)
 			stats.Created++
 
 			// Sync comments after create (push direction).
@@ -1633,6 +1759,14 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 
 			// Check if update is needed
 			var fetchedExt *TrackerIssue
+			// Fast path: if the local content is unchanged since the last
+			// successful push, the remote must already match it, so skip the
+			// fetch entirely. This is what keeps a no-op `--push-only` run
+			// from issuing one GET per issue (gastownhall/beads#4214).
+			if !forceIDs[issue.ID] && e.storedPushHashMatches(ctx, issue, extRef) {
+				stats.Skipped++
+				continue
+			}
 			// Force-pushed issues normally skip the remote fetch (the user has
 			// already decided to overwrite). But when the tracker implements
 			// RemoteAwareUpdater, we still want the remote payload so the
@@ -1653,6 +1787,9 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 					if !forceIDs[issue.ID] {
 						if e.PushHooks != nil && e.PushHooks.ContentEqual != nil {
 							if e.PushHooks.ContentEqual(issue, extIssue) {
+								// Remote already matches: record the hash so future
+								// runs skip the fetch above, not just the update.
+								e.recordPushHash(ctx, issue, extRef)
 								stats.Skipped++
 								continue
 							}
@@ -1673,6 +1810,9 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 						// (i.e., RemoteAwareUpdater trackers); other forced paths
 						// preserve the existing intentional-overwrite semantics.
 						if e.PushHooks.ContentEqual(issue, extIssue) {
+							// Remote already matches: record the hash so future
+							// runs skip the fetch above, not just the update.
+							e.recordPushHash(ctx, issue, extRef)
 							stats.Skipped++
 							continue
 						}
@@ -1744,6 +1884,8 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 				}
 				continue
 			}
+			// Remember what we just pushed so the next sync can skip the fetch.
+			e.recordPushHash(ctx, issue, extRef)
 			stats.Updated++
 
 			// Sync comments after update (push direction).
@@ -2027,7 +2169,9 @@ func (e *Engine) resolveFieldScopedConflict(
 	}
 }
 
-// reimportIssue fetches the external version and updates the local issue.
+// reimportIssue fetches an external version and reapplies its scalar fields.
+// It deliberately preserves local labels because conflict reimport has no
+// authoritative label collection to synchronize.
 func (e *Engine) reimportIssue(ctx context.Context, c Conflict) {
 	extIssue, err := e.Tracker.FetchIssue(ctx, c.ExternalIdentifier)
 	if err != nil || extIssue == nil {
@@ -2052,7 +2196,9 @@ func (e *Engine) reimportIssue(ctx context.Context, c Conflict) {
 		}
 	}
 
-	if err := e.Store.UpdateIssue(ctx, c.IssueID, updates, e.Actor); err != nil {
+	if err := e.Store.RunInIssueLifecycleTransaction(ctx, fmt.Sprintf("bd: reimport update %s", c.IssueID), func(tx storage.IssueLifecycleTransaction) error {
+		return applyPullIssueFields(ctx, tx, c.IssueID, updates, e.Actor)
+	}); err != nil {
 		e.warn("Failed to update %s during reimport: %v", c.IssueID, err)
 		return
 	}

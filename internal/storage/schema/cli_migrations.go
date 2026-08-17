@@ -1,12 +1,31 @@
 package schema
 
 // cliCompatibleMigrationSQL returns migration SQL suitable for `dolt sql -q`
-// against a fresh test database. The Dolt CLI accepts PREPARE/EXECUTE DDL but
-// does not apply some prepared ALTER TABLE statements in this path, so the
-// fresh-schema bundle uses direct DDL for prepared DDL that can change the
-// committed schema shape. The bundle's contract is to reproduce the runtime
-// committed schema for a fresh database; runtime migrations still use the source
-// files and remain the source of truth for upgrades of existing databases.
+// against a fresh test database. The Dolt CLI's batch execution path
+// (`dolt sql -q`/`-f`, which is what AllMigrationsSQL below feeds) silently
+// no-ops a PREPARE/EXECUTE statement whose prepared text is DML — UPDATE,
+// INSERT, or DELETE built into a `SET @sql = '...'` string and run via
+// PREPARE ... FROM @sql; EXECUTE stmt — while EXECUTE reports success and a
+// prepared SELECT or a direct (non-prepared) statement on the same path
+// executes correctly. This is dolthub/dolt#11345, verified on dolt 2.2.0 and
+// 2.2.2. Prepared ALTER TABLE is the same underlying limitation and one
+// instance of it, not the whole scope: the fresh-schema bundle uses direct
+// DDL below wherever a source migration guards an ALTER with PREPARE for
+// idempotent re-runs. The bundle's contract is to reproduce the runtime
+// committed schema for a fresh database; runtime migrations still use the
+// source files and remain the source of truth for upgrades of existing
+// databases, where PREPARE/EXECUTE runs over a real driver connection and
+// this limitation does not apply.
+//
+// For a migration whose PREPARE'd DML matters on this path (not just DDL),
+// the fix is not a direct-SQL override here — it is to not depend on
+// PREPARE'd writes to real tables in the source migration at all. Migration
+// 0059 (gastownhall/beads#4877) is the pattern: real-table mutations are
+// direct SQL; the only PREPARE'd statements are best-effort, guarded copies
+// into throwaway stand-in tables that a direct statement then reads, so a
+// silent no-op there degrades gracefully instead of corrupting state.
+// scripts/check-migration-hygiene.sh flags new migrations that use PREPARE'd
+// DML instead of that pattern.
 func cliCompatibleMigrationSQL(name, sqlText string) string {
 	switch name {
 	case "0008_create_child_counters.up.sql":
@@ -62,6 +81,15 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 		// prepared ALTERs don't apply — use direct DDL on the fresh schema,
 		// which never has these columns yet.
 		return cliMigration0072AddCommentExternalRef
+	case "0027_add_wisp_comment_external_ref.up.sql":
+		// Fork ignored-chain companion of main 0072 (bd-5rs; numbered 0022
+		// before the 2026-08 upmerge renumbering). Through the Dolt CLI the
+		// source file's prepared, INFORMATION_SCHEMA-guarded ALTERs are not
+		// reliably applied while its prepared CREATE INDEX still executes —
+		// and then fails against the never-added column. A fresh bundle's
+		// ignored sequence has just created wisp_comments bare, so direct
+		// DDL is correct (same rationale as 0072 above).
+		return cliMigration0027AddWispCommentExternalRef
 	case "0055_move_leases_to_table.up.sql":
 		// Direct DDL for the same reason as 0054. A fresh bundle has no live
 		// leases to copy (0054 just added empty columns), so this is pure
@@ -73,10 +101,19 @@ func cliCompatibleMigrationSQL(name, sqlText string) string {
 	}
 }
 
+// cliMigration0072AddCommentExternalRef deliberately omits the source
+// migration's wisp_comments statements: AllMigrationsSQL bundles the MAIN
+// chain only, and wisp tables are clone-local (ignored/0001 creates them), so
+// a CLI bundle has no wisp_comments to alter — the guarded prepared ALTERs
+// that make the runtime migration a no-op there do not apply through the Dolt
+// CLI. On real clones the ephemeral-plane columns come from the ignored-chain
+// companion (ignored/0027, formerly 0022 — bd-5rs), which is the replay path
+// that actually reaches clones.
 const cliMigration0072AddCommentExternalRef = `ALTER TABLE comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '';
 ALTER TABLE comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
-CREATE INDEX idx_comments_external_ref ON comments (external_ref);
-ALTER TABLE wisp_comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '';
+CREATE INDEX idx_comments_external_ref ON comments (external_ref);`
+
+const cliMigration0027AddWispCommentExternalRef = `ALTER TABLE wisp_comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '';
 ALTER TABLE wisp_comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
 CREATE INDEX idx_wisp_comments_external_ref ON wisp_comments (external_ref);`
 

@@ -46,7 +46,7 @@ Examples:
 	SilenceErrors: true,
 	RunE: func(_ *cobra.Command, _ []string) error {
 		if usesProxiedServer() {
-			return HandleErrorRespectJSON("compact is not supported in proxied-server mode")
+			return runCompactProxiedServer(rootCtx)
 		}
 		evt := metrics.NewCommandEvent("compact")
 		defer func() {
@@ -180,7 +180,7 @@ Examples:
 		// Prune remote-tracking refs before GC: they still anchor the
 		// pre-compact chain, and with them in place GC reclaims nothing on any
 		// workspace that has ever pushed or fetched (bd-agctw).
-		sizeBefore := storeSizeBytes()
+		sizeBefore := storeSizeBytes(ctx)
 		pruned, tags := pruneRemoteRefsForGC(ctx)
 		if !jsonOutput {
 			printPruneReport(pruned, tags)
@@ -192,7 +192,7 @@ Examples:
 				WarnError("dolt gc after compact failed: %v", err)
 			}
 		}
-		sizeAfter := storeSizeBytes()
+		sizeAfter := storeSizeBytes(ctx)
 
 		elapsed := time.Since(start)
 		resultCommits := len(recentHashes) + 1

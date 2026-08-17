@@ -378,6 +378,9 @@ func TestVerifyForkLineageState_MixedCursor_Inconsistent(t *testing.T) {
 
 	expectMaxVersion(mock, "schema_migrations", 73)
 	expectMaxVersion(mock, "ignored_schema_migrations", 11)
+	// gh 5033: a non-zero ignored cursor is corroborated against the ignored
+	// chain's sentinel tables before it is believed.
+	expectIgnoredSentinelProbes(mock, true)
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1) // row 54 despite MAX=73
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
@@ -403,6 +406,8 @@ func TestReconcileForkIgnoredCursor_HappyPath_DeletesForkRows(t *testing.T) {
 
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
 	expectMaxVersion(mock, "ignored_schema_migrations", 11)
+	// gh 5033: non-zero ignored cursor triggers the sentinel corroboration.
+	expectIgnoredSentinelProbes(mock, true)
 	expectTableProbe(mock, "linear_issue_snapshots", true)
 	expectTableProbe(mock, "linear_project_snapshots", true)
 	expectHasContentHashColumn(mock, "ignored_schema_migrations", true)
@@ -476,8 +481,8 @@ func TestNoDuplicateMigrationVersions(t *testing.T) {
 	if want, got := 73, LatestVersion(); got != want {
 		t.Errorf("LatestVersion() = %d, want %d (upstream 0053 tail + fork 0070-0073)", got, want)
 	}
-	if want, got := 22, LatestIgnoredVersion(); got != want {
-		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored 0010 + fork 0020-0022)", got, want)
+	if want, got := 27, LatestIgnoredVersion(); got != want {
+		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored tail 0024 + fork 0025-0027)", got, want)
 	}
 }
 

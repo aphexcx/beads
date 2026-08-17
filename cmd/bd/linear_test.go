@@ -1808,7 +1808,7 @@ func TestLinearConfig_LabelSyncOverrides(t *testing.T) {
 	}
 }
 
-// fakeLinearConfigReader is a test double for linearConfigReader that
+// fakeLinearConfigReader is a test double for configReader that
 // returns values from an in-memory map. Unset keys return "" with no error
 // (matches storage.Storage's behavior for missing config keys).
 type fakeLinearConfigReader map[string]string

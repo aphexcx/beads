@@ -192,11 +192,49 @@ func (s *DoltStore) updateWisp(ctx context.Context, id string, updates map[strin
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	if _, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor); err != nil {
 		return err
 	}
 
-	return wrapTransactionError("commit update wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit update wisp", tx)
+}
+
+// updateWispChecked updates a wisp with the optional atomic preconditions of
+// UpdateIssueChecked, mirroring updateWisp but first enforcing — in the SAME
+// transaction — opts.ExpectedVersion (issueops.CheckVersionInTx →
+// storage.ErrVersionMismatch) and the opts.ExpectedAssignee/ExpectedStatus
+// field guards (issueops.CheckExpectedFieldsInTx → ErrAssigneeMismatch/
+// ErrStatusMismatch), so a stale precondition refuses before any write and the
+// deferred Rollback discards the transaction (a true compare-and-swap). Like
+// updateWisp it uses a bare BeginTx/Commit with no withRetryTx (consistent with
+// the rest of the wisp write path — do not add one here); wisps live in
+// dolt_ignored tables, so there is no DOLT_COMMIT.
+func (s *DoltStore) updateWispChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts storage.UpdateIssueOptions) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
+	if opts.ExpectedVersion != nil {
+		if err := issueops.CheckVersionInTx(ctx, tx, id, *opts.ExpectedVersion); err != nil {
+			return err
+		}
+	}
+	if err := issueops.CheckExpectedFieldsInTx(ctx, tx, id, opts.ExpectedAssignee, opts.ExpectedStatus); err != nil {
+		return err
+	}
+	if _, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor); err != nil {
+		return err
+	}
+
+	return s.commitSQLTx(ctx, "commit update wisp", tx)
 }
 
 // closeWisp closes a wisp in the wisps table.
@@ -209,19 +247,32 @@ func (s *DoltStore) closeWisp(ctx context.Context, id string, reason string, act
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	if _, err := issueops.CloseIssueInTx(ctx, tx, id, reason, actor, session); err != nil {
 		return err
 	}
 
-	return wrapTransactionError("commit close wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit close wisp", tx)
 }
 
 // closeWispChecked closes a wisp with the is_blocked guard, mirroring closeWisp
 // but refusing with storage.ErrCloseBlocked when the wisp is still blocked
-// unless opts.Force is set. The guard and the close share the same transaction;
-// wisps live in dolt_ignored tables, so there is no DOLT_COMMIT. On a guard
-// rejection the deferred Rollback discards the transaction — no close or event
-// is written.
+// unless opts.Force is set — and, when opts.ExpectedVersion is non-nil, with
+// storage.ErrVersionMismatch when the row's RowVersion no longer matches (an
+// orthogonal CAS that Force does not bypass). The checks and the close share the
+// same transaction; wisps live in dolt_ignored tables, so there is no
+// DOLT_COMMIT. On any rejection the deferred Rollback discards the transaction —
+// no close or event is written.
+//
+// Unlike the permanent path, the wisp close uses a bare BeginTx/Commit with no
+// withRetryTx (consistent with the rest of the wisp write path — do not add one
+// here). So the CAS's read-side limb still returns ErrVersionMismatch for a
+// writer that committed before this tx began, but a CONCURRENT wisp mutation
+// that loses the race at commit surfaces as a transaction/serialization error
+// rather than ErrVersionMismatch. Either way atomicity holds: no lost update and
+// no stale close.
 func (s *DoltStore) closeWispChecked(ctx context.Context, id string, actor string, opts storage.CloseIssueOptions) (storage.CloseIssueResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -229,15 +280,52 @@ func (s *DoltStore) closeWispChecked(ctx context.Context, id string, actor strin
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force)
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
+	res, err := issueops.CloseIssueCheckedInTx(ctx, tx, id, opts.Reason, actor, opts.Session, opts.Force, opts.ExpectedVersion)
 	if err != nil {
 		return storage.CloseIssueResult{}, err
 	}
 
-	if err := wrapTransactionError("commit close wisp", tx.Commit()); err != nil {
+	if err := s.commitSQLTx(ctx, "commit close wisp", tx); err != nil {
 		return storage.CloseIssueResult{}, err
 	}
-	return storage.CloseIssueResult{Unchanged: res.AlreadyClosed}, nil
+	return storage.CloseIssueResult{Unchanged: res.AlreadyClosed, OpenChildren: res.OpenChildren}, nil
+}
+
+// wispAuxCascadeTables lists the wisp auxiliary tables a wisp delete must
+// also clean up, mirroring internal/storage/schema/cli_migrations.go:300-315.
+// wisp_child_counters is keyed on parent_id (a wisp can be a parent whose
+// children hold the counter row); the other three are keyed on issue_id.
+// Some deployed stores enforce this via FK ON DELETE CASCADE and some do not
+// (be-zdqyl: the migration adding those FKs was never promoted out of
+// migrations/ignored/), so the delete paths below must not rely on the
+// database to do it for them.
+var wispAuxCascadeTables = []struct{ table, column string }{
+	{"wisp_labels", "issue_id"},
+	{"wisp_events", "issue_id"},
+	{"wisp_comments", "issue_id"},
+	{"wisp_child_counters", "parent_id"},
+}
+
+// deleteWispAuxRowsInTx removes every row the given wisp ids own across
+// wispAuxCascadeTables. Shared by deleteWisp and deleteWispBatchTx so the
+// table set cannot drift between the two paths.
+func deleteWispAuxRowsInTx(ctx context.Context, tx *sql.Tx, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	inClause, args := doltBuildSQLInClause(ids)
+	for _, aux := range wispAuxCascadeTables {
+		//nolint:gosec // G201: aux.table/aux.column come from the fixed wispAuxCascadeTables literal; inClause contains only ? markers
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)", aux.table, aux.column, inClause),
+			args...); err != nil {
+			return fmt.Errorf("delete wisp aux rows from %s: %w", aux.table, err)
+		}
+	}
+	return nil
 }
 
 // deleteWisp permanently removes a wisp and its related data.
@@ -248,9 +336,19 @@ func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	affectedIssues, affectedWisps, aerr := issueops.AffectedByDeletionInTx(ctx, tx, nil, []string{id})
 	if aerr != nil {
 		return fmt.Errorf("affected by wisp delete for %s: %w", id, aerr)
+	}
+
+	// Edges are journaled before the row goes, while their source snapshots can
+	// still be read. An active wisp is a bead like any other, so its delete is
+	// a journalled mutation, not silent cleanup.
+	if err := issueops.RecordDependencyRemovalsForIssuesInTx(ctx, tx, []string{id}); err != nil {
+		return fmt.Errorf("journal dependency removals for wisp %s: %w", id, err)
 	}
 
 	result, err := tx.ExecContext(ctx, "DELETE FROM wisps WHERE id = ?", id)
@@ -265,16 +363,24 @@ func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
 	if rows == 0 {
 		return fmt.Errorf("wisp not found: %s", id)
 	}
+	// The rows==0 return above keeps this actually-deleted-only.
+	if err := issueops.RecordDeleteInTx(ctx, tx, id); err != nil {
+		return err
+	}
 
 	if err := issueops.DeleteWispFromDependenciesInTx(ctx, tx, id); err != nil {
 		return err
+	}
+
+	if err := deleteWispAuxRowsInTx(ctx, tx, []string{id}); err != nil {
+		return fmt.Errorf("delete wisp aux rows for %s: %w", id, err)
 	}
 
 	if err := issueops.RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
 		return fmt.Errorf("recompute is_blocked after wisp delete for %s: %w", id, err)
 	}
 
-	return wrapTransactionError("commit delete wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit delete wisp", tx)
 }
 
 // deleteWispBatch permanently removes multiple wisps using one transaction per
@@ -321,9 +427,27 @@ func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, e
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	affectedIssues, affectedWisps, aerr := issueops.AffectedByDeletionInTx(ctx, tx, nil, ids)
 	if aerr != nil {
 		return 0, fmt.Errorf("affected by batched wisp delete: %w", aerr)
+	}
+
+	// Resolve WHICH wisps this batch actually removes before the DELETE runs:
+	// afterwards they are gone, and RowsAffected reports a count, not a set.
+	// GC hands this path ids it scanned earlier, so an already-collected wisp is
+	// a routine case, and a phantom delete record would tell a consumer to drop
+	// a bead this transaction never touched.
+	deletedIDs, err := issueops.ExistingIssueIDsInTableInTx(ctx, tx, "wisps", ids)
+	if err != nil {
+		return 0, fmt.Errorf("resolve existing wisps for batch delete: %w", err)
+	}
+	// Edges are journaled before the rows go, while their source snapshots can
+	// still be read.
+	if err := issueops.RecordDependencyRemovalsForIssuesInTx(ctx, tx, deletedIDs); err != nil {
+		return 0, fmt.Errorf("journal dependency removals for batched wisp delete: %w", err)
 	}
 
 	inClause, args := doltBuildSQLInClause(ids)
@@ -337,16 +461,26 @@ func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, e
 	}
 	rowsAffected, _ := result.RowsAffected()
 
+	for _, id := range deletedIDs {
+		if err := issueops.RecordDeleteInTx(ctx, tx, id); err != nil {
+			return 0, err
+		}
+	}
+
 	if err := issueops.DeleteWispsFromDependenciesInTx(ctx, tx, ids); err != nil {
 		return 0, err
+	}
+
+	if err := deleteWispAuxRowsInTx(ctx, tx, ids); err != nil {
+		return 0, fmt.Errorf("delete wisp aux rows: %w", err)
 	}
 
 	if err := issueops.RecomputeIsBlockedInTx(ctx, tx, affectedIssues, affectedWisps); err != nil {
 		return 0, fmt.Errorf("recompute is_blocked after batched wisp delete: %w", err)
 	}
 
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit batch wisp delete: %w", err)
+	if err := s.commitSQLTx(ctx, "commit batch wisp delete", tx); err != nil {
+		return 0, err
 	}
 
 	return int(rowsAffected), nil
@@ -362,11 +496,14 @@ func (s *DoltStore) claimWisp(ctx context.Context, id string, actor string) erro
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
 		return err
 	}
 
-	return wrapTransactionError("commit claim wisp", tx.Commit())
+	return s.commitSQLTx(ctx, "commit claim wisp", tx)
 }
 
 // ListWisps returns ephemeral issues matching the filter.
@@ -541,24 +678,30 @@ func (s *DoltStore) getWispsByIDs(ctx context.Context, ids []string) ([]*types.I
 }
 
 // addWispDependency adds a dependency to the wisp_dependencies table.
-func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency, actor string, isCrossPrefix bool) error {
+func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency, actor string, isCrossPrefix, emitEvent bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
+
 	kind := issueops.ClassifyDepTarget(ctx, tx, dep, isCrossPrefix)
-	if err := issueops.AddDependencyInTx(ctx, tx, dep, actor, issueops.AddDependencyOpts{
+	// Wisp source/event tables are dolt_ignored (committed with the SQL tx, not
+	// via selective doltAddAndCommit), so the event-written flag is not needed here.
+	if _, err := issueops.AddDependencyInTx(ctx, tx, dep, actor, issueops.AddDependencyOpts{
 		SourceTable:   "wisps",
 		WriteTable:    "wisp_dependencies",
 		IsCrossPrefix: isCrossPrefix,
 		TargetKind:    &kind,
+		EmitEvent:     emitEvent,
 	}); err != nil {
 		return err
 	}
 
-	return wrapTransactionError("commit add wisp dependency", tx.Commit())
+	return s.commitSQLTx(ctx, "commit add wisp dependency", tx)
 }
 
 // getWispDependencies retrieves issues that a wisp depends on.

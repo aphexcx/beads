@@ -8,9 +8,25 @@ import (
 
 	"github.com/steveyegge/beads"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+func TestReExportCommitIndeterminate(t *testing.T) {
+	t.Parallel()
+
+	if beads.ErrCommitIndeterminate != storage.ErrCommitIndeterminate {
+		t.Error("beads.ErrCommitIndeterminate is not the shared storage sentinel value (identity broken)")
+	}
+	if dolt.ErrCommitIndeterminate != storage.ErrCommitIndeterminate {
+		t.Error("dolt.ErrCommitIndeterminate is not the shared storage sentinel value (identity broken)")
+	}
+	wrapped := fmt.Errorf("update issue: %w", storage.ErrCommitIndeterminate)
+	if !errors.Is(wrapped, beads.ErrCommitIndeterminate) {
+		t.Errorf("errors.Is(wrapped, beads.ErrCommitIndeterminate) = false; err = %v", wrapped)
+	}
+}
 
 // TestReExportCloseBlocked proves the public beads.ErrCloseBlocked alias is the
 // same value as the internal sentinel and composes through errors.Is when
@@ -28,6 +44,40 @@ func TestReExportCloseBlocked(t *testing.T) {
 	}
 }
 
+// TestReExportVersionMismatch proves the public beads.ErrVersionMismatch alias
+// is the same value as the internal sentinel and composes through errors.Is when
+// wrapped — the property a CloseIssueChecked caller relies on to detect an
+// optimistic-concurrency refusal without importing internal/storage.
+func TestReExportVersionMismatch(t *testing.T) {
+	t.Parallel()
+
+	if beads.ErrVersionMismatch != storage.ErrVersionMismatch {
+		t.Error("beads.ErrVersionMismatch is not the internal sentinel value (identity broken)")
+	}
+	wrapped := fmt.Errorf("x: %w", beads.ErrVersionMismatch)
+	if !errors.Is(wrapped, beads.ErrVersionMismatch) {
+		t.Errorf("errors.Is(wrapped, beads.ErrVersionMismatch) = false; err = %v", wrapped)
+	}
+}
+
+// TestUpdateIssueOptionsIsExported proves the public beads.UpdateIssueOptions
+// alias is usable from outside the module and its ExpectedVersion compare-and-
+// swap field round-trips — the type a caller names to opt a
+// Storage.UpdateIssueChecked into optimistic concurrency without importing
+// internal/storage. The zero value must leave ExpectedVersion nil (no check).
+func TestUpdateIssueOptionsIsExported(t *testing.T) {
+	t.Parallel()
+
+	v := int64(7)
+	opts := beads.UpdateIssueOptions{ExpectedVersion: &v}
+	if opts.ExpectedVersion == nil || *opts.ExpectedVersion != 7 {
+		t.Fatalf("ExpectedVersion did not round-trip through the exported alias: %+v", opts)
+	}
+	if (beads.UpdateIssueOptions{}).ExpectedVersion != nil {
+		t.Fatal("zero-value UpdateIssueOptions must have a nil ExpectedVersion (no check)")
+	}
+}
+
 // TestReExportedSentinelIdentity proves each public sentinel is the SAME value
 // as the internal one it aliases, so errors.Is composes across the package
 // boundary without any bridging.
@@ -42,8 +92,11 @@ func TestReExportedSentinelIdentity(t *testing.T) {
 		{"ErrNotFound", beads.ErrNotFound, storage.ErrNotFound},
 		{"ErrAlreadyClaimed", beads.ErrAlreadyClaimed, storage.ErrAlreadyClaimed},
 		{"ErrNotClaimable", beads.ErrNotClaimable, storage.ErrNotClaimable},
+		{"ErrVersionMismatch", beads.ErrVersionMismatch, storage.ErrVersionMismatch},
 		{"ErrSelfDependency", beads.ErrSelfDependency, domain.ErrSelfDependency},
 		{"ErrDependencyCycle", beads.ErrDependencyCycle, domain.ErrDependencyCycle},
+		{"ErrDependencySourceNotFound", beads.ErrDependencySourceNotFound, domain.ErrDependencySourceNotFound},
+		{"ErrDependencyTargetNotFound", beads.ErrDependencyTargetNotFound, domain.ErrDependencyTargetNotFound},
 		{"ErrFieldTooLong", beads.ErrFieldTooLong, types.ErrFieldTooLong},
 	}
 	for _, tc := range cases {
@@ -91,6 +144,91 @@ func TestReExportedSentinelCatchesRealProductionError(t *testing.T) {
 		&types.Dependency{IssueID: "a", DependsOnID: "b", Type: types.DepBlocks}, "tester")
 	if !errors.Is(cycleErr, beads.ErrDependencyCycle) {
 		t.Errorf("errors.Is(real cycle err, beads.ErrDependencyCycle) = false; err = %v", cycleErr)
+	}
+}
+
+// insertErrDepRepo returns preset errors from the two methods the domain
+// dependency use-case consults before its typed-conflict passthrough branches:
+// ValidateBlockingHierarchy (hierarchy conflict) and Insert (type conflict). Any
+// other call nil-panics through the embedded interface, keeping the stub honest
+// about the surface these branches touch.
+type insertErrDepRepo struct {
+	domain.DependencySQLRepository
+	hierarchyErr error
+	insertErr    error
+}
+
+func (r insertErrDepRepo) ValidateBlockingHierarchy(context.Context, *types.Dependency) error {
+	return r.hierarchyErr
+}
+
+func (r insertErrDepRepo) HasCycle(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+
+func (r insertErrDepRepo) Insert(context.Context, *types.Dependency, string, domain.DepInsertOpts) error {
+	return r.insertErr
+}
+
+// TestReExportedDependencyConflictTypes proves the public
+// beads.DependencyTypeConflictError and beads.DependencyHierarchyConflictError
+// aliases are the SAME struct types the engine returns: driving ACTUAL domain
+// use-case passthrough returns (the conflict is passed through unwrapped, the
+// property both write stacks now share), errors.As classifies each through the
+// public alias and reads its fields — no message parsing.
+func TestReExportedDependencyConflictTypes(t *testing.T) {
+	t.Parallel()
+
+	// Type conflict: a different-type edge already exists between the pair.
+	typeConflict := &domain.DependencyTypeConflictError{
+		IssueID: "a", DependsOnID: "b", ExistingType: "blocks", RequestedType: "related",
+	}
+	uc := domain.NewDependencyUseCase(insertErrDepRepo{insertErr: typeConflict})
+	err := uc.AddDependency(context.Background(),
+		&types.Dependency{IssueID: "a", DependsOnID: "b", Type: types.DepRelated}, "tester")
+	var gotType *beads.DependencyTypeConflictError
+	if !errors.As(err, &gotType) {
+		t.Fatalf("errors.As(real type-conflict err, *beads.DependencyTypeConflictError) = false; err = %v", err)
+	}
+	if gotType.IssueID != "a" || gotType.DependsOnID != "b" ||
+		gotType.ExistingType != "blocks" || gotType.RequestedType != "related" {
+		t.Errorf("extracted type-conflict fields = %+v, want {a b blocks related}", gotType)
+	}
+
+	// Hierarchy conflict: a blocking edge would gate an issue on its ancestor.
+	hierConflict := &domain.DependencyHierarchyConflictError{
+		IssueID: "child", BlockerID: "ancestor", BlockerIsAncestor: true,
+	}
+	uc = domain.NewDependencyUseCase(insertErrDepRepo{hierarchyErr: hierConflict})
+	err = uc.AddDependency(context.Background(),
+		&types.Dependency{IssueID: "child", DependsOnID: "ancestor", Type: types.DepBlocks}, "tester")
+	var gotHier *beads.DependencyHierarchyConflictError
+	if !errors.As(err, &gotHier) {
+		t.Fatalf("errors.As(real hierarchy-conflict err, *beads.DependencyHierarchyConflictError) = false; err = %v", err)
+	}
+	if gotHier.IssueID != "child" || gotHier.BlockerID != "ancestor" || !gotHier.BlockerIsAncestor {
+		t.Errorf("extracted hierarchy-conflict fields = %+v, want {child ancestor true}", gotHier)
+	}
+
+	// Endpoint miss: the target names no row this database holds. The domain
+	// use case passes it through unwrapped for the same reason the two
+	// conflicts above are passed through.
+	missing := &domain.DependencyEndpointNotFoundError{
+		IssueID: "a", DependsOnID: "ghost", MissingID: "ghost",
+		Err: domain.ErrDependencyTargetNotFound,
+	}
+	uc = domain.NewDependencyUseCase(insertErrDepRepo{insertErr: missing})
+	err = uc.AddDependency(context.Background(),
+		&types.Dependency{IssueID: "a", DependsOnID: "ghost", Type: types.DepBlocks}, "tester")
+	var gotMissing *beads.DependencyEndpointNotFoundError
+	if !errors.As(err, &gotMissing) {
+		t.Fatalf("errors.As(real endpoint-miss err, *beads.DependencyEndpointNotFoundError) = false; err = %v", err)
+	}
+	if !errors.Is(err, beads.ErrDependencyTargetNotFound) {
+		t.Errorf("errors.Is(real endpoint-miss err, beads.ErrDependencyTargetNotFound) = false; err = %v", err)
+	}
+	if gotMissing.IssueID != "a" || gotMissing.DependsOnID != "ghost" || gotMissing.MissingID != "ghost" {
+		t.Errorf("extracted endpoint-miss fields = %+v, want {a ghost ghost}", gotMissing)
 	}
 }
 

@@ -202,11 +202,12 @@ func TestRekeyAuxRowIDsSkipsWhenMarkerRecorded(t *testing.T) {
 	defer db.Close()
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion)
+		"version", auxRekeyPassInitial.markerVersion)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	// No further expectations: no table may be probed or scanned.
 
-	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1)
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
 	if err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
@@ -228,7 +229,8 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 	defer db.Close()
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion-1)
+		"version", auxRekeyPassInitial.markerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// Each of the four tables is probed; this mocked world has none of them,
@@ -238,7 +240,7 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 	}
 	expectClearAuxRekeySentinel(mock)
 
-	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1)
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
 	if err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
@@ -258,13 +260,13 @@ func expectAuxRekeyState(mock sqlmock.Sqlmock, resume bool, drifted ...string) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	rows := sqlmock.NewRows([]string{"key", "value"})
 	if resume {
-		rows.AddRow(auxRowRekeyInProgressKey, "1")
+		rows.AddRow(auxRekeyPassInitial.sentinelKey, "1")
 	}
 	if len(drifted) > 0 {
 		rows.AddRow(auxRowRekeyDriftedKey, strings.Join(drifted, ","))
 	}
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT `key`, value FROM local_metadata WHERE `key` IN (?, ?)")).
-		WithArgs(auxRowRekeyInProgressKey, auxRowRekeyDriftedKey).
+		WithArgs(auxRekeyPassInitial.sentinelKey, auxRowRekeyDriftedKey).
 		WillReturnRows(rows)
 }
 
@@ -288,13 +290,13 @@ func expectSetAuxRekeySentinel(mock sqlmock.Sqlmock) {
 	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, '1')")).
-		WithArgs(auxRowRekeyInProgressKey).
+		WithArgs(auxRekeyPassInitial.sentinelKey).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
 func expectClearAuxRekeySentinel(mock sqlmock.Sqlmock) {
 	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
-		WithArgs(auxRowRekeyInProgressKey).
+		WithArgs(auxRekeyPassInitial.sentinelKey).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -311,13 +313,14 @@ func TestRekeyAuxRowIDsSkipsConvergedLineage(t *testing.T) {
 	defer db.Close()
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion-1)
+		"version", auxRekeyPassInitial.markerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	// No further expectations: marker is pending, but the pre-pass main
 	// cursor at the watershed and no crash sentinel means no table may be
 	// probed or scanned.
 
-	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion)
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial)
 	if err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
@@ -343,7 +346,8 @@ func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
 	defer db.Close()
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion-1)
+		"version", auxRekeyPassInitial.markerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, true)
 	expectSetAuxRekeySentinel(mock)
 	for range auxRekeyTables {
@@ -353,7 +357,7 @@ func TestRekeyAuxRowIDsResumesAfterCrash(t *testing.T) {
 
 	// Pre-pass cursor at the watershed — the crashed pass already migrated
 	// main — yet the rewrite must run because the sentinel is pending.
-	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion); err != nil {
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial); err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -372,14 +376,15 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
 	defer db.Close()
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion-1)
+		"version", auxRekeyPassInitial.markerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// First table probe fails; no DELETE of the sentinel may follow.
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
 		WillReturnError(errors.New("boom"))
 
-	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1); err == nil {
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial); err == nil {
 		t.Fatal("expected the table failure to propagate")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

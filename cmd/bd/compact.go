@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -48,7 +49,7 @@ actively referenced. This is permanent graceful decay - original content is disc
 Modes:
   - Analyze: Export candidates for agent review (no API key needed)
   - Apply: Accept agent-provided summary (no API key needed)
-  - Auto: AI-powered compaction (requires ANTHROPIC_API_KEY or ai.api_key, legacy)
+  - Auto: AI-powered compaction (requires ANTHROPIC_API_KEY, MINIMAX_API_KEY, or ai.api_key)
   - Dolt: Run Dolt garbage collection (for Dolt-backend repositories)
 
 Tiers:
@@ -72,17 +73,21 @@ Examples:
   bd compact --apply --id bd-42 --summary summary.txt
   bd compact --apply --id bd-42 --summary - < summary.txt
 
-  # Legacy AI-powered workflow
+  # AI-powered workflow
   bd compact --auto --dry-run              # Preview candidates
   bd compact --auto --all                  # Compact all eligible issues
   bd compact --auto --id bd-42             # Compact specific issue
+  MINIMAX_API_KEY=... bd compact --auto --all
 
   # Statistics
   bd compact --stats                       # Show statistics
 `,
 	RunE: func(_ *cobra.Command, _ []string) error {
 		if usesProxiedServer() {
-			return HandleErrorRespectJSON("admin compact is not supported in proxied-server mode")
+			if compactDolt {
+				return runCompactDoltProxiedServer(rootCtx)
+			}
+			return HandleErrorRespectJSON("only 'compact --dolt' is supported in proxied-server mode")
 		}
 		// Block mutating operations in embedded mode; allow --stats, --analyze, --dry-run read-only paths.
 		if !compactStats && !compactAnalyze && !compactDryRun {
@@ -168,12 +173,9 @@ Examples:
 			}
 
 			// Direct mode
-			apiKey := os.Getenv("ANTHROPIC_API_KEY")
-			if apiKey == "" {
-				apiKey = config.GetString("ai.api_key")
-			}
+			apiKey, _ := config.ResolveAIAPIKey("")
 			if apiKey == "" && !compactDryRun {
-				return HandleError("--auto mode requires ANTHROPIC_API_KEY environment variable or ai.api_key in config")
+				return HandleError("--auto mode requires ANTHROPIC_API_KEY, MINIMAX_API_KEY, or ai.api_key in config")
 			}
 
 			compactCfg := &compact.Config{
@@ -807,10 +809,25 @@ func runCompactDolt() error {
 		fmt.Printf("Running Dolt garbage collection...\n")
 	}
 
-	// Run dolt gc
-	cmd := exec.Command("dolt", "gc") // #nosec G204 -- fixed command, no user input
+	// Run dolt gc without archive compression. Level 0 writes classic Snappy
+	// table files instead of zstd archives, matching the in-process GC paths.
+	// The external `dolt` on PATH has no version guarantee (unlike the
+	// in-process paths, which are pinned by go.mod), so an older dolt that
+	// predates --archive-level would otherwise abort compact where plain
+	// `dolt gc` used to work. Detect that specific unknown-flag rejection
+	// and retry with plain `dolt gc` rather than fail outright; any other
+	// error (a genuine GC failure) is not swallowed.
+	cmd := exec.Command("dolt", "gc", "--archive-level", "0") // #nosec G204 -- fixed command, no user input
 	cmd.Dir = doltPath
 	output, err := cmd.CombinedOutput()
+	if err != nil && isUnknownArchiveLevelFlagError(string(output)) {
+		if !jsonOutput {
+			fmt.Fprintf(os.Stderr, "Notice: external dolt does not support --archive-level; falling back to plain 'dolt gc' (new table files may still use zstd archives)\n")
+		}
+		fallbackCmd := exec.Command("dolt", "gc") // #nosec G204 -- fixed command, no user input
+		fallbackCmd.Dir = doltPath
+		output, err = fallbackCmd.CombinedOutput()
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: dolt gc failed: %v\n", err)
 		if len(output) > 0 {
@@ -852,6 +869,29 @@ func runCompactDolt() error {
 	fmt.Printf("  %s → %s (freed %s)\n", formatBytes(sizeBefore), formatBytes(sizeAfter), formatBytes(freed))
 	fmt.Printf("  Time: %v\n", elapsed)
 	return nil
+}
+
+// isUnknownArchiveLevelFlagError reports whether output (the combined
+// stdout+stderr of `dolt gc --archive-level 0`) indicates the external dolt
+// binary rejected --archive-level as an unrecognized flag, rather than a
+// genuine GC failure. Older Dolt releases that predate the flag report this
+// via the pinned dolt module's argparser, e.g.:
+//
+//	error: unknown option `archive-level'
+//
+// (see libraries/utils/argparser/errors.go in the pinned dolthub/dolt/go
+// module). The check requires both an "unknown flag" phrasing AND the flag
+// name to appear in the output, so a real GC failure that happens to
+// contain the word "unknown" elsewhere is never misclassified as a missing
+// flag and silently swallowed — genuine failures continue to fail.
+func isUnknownArchiveLevelFlagError(output string) bool {
+	lower := strings.ToLower(output)
+	if !strings.Contains(lower, "archive-level") && !strings.Contains(lower, "archive_level") {
+		return false
+	}
+	return strings.Contains(lower, "unknown option") ||
+		strings.Contains(lower, "unknown flag") ||
+		strings.Contains(lower, "flag provided but not defined")
 }
 
 // getDirSize calculates the total size of a directory recursively
@@ -915,7 +955,7 @@ func init() {
 	// New mode flags
 	compactCmd.Flags().BoolVar(&compactAnalyze, "analyze", false, "Analyze mode: export candidates for agent review")
 	compactCmd.Flags().BoolVar(&compactApply, "apply", false, "Apply mode: accept agent-provided summary")
-	compactCmd.Flags().BoolVar(&compactAuto, "auto", false, "Auto mode: AI-powered compaction (legacy)")
+	compactCmd.Flags().BoolVar(&compactAuto, "auto", false, "Auto mode: AI-powered compaction")
 	compactCmd.Flags().StringVar(&compactSummary, "summary", "", "Path to summary file (use '-' for stdin)")
 	compactCmd.Flags().StringVar(&compactActor, "actor", "agent", "Actor name for audit trail")
 	compactCmd.Flags().IntVar(&compactLimit, "limit", 0, "Limit number of candidates (0 = no limit)")

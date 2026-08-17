@@ -93,7 +93,8 @@ func TestRekeyAuxRowIDsSkipsDriftedTable(t *testing.T) {
 	logged := captureLog(t)
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion-1)
+		"version", auxRekeyPassInitial.markerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	// events carries the drift: its scan panics server-side.
@@ -106,7 +107,7 @@ func TestRekeyAuxRowIDsSkipsDriftedTable(t *testing.T) {
 	expectSetAuxRekeyDrifted(mock, "events")
 	expectClearAuxRekeySentinel(mock)
 
-	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1); err != nil {
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial); err != nil {
 		t.Fatalf("drift must not abort the pass: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -133,7 +134,8 @@ func TestRekeyAuxRowIDsSkipsDriftDuringRewrite(t *testing.T) {
 	captureLog(t)
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion-1)
+		"version", auxRekeyPassInitial.markerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	expectColumnExists(mock, true)
@@ -152,7 +154,7 @@ func TestRekeyAuxRowIDsSkipsDriftDuringRewrite(t *testing.T) {
 	expectSetAuxRekeyDrifted(mock, "events")
 	expectClearAuxRekeySentinel(mock)
 
-	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1)
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial)
 	if err != nil {
 		t.Fatalf("drift mid-rewrite must not abort the pass: %v", err)
 	}
@@ -176,13 +178,14 @@ func TestRekeyAuxRowIDsAbortsOnNonDriftError(t *testing.T) {
 	captureLog(t)
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion-1)
+		"version", auxRekeyPassInitial.markerVersion-1)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false)
 	expectSetAuxRekeySentinel(mock)
 	expectColumnExists(mock, true)
 	expectEventsSelect(mock).WillReturnError(errors.New("Error 1062 (23000): duplicate entry"))
 
-	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion-1); err == nil {
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial); err == nil {
 		t.Fatal("expected a non-drift table failure to propagate")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -210,7 +213,8 @@ func TestRekeyAuxRowIDsResumesDriftedTableOnly(t *testing.T) {
 
 	// Marker recorded, no crash sentinel — the post-skip steady state.
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion)
+		"version", auxRekeyPassInitial.markerVersion)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false, "events")
 	expectSetAuxRekeySentinel(mock)
 	// Exactly one table probe: any second one is an unexpected call, which is
@@ -221,7 +225,7 @@ func TestRekeyAuxRowIDsResumesDriftedTableOnly(t *testing.T) {
 
 	// Pre-pass cursor past the watershed too, so the drift record is overriding
 	// both the marker gate and the fresh-clone gate.
-	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion)
+	wrote, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial)
 	if err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
@@ -249,15 +253,16 @@ func TestRekeyAuxRowIDsResumeStaysScopedAfterCrash(t *testing.T) {
 	captureLog(t)
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion)
+		"version", auxRekeyPassInitial.markerVersion)
 	// Marker recorded AND sentinel set: a drift-resume that died partway.
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, true, "events")
 	expectSetAuxRekeySentinel(mock)
 	expectColumnExists(mock, false)
 	expectClearAuxRekeyDrifted(mock)
 	expectClearAuxRekeySentinel(mock)
 
-	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion); err != nil {
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial); err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -277,7 +282,8 @@ func TestRekeyAuxRowIDsKeepsDriftRecordWhileUnrepaired(t *testing.T) {
 	captureLog(t)
 
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
-		"version", auxRowRekeyMarkerVersion)
+		"version", auxRekeyPassInitial.markerVersion)
+	expectIgnoredSentinelProbes(mock, true)
 	expectAuxRekeyState(mock, false, "events")
 	expectSetAuxRekeySentinel(mock)
 	expectColumnExists(mock, true)
@@ -285,7 +291,7 @@ func TestRekeyAuxRowIDsKeepsDriftRecordWhileUnrepaired(t *testing.T) {
 	expectSetAuxRekeyDrifted(mock, "events")
 	expectClearAuxRekeySentinel(mock)
 
-	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRowRekeyShippedMainVersion); err != nil {
+	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion, auxRekeyPassInitial); err != nil {
 		t.Fatalf("rekeyAuxRowIDs: %v", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

@@ -43,7 +43,7 @@ Examples:
 	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		if usesProxiedServer() {
-			return HandleErrorRespectJSON("gc is not supported in proxied-server mode")
+			return runGCProxiedServer(rootCtx)
 		}
 		evt := metrics.NewCommandEvent("gc")
 		defer func() {
@@ -79,9 +79,13 @@ Examples:
 			cutoffDays := gcOlderThan
 			cutoffTime := time.Now().UTC().AddDate(0, 0, -cutoffDays)
 			statusClosed := types.StatusClosed
+			// gc is a scripted internal sweep — opt out of BEADS_MAX_ROWS
+			// (designer §4.1) so a misconfigured env doesn't abort the sweep.
 			filter := types.IssueFilter{
-				Status:       &statusClosed,
-				ClosedBefore: &cutoffTime,
+				Status:        &statusClosed,
+				ClosedBefore:  &cutoffTime,
+				MaxRows:       0,
+				MaxRowsSource: "",
 			}
 
 			closedIssues, err := store.SearchIssues(ctx, "", filter)
@@ -194,13 +198,13 @@ Examples:
 				// refs are left alone here (they cache the remote tip for the
 				// migrate gate); flatten/compact prune them before their GC
 				// (bd-agctw). Sizes are reported so a no-op reclaim is visible.
-				sizeBefore := storeSizeBytes()
+				sizeBefore := storeSizeBytes(ctx)
 				remoteRefs, tags := listRemoteRefsAndTags(ctx)
 				if err := gc.DoltGC(ctx); err != nil {
 					WarnError("dolt gc failed: %v", err)
 					results = append(results, phaseResult{name: "Dolt GC", detail: "failed"})
 				} else {
-					sizeAfter := storeSizeBytes()
+					sizeAfter := storeSizeBytes(ctx)
 					detail := "complete"
 					if line := gcSizeLine(sizeBefore, sizeAfter); line != "" {
 						detail = "complete: " + line

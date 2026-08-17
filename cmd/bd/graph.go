@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -74,7 +76,14 @@ Examples:
   bd graph --html issue-id > graph.html  # Interactive browser view
   bd graph --all --html > all.html       # All issues, interactive
   bd graph --open issue-id       # Open issues only, layered by blocking order
-  bd graph --all --open          # All open issues, compact layers`,
+  bd graph --all --open          # All open issues, compact layers
+
+--max-rows / BEADS_MAX_ROWS caveat: the cap is checked differently per mode.
+Single-issue graphs (no --all) check the connected-component node count
+after the BFS traversal completes — the whole subgraph is always walked
+first, then rejected if it's over cap. --all checks each status
+(open/in_progress/blocked) independently, so up to 3x the cap can be loaded
+in total before any individual status trips it.`,
 	Args:          cobra.RangeArgs(0, 1),
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -93,8 +102,12 @@ Examples:
 			return HandleErrorWithHintRespectJSON("issue ID required", "Use --all for all open issues")
 		}
 
+		out := cmd.OutOrStdout()
 		if usesProxiedServer() {
-			return runGraphProxiedServer(rootCtx, args)
+			if err := rejectMaxRowsUnderProxiedServer(cmd); err != nil {
+				return err
+			}
+			return runGraphProxiedServer(rootCtx, out, args)
 		}
 
 		ctx := rootCtx
@@ -103,11 +116,18 @@ Examples:
 		}
 
 		if graphAll {
-			subgraphs, err := loadAllGraphSubgraphs(ctx, store)
+			maxRows, maxRowsSource, err := resolveMaxRows(cmd)
 			if err != nil {
+				return err
+			}
+			subgraphs, err := loadAllGraphSubgraphs(ctx, store, maxRows, maxRowsSource)
+			if err != nil {
+				if capErr := handleMaxRowsError(err); capErr != nil {
+					return capErr
+				}
 				return HandleErrorRespectJSON("loading all issues: %v", err)
 			}
-			return renderGraphAllSubgraphs(subgraphs)
+			return renderGraphAllSubgraphs(out, subgraphs)
 		}
 
 		issueID, err := utils.ResolvePartialID(ctx, store, args[0])
@@ -119,11 +139,37 @@ Examples:
 		if err != nil {
 			return HandleErrorRespectJSON("loading graph: %v", err)
 		}
-		return renderGraphSingleSubgraph(subgraph)
+
+		// Apply the defensive row cap (be-x42v) on the connected-component
+		// node count. loadGraphSubgraph is a BFS over GetDependents/
+		// GetDependencies (per-ID lookups, no IssueFilter to thread MaxRows
+		// through), so — like `bd dep tree` — the cap is checked post-hoc
+		// against the final node set rather than during traversal.
+		graphMaxRows, graphMaxRowsSource, err := resolveMaxRows(cmd)
+		if err != nil {
+			return err
+		}
+		if graphMaxRows > 0 && len(subgraph.Issues) > graphMaxRows {
+			if capErr := handleMaxRowsError(&issueops.ErrTooManyRows{
+				Found:  len(subgraph.Issues),
+				Cap:    graphMaxRows,
+				Source: graphMaxRowsSource,
+			}); capErr != nil {
+				return capErr
+			}
+		}
+
+		return renderGraphSingleSubgraph(out, subgraph)
 	},
 }
 
-func renderGraphAllSubgraphs(subgraphs []*TemplateSubgraph) error {
+func writeGraphLine(out io.Writer, value string) error {
+	w := &graphExportWriter{out: out}
+	w.println(value)
+	return w.wrapError("graph")
+}
+
+func renderGraphAllSubgraphs(out io.Writer, subgraphs []*TemplateSubgraph) error {
 	if graphOpen {
 		var filtered []*TemplateSubgraph
 		for _, sg := range subgraphs {
@@ -136,8 +182,7 @@ func renderGraphAllSubgraphs(subgraphs []*TemplateSubgraph) error {
 	}
 
 	if len(subgraphs) == 0 {
-		fmt.Println("No open issues found")
-		return nil
+		return writeGraphLine(out, "No open issues found")
 	}
 
 	if jsonOutput {
@@ -147,8 +192,7 @@ func renderGraphAllSubgraphs(subgraphs []*TemplateSubgraph) error {
 	if graphHTML && !graphOpen {
 		merged := mergeSubgraphsForHTML(subgraphs)
 		layout := computeLayout(merged)
-		renderGraphHTML(layout, merged)
-		return nil
+		return renderGraphHTML(out, layout, merged)
 	}
 
 	if graphOpen {
@@ -156,7 +200,9 @@ func renderGraphAllSubgraphs(subgraphs []*TemplateSubgraph) error {
 			layout := computeLayout(subgraph)
 			renderGraphCompact(layout, subgraph)
 			if i < len(subgraphs)-1 {
-				fmt.Println(strings.Repeat("─", 60))
+				if err := writeGraphLine(out, strings.Repeat("─", 60)); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -165,7 +211,9 @@ func renderGraphAllSubgraphs(subgraphs []*TemplateSubgraph) error {
 	for i, subgraph := range subgraphs {
 		layout := computeLayout(subgraph)
 		if graphDOT {
-			renderGraphDOT(layout, subgraph)
+			if err := renderGraphDOT(out, layout, subgraph); err != nil {
+				return err
+			}
 		} else if graphCompact {
 			renderGraphCompact(layout, subgraph)
 		} else if graphBox {
@@ -174,18 +222,19 @@ func renderGraphAllSubgraphs(subgraphs []*TemplateSubgraph) error {
 			renderGraphVisual(layout, subgraph)
 		}
 		if !graphDOT && i < len(subgraphs)-1 {
-			fmt.Println(strings.Repeat("─", 60))
+			if err := writeGraphLine(out, strings.Repeat("─", 60)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-func renderGraphSingleSubgraph(subgraph *TemplateSubgraph) error {
+func renderGraphSingleSubgraph(out io.Writer, subgraph *TemplateSubgraph) error {
 	if graphOpen {
 		subgraph = filterSubgraphOpen(subgraph)
 		if subgraph == nil || len(subgraph.Issues) == 0 {
-			fmt.Println("No open issues in subgraph")
-			return nil
+			return writeGraphLine(out, "No open issues in subgraph")
 		}
 	}
 
@@ -205,9 +254,9 @@ func renderGraphSingleSubgraph(subgraph *TemplateSubgraph) error {
 	}
 
 	if graphDOT {
-		renderGraphDOT(layout, subgraph)
+		return renderGraphDOT(out, layout, subgraph)
 	} else if graphHTML {
-		renderGraphHTML(layout, subgraph)
+		return renderGraphHTML(out, layout, subgraph)
 	} else if graphCompact {
 		renderGraphCompact(layout, subgraph)
 	} else if graphBox {
@@ -311,6 +360,8 @@ func init() {
 	graphCmd.Flags().BoolVar(&graphDOT, "dot", false, "Output Graphviz DOT format (pipe to: dot -Tsvg > graph.svg)")
 	graphCmd.Flags().BoolVar(&graphHTML, "html", false, "Output self-contained interactive HTML (redirect to file)")
 	graphCmd.Flags().BoolVar(&graphOpen, "open", false, "Show only open issues (filters out closed/deferred), forces compact layer format")
+	// Defensive row cap (be-x42v): exits 2 on overage, default disabled.
+	addMaxRowsFlag(graphCmd)
 	graphCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(graphCmd)
 	graphCmd.AddCommand(graphCheckCmd)
@@ -418,8 +469,10 @@ func loadGraphSubgraph(ctx context.Context, s storage.DoltStorage, issueID strin
 }
 
 // loadAllGraphSubgraphs loads all open issues and groups them by connected component
-// Each component is a subgraph of issues that share dependencies
-func loadAllGraphSubgraphs(ctx context.Context, s storage.DoltStorage) ([]*TemplateSubgraph, error) {
+// Each component is a subgraph of issues that share dependencies. The defensive
+// row cap (be-x42v) is propagated to each per-status SearchIssues call so any
+// single status that exceeds the cap returns the typed error directly.
+func loadAllGraphSubgraphs(ctx context.Context, s storage.DoltStorage, maxRows int, maxRowsSource string) ([]*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -430,7 +483,9 @@ func loadAllGraphSubgraphs(ctx context.Context, s storage.DoltStorage) ([]*Templ
 	for _, status := range []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked} {
 		statusCopy := status
 		issues, err := s.SearchIssues(ctx, "", types.IssueFilter{
-			Status: &statusCopy,
+			Status:        &statusCopy,
+			MaxRows:       maxRows,
+			MaxRowsSource: maxRowsSource,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to search issues: %w", err)
@@ -1076,7 +1131,7 @@ func formatCompactNode(node *GraphNode) string {
 	// Use shared status icon with semantic color
 	statusIcon := ui.RenderStatusIcon(status)
 
-	// Priority with icon
+	// Priority with semantic color (P-label only)
 	priorityTag := ui.RenderPriority(node.Issue.Priority)
 
 	// Title - truncate if too long
@@ -1088,7 +1143,7 @@ func formatCompactNode(node *GraphNode) string {
 		return fmt.Sprintf("%s %s %s %s",
 			statusIcon,
 			style.Render(node.Issue.ID),
-			style.Render(fmt.Sprintf("● P%d", node.Issue.Priority)),
+			style.Render(fmt.Sprintf("P%d", node.Issue.Priority)),
 			style.Render(title))
 	}
 
