@@ -92,6 +92,7 @@ func TestRekeyAuxRowIDsSkipsDriftedTable(t *testing.T) {
 	defer db.Close()
 	logged := captureLog(t)
 
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion-1)
 	expectIgnoredSentinelProbes(mock, true)
@@ -133,6 +134,7 @@ func TestRekeyAuxRowIDsSkipsDriftDuringRewrite(t *testing.T) {
 	defer db.Close()
 	captureLog(t)
 
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion-1)
 	expectIgnoredSentinelProbes(mock, true)
@@ -177,6 +179,7 @@ func TestRekeyAuxRowIDsAbortsOnNonDriftError(t *testing.T) {
 	defer db.Close()
 	captureLog(t)
 
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion-1)
 	expectIgnoredSentinelProbes(mock, true)
@@ -212,6 +215,7 @@ func TestRekeyAuxRowIDsResumesDriftedTableOnly(t *testing.T) {
 	captureLog(t)
 
 	// Marker recorded, no crash sentinel — the post-skip steady state.
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion)
 	expectIgnoredSentinelProbes(mock, true)
@@ -252,6 +256,7 @@ func TestRekeyAuxRowIDsResumeStaysScopedAfterCrash(t *testing.T) {
 	defer db.Close()
 	captureLog(t)
 
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion)
 	// Marker recorded AND sentinel set: a drift-resume that died partway.
@@ -281,6 +286,7 @@ func TestRekeyAuxRowIDsKeepsDriftRecordWhileUnrepaired(t *testing.T) {
 	defer db.Close()
 	captureLog(t)
 
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
 		"version", auxRekeyPassInitial.markerVersion)
 	expectIgnoredSentinelProbes(mock, true)
