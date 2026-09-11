@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/storage/schema"
 )
@@ -75,6 +76,22 @@ func checkForkMigrationLineageEmbedded(ctx context.Context, beadsDir string) (Do
 	return checkForkMigrationLineage(ctx, db), true
 }
 
+// forkLineageStoreHasServer reports whether the store at beadsDir has a
+// server for checkForkMigrationLineageServer to ask. The first leg is the
+// storage-mode predicate SharedStore itself used to decide whether this
+// store had a server to open (configfile.IsDoltServerMode: an empty
+// dolt_mode on a localhost host reads embedded), not the lifecycle resolver
+// (doltserver.ResolveServerMode reads that same empty mode as Owned), so
+// this fallback and the open it stands in for cannot disagree (Fable read
+// r1, gp-w0nu). The second leg is shared-server intent, which the storage
+// predicate reads only from BEADS_DOLT_SHARED_SERVER while bd's own open
+// path (doltserver.IsSharedServerMode) also honors config.yaml
+// dolt.shared-server; without it a YAML shared-server store with no local
+// database directory lost the diagnostic (codex round 2, gp-0i4o).
+func forkLineageStoreHasServer(beadsDir string) bool {
+	return !sharedStoreNeedsLocalDoltDir(beadsDir) || doltserver.IsSharedServerMode()
+}
+
 func checkForkMigrationLineageServer(ctx context.Context, beadsDir string) (DoctorCheck, bool) {
 	if beadsDir == "" || !IsDoltBackend(beadsDir) {
 		return DoctorCheck{}, false
@@ -83,14 +100,8 @@ func checkForkMigrationLineageServer(ctx context.Context, beadsDir string) (Doct
 	// is also true for an embedded configuration; an embedded checkout with
 	// no embeddeddolt directory yet (the Embedded probe above declined) must
 	// not have some other database's lineage reported as its own over a
-	// retained server endpoint (codex gate r1, gp-w0nu). The predicate is
-	// the storage-mode one SharedStore itself used to decide whether this
-	// store had a server to open (configfile.IsDoltServerMode: an empty
-	// dolt_mode on a localhost host reads embedded), not the lifecycle
-	// resolver (doltserver.ResolveServerMode reads that same empty mode as
-	// Owned), so this fallback and the open it stands in for cannot
-	// disagree (Fable read r1, gp-w0nu).
-	if sharedStoreNeedsLocalDoltDir(beadsDir) {
+	// retained server endpoint (codex gate r1, gp-w0nu).
+	if !forkLineageStoreHasServer(beadsDir) {
 		return DoctorCheck{}, false
 	}
 	conn, err := openDoltConn(beadsDir)
