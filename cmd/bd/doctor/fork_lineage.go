@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/storage/schema"
 )
@@ -77,6 +78,14 @@ func checkForkMigrationLineageEmbedded(ctx context.Context, beadsDir string) (Do
 
 func checkForkMigrationLineageServer(ctx context.Context, beadsDir string) (DoctorCheck, bool) {
 	if beadsDir == "" || !IsDoltBackend(beadsDir) {
+		return DoctorCheck{}, false
+	}
+	// Only a store that is effectively in server mode has a server to ask.
+	// IsDoltBackend is also true for an embedded configuration; an embedded
+	// checkout with no embeddeddolt directory yet (the Embedded probe above
+	// declined) must not have some other database's lineage reported as
+	// its own over a retained server endpoint (codex gate r1, gp-w0nu).
+	if doltserver.ResolveServerMode(beadsDir) == doltserver.ServerModeEmbedded {
 		return DoctorCheck{}, false
 	}
 	conn, err := openDoltConn(beadsDir)
