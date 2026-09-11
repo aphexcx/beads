@@ -35,9 +35,6 @@ import (
 func startScratchDoltServer(t *testing.T) int {
 	t.Helper()
 	testutil.RequireDoltBinary(t)
-	if testing.Short() {
-		t.Skip("skipping dolt sql-server test in -short mode")
-	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -383,7 +380,11 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 // uncommitted: dolt_status read "schema_migrations: modified, dolt_ignore:
 // modified", HEAD was intact, and bd 1.1.2 then misread the store as "row 54
 // but MAX=55" until DOLT_CHECKOUT('schema_migrations'). Now the refusal
-// leaves dolt_status exactly as it was found.
+// leaves dolt_status exactly as it was found: the plan runs before the pass
+// writes anything, so a refused pass neither seeds dolt_ignore, nor resets a
+// table the operator had staged (round 2: codex gate r1 found the previous
+// order ran unstagePreExistingTables before the plan), nor deletes a cursor
+// row.
 func TestForkReconcile_RefusalLeavesWorkingSetAsFoundOnSQLServer(t *testing.T) {
 	port := startScratchDoltServer(t)
 	ctx := context.Background()
@@ -402,12 +403,23 @@ func TestForkReconcile_RefusalLeavesWorkingSetAsFoundOnSQLServer(t *testing.T) {
 		t.Fatalf("unseed dolt_ignore: %v", err)
 	}
 	commitAll(t, ctx, conn, "fixture: under-seeded dolt_ignore")
+	// An operator's own staged table (a DOLT_ADD before the roll). MigrateUp
+	// unstages pre-existing staged tables before its seed commit; the plan
+	// now runs before that DOLT_RESET, so a refusal must leave the table
+	// staged exactly as found.
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE operator_scratch (id INT PRIMARY KEY)"); err != nil {
+		t.Fatalf("create operator_scratch: %v", err)
+	}
+	if err := DrainCall(ctx, conn, "CALL DOLT_ADD(?)", "operator_scratch"); err != nil {
+		t.Fatalf("stage operator_scratch: %v", err)
+	}
 
 	mainBefore := cursorVersions(t, ctx, conn, mainSource.cursorTable)
 	ignoredBefore := cursorVersions(t, ctx, conn, ignoredSource.cursorTable)
 	statusBefore := doltStatusRows(t, ctx, conn)
-	if dirty, err := dirtyTables(ctx, conn, true); err != nil || len(dirty) != 0 {
-		t.Fatalf("fixture must start with a clean committable working set, got %v (%v)", dirty, err)
+	const stagedRow = "operator_scratch:true:new table"
+	if len(statusBefore) != 1 || statusBefore[0] != stagedRow {
+		t.Fatalf("fixture dolt_status = %v, want exactly [%s] (the operator's staged table and nothing else)", statusBefore, stagedRow)
 	}
 
 	_, err := MigrateUp(ctx, conn)
@@ -425,15 +437,24 @@ func TestForkReconcile_RefusalLeavesWorkingSetAsFoundOnSQLServer(t *testing.T) {
 	if got := doltStatusRows(t, ctx, conn); fmt.Sprint(got) != fmt.Sprint(statusBefore) {
 		t.Fatalf("dolt_status after the refusal = %v, want exactly as found %v", got, statusBefore)
 	}
-	// The seed did its work and committed it: the pattern is back at HEAD,
-	// not sitting in the working set.
-	var seeded int
-	if err := conn.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM dolt_ignore AS OF 'HEAD' WHERE pattern = 'bd_events_journal'").Scan(&seeded); err != nil {
-		t.Fatalf("reading dolt_ignore AS OF HEAD: %v", err)
+	// Spelled out: the operator's table is still staged (no DOLT_RESET ran)
+	// and dolt_ignore is not dirty (the seed never ran).
+	if got := doltStatusRows(t, ctx, conn); len(got) != 1 || got[0] != stagedRow {
+		t.Fatalf("dolt_status after the refusal = %v, want the operator's table still staged [%s]", got, stagedRow)
 	}
-	if seeded != 1 {
-		t.Fatalf("dolt_ignore AS OF HEAD has %d bd_events_journal rows, want 1 (seed committed before the reconcile)", seeded)
+	// A refused pass seeds nothing and commits nothing: the under-seeded
+	// pattern is neither in the working set nor at HEAD.
+	for _, q := range []struct{ where, sql string }{
+		{"working set", "SELECT COUNT(*) FROM dolt_ignore WHERE pattern = 'bd_events_journal'"},
+		{"HEAD", "SELECT COUNT(*) FROM dolt_ignore AS OF 'HEAD' WHERE pattern = 'bd_events_journal'"},
+	} {
+		var seeded int
+		if err := conn.QueryRowContext(ctx, q.sql).Scan(&seeded); err != nil {
+			t.Fatalf("reading dolt_ignore (%s): %v", q.where, err)
+		}
+		if seeded != 0 {
+			t.Fatalf("dolt_ignore (%s) has %d bd_events_journal rows after the refusal, want 0 (a refused pass seeds nothing)", q.where, seeded)
+		}
 	}
 
 	// The previous binary's view: a fresh session still sees MAX(version)=73

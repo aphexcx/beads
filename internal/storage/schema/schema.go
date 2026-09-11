@@ -562,19 +562,43 @@ func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
 }
 
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
-	// Re-assert the canonical dolt_ignore patterns before anything else, and
-	// in particular before the migrationWorkNeeded short-circuit: a database
-	// whose migration cursors arrived at-latest without executing the seeding
-	// migrations (out-of-band table copy) reports no work needed and
-	// would otherwise never be healed.
-	seedChanged, err := seedDoltIgnorePatterns(ctx, db)
-	if err != nil {
-		return 0, err
-	}
-
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("checking schema migration work: %w", err)
+	}
+
+	// bd-dn6: databases migrated by a pre-merge fork binary recorded the
+	// fork's migrations under numbers upstream now owns (main 51-54, ignored
+	// 10-11), and the 2026-08 upmerge left the same shape at main 70-73 /
+	// ignored 20-22. Those cursor rows are rewritten to the renumbered scheme
+	// before pending versions are computed, so this pass applies upstream's
+	// same-numbered migrations instead of silently skipping them.
+	//
+	// The rewrites are PLANNED here, before the pass writes anything: the
+	// planning half only reads (fingerprint rows, schema probes, content
+	// hashes), and its refuse-to-rewrite guard must leave the working set
+	// exactly as found. Planned any later, a refusal would already have
+	// dirtied dolt_ignore through the seed below, or DOLT_RESET a table the
+	// operator had staged (unstagePreExistingTables), while claiming the
+	// working set was left as found (codex gate r1 on gp-w0nu). The plan
+	// needs nothing the seed writes. The rewrites are applied after the seed
+	// commit, below.
+	var forkRewrites []cursorRewrite
+	if needed {
+		forkRewrites, err = planForkLineageCursors(ctx, db)
+		if err != nil {
+			return 0, fmt.Errorf("reconciling fork-lineage migration cursors: %w", err)
+		}
+	}
+
+	// Re-assert the canonical dolt_ignore patterns whether or not migration
+	// work is needed: a database whose migration cursors arrived at-latest
+	// without executing the seeding migrations (out-of-band table copy)
+	// reports no work needed and would otherwise never be healed. It is the
+	// first write of the pass, after the read-only plan above.
+	seedChanged, err := seedDoltIgnorePatterns(ctx, db)
+	if err != nil {
+		return 0, err
 	}
 	if !needed {
 		// No migration pass will run, so nothing downstream commits the seed:
@@ -610,29 +634,23 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// scoped and labeled now, after pre-existing staged tables were unstaged
 	// (so nothing else rides into the commit) and before the first step runs.
 	//
-	// It is also committed BEFORE the fork-lineage reconciliation below. That
-	// pass can refuse (its refuse-to-rewrite guard), and a refusal must leave
-	// dolt_status exactly as it was found: a seed row still sitting in the
-	// working set read as "dolt_ignore: modified" beside the debris of the
-	// refused pass (boomtown, 2026-09-11, gp-w0nu).
+	// It is also committed BEFORE the fork-lineage rewrites are applied
+	// below, so the seed rows never sit uncommitted beside a cursor DELETE
+	// (boomtown, 2026-09-11, gp-w0nu, read the refused pass's debris as
+	// "dolt_ignore: modified" beside "schema_migrations: modified").
 	if seedChanged {
 		if err := commitSeededDoltIgnore(ctx, db); err != nil {
 			return 0, err
 		}
 	}
 
-	// bd-dn6: databases migrated by a pre-merge fork binary recorded the
-	// fork's migrations under numbers upstream now owns (main 51-54, ignored
-	// 10-11), and the 2026-08 upmerge left the same shape at main 70-73 /
-	// ignored 20-22. Rewrite those cursor rows to the renumbered scheme BEFORE
-	// pending versions are computed, so this pass applies upstream's
-	// same-numbered migrations instead of silently skipping them. Every chain
-	// is verified before anything is deleted, so a refusal leaves the working
-	// set as found. The DELETEs only touch the cursor tables (exempt from the
+	// Apply the fork-lineage cursor rewrites planned above (every chain was
+	// verified before this point, so nothing is deleted unless all of them
+	// verified). The DELETEs only touch the cursor tables (exempt from the
 	// dirty-table guards) and are committed with the rest of the pass; a
 	// crash before the commit is harmless because detection re-probes actual
 	// schema state.
-	if _, err := reconcileForkLineageCursors(ctx, db); err != nil {
+	if _, err := applyForkLineageRewrites(ctx, db, forkRewrites); err != nil {
 		return 0, fmt.Errorf("reconciling fork-lineage migration cursors: %w", err)
 	}
 

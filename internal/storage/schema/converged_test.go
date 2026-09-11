@@ -774,7 +774,10 @@ func TestMigrateUpWithLockLogsAnUnavailableFastPath(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
-	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO dolt_ignore VALUES (?, true)")).
+	// MigrateUp's first non-degrading statement is the fork-lineage plan's
+	// fingerprint probe (gp-w0nu round 2); failing it stops the locked path.
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")).
+		WithArgs(54).
 		WillReturnError(errors.New("stop here"))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
 		WithArgs(lockName).

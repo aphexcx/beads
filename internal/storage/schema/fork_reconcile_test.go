@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
@@ -636,14 +637,56 @@ func TestPlanForkLineageRewrites_RefusalIssuesNoWrite(t *testing.T) {
 	expectMaxVersion(mock, "ignored_schema_migrations", 22)
 	expectTableProbe(mock, "linear_issue_snapshots", false) // recorded but absent
 
-	_, err = reconcileForkLineageCursors(context.Background(), db)
+	_, err = planForkLineageCursors(context.Background(), db)
 	if err == nil {
-		t.Fatal("reconcileForkLineageCursors succeeded, want the ignored-chain refusal")
+		t.Fatal("planForkLineageCursors succeeded, want the ignored-chain refusal")
 	}
 	for _, want := range []string{"linear_issue_snapshots", "refusing to rewrite", "working set was left as found"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("err = %q, want it to contain %q", err, want)
 		}
+	}
+	if !errors.Is(err, errRefusedRewrite) {
+		t.Fatalf("err = %q does not wrap errRefusedRewrite", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPlanForkLineageCursors_TransientErrorIsNotWordedAsRefusal: a SQL error
+// on a plan probe is not a refusal. The plan issues no write, so the working
+// set IS as found, but the caller must not dress a transient failure in the
+// refusal's wording (an operator reads "refused ... repair manually" as a
+// verdict on the store); it says only that no cursor row was rewritten
+// (Fable read r1 on gp-w0nu).
+func TestPlanForkLineageCursors_TransientErrorIsNotWordedAsRefusal(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM schema_migrations WHERE version = \?`).
+		WithArgs(54).
+		WillReturnError(errors.New("connection reset"))
+
+	_, err = planForkLineageCursors(context.Background(), db)
+	if err == nil {
+		t.Fatal("planForkLineageCursors succeeded, want the injected probe failure")
+	}
+	for _, want := range []string{"connection reset", "no cursor row was rewritten"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %q, want it to contain %q", err, want)
+		}
+	}
+	for _, forbidden := range []string{"refusing to rewrite", "working set was left as found"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("err = %q wears the refusal's wording %q on a transient error", err, forbidden)
+		}
+	}
+	if errors.Is(err, errRefusedRewrite) {
+		t.Fatalf("err = %q wraps errRefusedRewrite, want a plain probe error", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
@@ -674,9 +717,13 @@ func TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified(t *testing.T) {
 	expectCursorRewrite(mock, "schema_migrations", 70, 73)
 	expectCursorRewrite(mock, "ignored_schema_migrations", 20, 22)
 
-	changed, err := reconcileForkLineageCursors(context.Background(), db)
+	rewrites, err := planForkLineageCursors(context.Background(), db)
 	if err != nil {
-		t.Fatalf("reconcileForkLineageCursors: %v", err)
+		t.Fatalf("planForkLineageCursors: %v", err)
+	}
+	changed, err := applyForkLineageRewrites(context.Background(), db, rewrites)
+	if err != nil {
+		t.Fatalf("applyForkLineageRewrites: %v", err)
 	}
 	if !changed {
 		t.Fatal("changed = false, want true after both upmerge rewrites")
