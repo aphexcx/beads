@@ -62,32 +62,36 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	}
 	defer db.Close()
 
-	// MigrateUp re-asserts the canonical dolt_ignore patterns before anything
-	// else (GH#4378); the rows changed, so a scoped commit lands before the
-	// pass runs (#4566: the seed must not ride the per-step pass commits).
-	expectIgnorePatternSeed(mock, 42)
 	// migrationWorkNeeded: mainSource.atLatest reads the current cursor; v42
 	// is behind LatestVersion(), so the || short-circuits before checking
 	// ignoredSource.atLatest or the content-hash/backfill probes.
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
-	// reconcileForkLineageCursors: no fork-lineage fingerprint rows (main 54,
-	// ignored 11) and no pre-upmerge fingerprints (main 73, ignored 22), so
-	// the reconcile pass is a no-op before the dirty checks.
+	// planForkLineageCursors runs before the pass writes anything (gp-w0nu
+	// round 2): no fork-lineage fingerprint rows (main 54, ignored 11) and no
+	// pre-upmerge fingerprints (main 73, ignored 22), so nothing is planned.
 	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
 	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+
+	// MigrateUp re-asserts the canonical dolt_ignore patterns as the first
+	// write of the pass (GH#4378); the rows changed, so a scoped commit lands
+	// before the pass runs (#4566: the seed must not ride the per-step pass
+	// commits).
+	expectIgnorePatternSeed(mock, 42)
 
 	// dirtyTables(ctx, db, false): `dependencies` has an uncommitted, unstaged
 	// change in the working set.
 	expectDirtyDoltStatusRow(mock, "dependencies", false)
 	// The seed changed rows, so it is committed scoped+labeled right after
-	// pre-existing tables are unstaged, before the dirty-table guards run.
+	// pre-existing tables are unstaged, before the planned fork-lineage
+	// rewrites (none here) are applied and before the dirty-table guards run.
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
+
 	// committableDirtyTables -> dirtyTables(ctx, db, true): same dirty state.
 	expectDirtyDoltStatusRow(mock, "dependencies", false)
 
@@ -98,6 +102,7 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	// failed0053DirtyTablesAreRecoverable (dolt#11131 recovery gate) reads the
 	// current version first; at 42 (!= 52) the exemption declines and the
 	// dirty-table error path continues unchanged.
+	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
 	// pendingMigrationDirtyTables re-reads the current version and finds

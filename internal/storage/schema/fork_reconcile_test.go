@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
@@ -72,6 +73,35 @@ func expectRecordedHash(mock sqlmock.Sqlmock, table string, version int, hash an
 		WillReturnRows(sqlmock.NewRows([]string{"content_hash"}).AddRow(hash))
 }
 
+// applyPlanned composes one chain's plan and apply halves, so the chain-level
+// tests below keep exercising verify+DELETE as one unit. Production never
+// applies a single chain: MigrateUp runs planForkLineageRewrites over every
+// chain first and applies only when all of them verified.
+func applyPlanned(ctx context.Context, db DBConn, plan func(context.Context, DBConn) (*cursorRewrite, error)) (bool, error) {
+	rewrite, err := plan(ctx, db)
+	if err != nil || rewrite == nil {
+		return false, err
+	}
+	if err := rewrite.apply(ctx, db); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
+	return applyPlanned(ctx, db, planForkMainCursor)
+}
+
+func reconcileForkIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {
+	return applyPlanned(ctx, db, planForkIgnoredCursor)
+}
+
+func expectCursorRewrite(mock sqlmock.Sqlmock, table string, lo, hi int) {
+	mock.ExpectExec(`DELETE FROM `+table+` WHERE version BETWEEN \? AND \?`).
+		WithArgs(lo, hi).
+		WillReturnResult(sqlmock.NewResult(0, int64(hi-lo+1)))
+}
+
 // expectForkMainVerification queues the happy-path probe sequence for
 // reconcileForkMainCursor up to (not including) the DELETE.
 func expectForkMainVerification(t *testing.T, mock sqlmock.Sqlmock) {
@@ -103,9 +133,7 @@ func TestReconcileForkMainCursor_HappyPath_DeletesForkRows(t *testing.T) {
 	defer db.Close()
 
 	expectForkMainVerification(t, mock)
-	mock.ExpectExec(`DELETE FROM schema_migrations WHERE version BETWEEN 51 AND \?`).
-		WithArgs(54).
-		WillReturnResult(sqlmock.NewResult(0, 4))
+	expectCursorRewrite(mock, "schema_migrations", 51, 54)
 
 	changed, err := reconcileForkMainCursor(context.Background(), db)
 	if err != nil {
@@ -271,9 +299,7 @@ func TestReconcileForkMainCursor_NullHashes_FallBackToProbes(t *testing.T) {
 	for _, col := range forkIssueDriftColumns {
 		expectColumnProbe(mock, "issues", col.name, true)
 	}
-	mock.ExpectExec(`DELETE FROM schema_migrations WHERE version BETWEEN 51 AND \?`).
-		WithArgs(54).
-		WillReturnResult(sqlmock.NewResult(0, 4))
+	expectCursorRewrite(mock, "schema_migrations", 51, 54)
 
 	changed, err := reconcileForkMainCursor(context.Background(), db)
 	if err != nil {
@@ -325,9 +351,7 @@ func TestReconcileForkMainCursor_PreSquashDrift_RepairsAndCommits(t *testing.T) 
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`CALL DOLT_COMMIT\('-m', 'schema: repair pre-squash issues column drift \(bd-dn6\)'\)`).
 		WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec(`DELETE FROM schema_migrations WHERE version BETWEEN 51 AND \?`).
-		WithArgs(54).
-		WillReturnResult(sqlmock.NewResult(0, 4))
+	expectCursorRewrite(mock, "schema_migrations", 51, 54)
 
 	changed, err := reconcileForkMainCursor(context.Background(), db)
 	if err != nil {
@@ -383,11 +407,15 @@ func TestVerifyForkLineageState_MixedCursor_Inconsistent(t *testing.T) {
 	}
 	defer db.Close()
 
+	// currentVersion for both chains (be-bv7x existence probe, then MAX; gh
+	// 5033 corroborates a non-zero ignored cursor against its sentinels), then
+	// the recorded ignored MAX the reconciler itself compares against.
+	expectCursorProbe(mock, "schema_migrations", true)
 	expectMaxVersion(mock, "schema_migrations", 73)
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
 	expectMaxVersion(mock, "ignored_schema_migrations", 11)
-	// gh 5033: a non-zero ignored cursor is corroborated against the ignored
-	// chain's sentinel tables before it is believed.
 	expectIgnoredSentinelProbes(mock, true)
+	expectMaxVersion(mock, "ignored_schema_migrations", 11)
 	expectCursorRowProbe(mock, "schema_migrations", 54, 1) // row 54 despite MAX=73
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
@@ -413,18 +441,18 @@ func TestReconcileForkIgnoredCursor_HappyPath_DeletesForkRows(t *testing.T) {
 	defer db.Close()
 
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
+	// The recorded MAX, read raw (cursorMaxVersion): a pre-merge ignored
+	// chain predates every gh 5033 sentinel column, so the reality check's
+	// healed reading would be 0 here and must not be what the fingerprint
+	// precondition compares against (gp-w0nu).
 	expectMaxVersion(mock, "ignored_schema_migrations", 11)
-	// gh 5033: non-zero ignored cursor triggers the sentinel corroboration.
-	expectIgnoredSentinelProbes(mock, true)
 	expectTableProbe(mock, "linear_issue_snapshots", true)
 	expectTableProbe(mock, "linear_project_snapshots", true)
 	expectHasContentHashColumn(mock, "ignored_schema_migrations", true)
 	for _, v := range []int{10, 11} {
 		expectRecordedHash(mock, "ignored_schema_migrations", v, forkFileHash(t, ignoredSource, forkRenumberedIgnoredFiles[v]))
 	}
-	mock.ExpectExec(`DELETE FROM ignored_schema_migrations WHERE version BETWEEN 10 AND \?`).
-		WithArgs(11).
-		WillReturnResult(sqlmock.NewResult(0, 2))
+	expectCursorRewrite(mock, "ignored_schema_migrations", 10, 11)
 
 	changed, err := reconcileForkIgnoredCursor(context.Background(), db)
 	if err != nil {
@@ -489,8 +517,8 @@ func TestNoDuplicateMigrationVersions(t *testing.T) {
 	if want, got := 73, LatestVersion(); got != want {
 		t.Errorf("LatestVersion() = %d, want %d (upstream 0053 tail + fork 0070-0073)", got, want)
 	}
-	if want, got := 27, LatestIgnoredVersion(); got != want {
-		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored tail 0024 + fork 0025-0027)", got, want)
+	if want, got := 28, LatestIgnoredVersion(); got != want {
+		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored tail 0024 + fork 0025-0027 + upstream's 0025 twin renumbered to 0028)", got, want)
 	}
 }
 
@@ -528,6 +556,177 @@ func TestReconcileForkMainCursor_PostUpmergeLeaselessShape_NoOp(t *testing.T) {
 	}
 	if changed {
 		t.Fatal("changed = true, want false for a post-upmerge upstream-lineage cursor")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// expectUpmergeMainVerification queues the pre-upmerge main chain's read-only
+// verification (row 73 without 56, recorded MAX 73, the fork DDL, the hashes).
+func expectUpmergeMainVerification(t *testing.T, mock sqlmock.Sqlmock) {
+	t.Helper()
+	expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+	expectCursorRowProbe(mock, "schema_migrations", 56, 0)
+	expectMaxVersion(mock, "schema_migrations", 73)
+	expectTableProbe(mock, "linear_label_snapshots", true)
+	expectColumnProbe(mock, "comments", "external_ref", true)
+	expectColumnProbe(mock, "comments", "updated_at", true)
+	expectTableProbe(mock, "attachments", true)
+	expectHasContentHashColumn(mock, "schema_migrations", true)
+	for _, v := range []int{70, 71, 72, 73} {
+		expectRecordedHash(mock, "schema_migrations", v, forkFileHash(t, mainSource, upmergeMainFiles[v]))
+	}
+}
+
+// TestPlanUpmergeIgnoredCursor_PreUpmergeShape_ComparesRecordedMax is
+// boomtown's 2026-09-11 refusal at the unit level. The pre-upmerge ignored
+// chain (1-13, 20-22) has row 22 without row 14 and a recorded MAX of 22, but
+// never ran upstream ignored 0016, so currentVersion's reality check would
+// read it as 0 (sentinel leases.granted_node absent) and the precondition
+// refused with "MAX(version)=0". The plan must read the recorded MAX — one
+// statement, no INFORMATION_SCHEMA existence probe and no sentinel probes —
+// and verify the fork DDL.
+func TestPlanUpmergeIgnoredCursor_PreUpmergeShape_ComparesRecordedMax(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
+	expectMaxVersion(mock, "ignored_schema_migrations", 22)
+	expectTableProbe(mock, "linear_issue_snapshots", true)
+	expectTableProbe(mock, "linear_project_snapshots", true)
+	expectColumnProbe(mock, "wisp_comments", "external_ref", true)
+	expectHasContentHashColumn(mock, "ignored_schema_migrations", true)
+	for _, v := range []int{20, 21, 22} {
+		expectRecordedHash(mock, "ignored_schema_migrations", v, forkFileHash(t, ignoredSource, upmergeRenumberedIgnoredFiles[v]))
+	}
+
+	rewrite, err := planUpmergeIgnoredCursor(context.Background(), db)
+	if err != nil {
+		t.Fatalf("planUpmergeIgnoredCursor: %v", err)
+	}
+	if rewrite == nil || rewrite.table != "ignored_schema_migrations" || rewrite.lo != 20 || rewrite.hi != 22 {
+		t.Fatalf("rewrite = %+v, want ignored_schema_migrations rows 20-22", rewrite)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPlanForkLineageRewrites_RefusalIssuesNoWrite pins the refusal-hygiene
+// rule: the upmerge main chain verifies clean, the upmerge ignored chain
+// refuses (a recorded fork table is missing), and NOTHING is deleted —
+// sqlmock fails any Exec that was not expected, and no DELETE is expected.
+// On the base the main DELETE (70-73) had already run by the time the
+// ignored chain was probed.
+func TestPlanForkLineageRewrites_RefusalIssuesNoWrite(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0) // no bd-dn6 fingerprint
+	expectUpmergeMainVerification(t, mock)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
+	expectMaxVersion(mock, "ignored_schema_migrations", 22)
+	expectTableProbe(mock, "linear_issue_snapshots", false) // recorded but absent
+
+	_, err = planForkLineageCursors(context.Background(), db)
+	if err == nil {
+		t.Fatal("planForkLineageCursors succeeded, want the ignored-chain refusal")
+	}
+	for _, want := range []string{"linear_issue_snapshots", "refusing to rewrite", "working set was left as found"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %q, want it to contain %q", err, want)
+		}
+	}
+	if !errors.Is(err, errRefusedRewrite) {
+		t.Fatalf("err = %q does not wrap errRefusedRewrite", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPlanForkLineageCursors_TransientErrorIsNotWordedAsRefusal: a SQL error
+// on a plan probe is not a refusal. The plan issues no write, so the working
+// set IS as found, but the caller must not dress a transient failure in the
+// refusal's wording (an operator reads "refused ... repair manually" as a
+// verdict on the store); it says only that no cursor row was rewritten
+// (Fable read r1 on gp-w0nu).
+func TestPlanForkLineageCursors_TransientErrorIsNotWordedAsRefusal(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM schema_migrations WHERE version = \?`).
+		WithArgs(54).
+		WillReturnError(errors.New("connection reset"))
+
+	_, err = planForkLineageCursors(context.Background(), db)
+	if err == nil {
+		t.Fatal("planForkLineageCursors succeeded, want the injected probe failure")
+	}
+	for _, want := range []string{"connection reset", "no cursor row was rewritten"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %q, want it to contain %q", err, want)
+		}
+	}
+	for _, forbidden := range []string{"refusing to rewrite", "working set was left as found"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("err = %q wears the refusal's wording %q on a transient error", err, forbidden)
+		}
+	}
+	if errors.Is(err, errRefusedRewrite) {
+		t.Fatalf("err = %q wraps errRefusedRewrite, want a plain probe error", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified: both upmerge
+// chains verify, and only then are both DELETEs issued, main first.
+func TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectUpmergeMainVerification(t, mock)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
+	expectMaxVersion(mock, "ignored_schema_migrations", 22)
+	expectTableProbe(mock, "linear_issue_snapshots", true)
+	expectTableProbe(mock, "linear_project_snapshots", true)
+	expectColumnProbe(mock, "wisp_comments", "external_ref", true)
+	expectHasContentHashColumn(mock, "ignored_schema_migrations", true)
+	for _, v := range []int{20, 21, 22} {
+		expectRecordedHash(mock, "ignored_schema_migrations", v, forkFileHash(t, ignoredSource, upmergeRenumberedIgnoredFiles[v]))
+	}
+	expectCursorRewrite(mock, "schema_migrations", 70, 73)
+	expectCursorRewrite(mock, "ignored_schema_migrations", 20, 22)
+
+	rewrites, err := planForkLineageCursors(context.Background(), db)
+	if err != nil {
+		t.Fatalf("planForkLineageCursors: %v", err)
+	}
+	changed, err := applyForkLineageRewrites(context.Background(), db, rewrites)
+	if err != nil {
+		t.Fatalf("applyForkLineageRewrites: %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true after both upmerge rewrites")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
