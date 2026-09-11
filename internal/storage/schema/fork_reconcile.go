@@ -109,7 +109,72 @@ var upmergeMainFiles = map[int]string{
 	73: "0073_create_attachments.up.sql",
 }
 
-func reconcileUpmergeMainCursor(ctx context.Context, db DBConn) (bool, error) {
+// cursorRewrite is one verified fork-cursor rewrite. The reconcile pass is
+// split into a planning half that only READS (every fingerprint probe, every
+// schema probe and every content-hash cross-check, for every chain) and an
+// apply half that only WRITES, so a refusal on any chain happens before the
+// first DELETE and leaves the working set exactly as it was found. Before the
+// split the upmerge main DELETE (rows 70-73) ran before the ignored chain was
+// even probed; when the ignored chain then refused, that DELETE stayed in the
+// working set uncommitted (HEAD intact, dolt_status dirty) and the previous
+// binary read the store as "row 54 but MAX=55" until an operator ran
+// DOLT_CHECKOUT('schema_migrations') — boomtown's 2026-09-11 write outage
+// (gp-w0nu).
+type cursorRewrite struct {
+	// desc names the chain in errors.
+	desc string
+	// prepare is a write that must precede the DELETE and is only safe once
+	// every chain has verified: the bd-dn6 pre-squash issues column-drift
+	// repair. nil for the other chains.
+	prepare func(ctx context.Context, db DBConn) error
+	table   string
+	lo, hi  int
+}
+
+func (r cursorRewrite) apply(ctx context.Context, db DBConn) error {
+	if r.prepare != nil {
+		if err := r.prepare(ctx, db); err != nil {
+			return err
+		}
+	}
+	//nolint:gosec // G202: r.table is one of the two hardcoded cursor table names.
+	if _, err := db.ExecContext(ctx,
+		"DELETE FROM "+r.table+" WHERE version BETWEEN ? AND ?", r.lo, r.hi); err != nil {
+		return fmt.Errorf("rewriting %s: %w", r.desc, err)
+	}
+	return nil
+}
+
+// cursorMaxVersion reads the cursor table's recorded MAX(version): the number
+// every refusal text in this file compares against.
+//
+// It deliberately bypasses migrationSource.currentVersion. currentVersion
+// heals a cursor whose clone-local sentinel effects are absent by reading it
+// as 0 (gh 5033), and on exactly the shapes reconciled here a sentinel is
+// legitimately absent: a pre-upmerge ignored chain (1-13, 20-22) never ran
+// upstream ignored 0016, so leases.granted_node is missing and the cursor
+// reads as 0 while MAX(version) on the wire is 22. Comparing the fingerprint
+// precondition against the healed reading refused every pre-upmerge store
+// with "row 22 without row 14 but MAX(version)=0" (boomtown, 2026-09-11,
+// gp-w0nu). The heal is right for the migration pass, which re-runs the
+// re-runnable series from that reading; the fingerprint check needs the
+// number the cursor actually records. A missing table reads as 0 — callers
+// probe a fingerprint row first, so this never issues the first (poisoning,
+// be-bv7x) statement against an absent table.
+func cursorMaxVersion(ctx context.Context, db DBConn, table string) (int, error) {
+	var current int
+	//nolint:gosec // G202: table is one of the two hardcoded cursor table names.
+	err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM "+table).Scan(&current)
+	if err != nil {
+		if dberrors.IsTableNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("reading %s MAX(version): %w", table, err)
+	}
+	return current, nil
+}
+
+func planUpmergeMainCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
 	// Row 73 (fork create_attachments) without row 56 (upstream
 	// add_comments_keyset_index) is the pre-upmerge fingerprint: any database
 	// that migrated through the merged lineage records 0056 before it can
@@ -117,19 +182,19 @@ func reconcileUpmergeMainCursor(ctx context.Context, db DBConn) (bool, error) {
 	// 56 without 73, never 73 without 56.
 	has73, err := cursorRowExists(ctx, db, mainSource.cursorTable, 73)
 	if err != nil || !has73 {
-		return false, err
+		return nil, err
 	}
 	has56, err := cursorRowExists(ctx, db, mainSource.cursorTable, 56)
 	if err != nil || has56 {
-		return false, err
+		return nil, err
 	}
 
-	current, err := mainSource.currentVersion(ctx, db)
+	current, err := cursorMaxVersion(ctx, db, mainSource.cursorTable)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if current != 73 {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"schema_migrations has pre-upmerge row 73 without row 56 but MAX(version)=%d; cursor state is neither pre-upmerge (MAX=73) nor merged-lineage (row 56 present) — refusing to rewrite, repair manually",
 			current)
 	}
@@ -150,46 +215,44 @@ func reconcileUpmergeMainCursor(ctx context.Context, db DBConn) (bool, error) {
 	for _, p := range probes {
 		ok, err := p.ok()
 		if err != nil {
-			return false, fmt.Errorf("verifying pre-upmerge lineage (%s): %w", p.desc, err)
+			return nil, fmt.Errorf("verifying pre-upmerge lineage (%s): %w", p.desc, err)
 		}
 		if !ok {
-			return false, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"schema_migrations records fork migrations 70-73 but %s is missing; schema does not match the recorded cursor — refusing to rewrite, repair manually",
 				p.desc)
 		}
 	}
 
 	if err := verifyForkCursorHashes(ctx, db, mainSource, upmergeMainFiles); err != nil {
-		return false, err
+		return nil, err
 	}
-
-	if _, err := db.ExecContext(ctx,
-		"DELETE FROM "+mainSource.cursorTable+" WHERE version BETWEEN 70 AND 73"); err != nil {
-		return false, fmt.Errorf("rewriting pre-upmerge main cursor: %w", err)
-	}
-	return true, nil
+	return &cursorRewrite{desc: "pre-upmerge main cursor", table: mainSource.cursorTable, lo: 70, hi: 73}, nil
 }
 
-func reconcileUpmergeIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {
+func planUpmergeIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
 	// Row 22 (fork add_wisp_comment_external_ref) without row 14 (upstream
 	// add_wisp_comments_keyset_index) is the pre-upmerge ignored fingerprint,
 	// by the same prefix argument as the main chain: the merged series
 	// records 14 before anything can record 22.
 	has22, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, 22)
 	if err != nil || !has22 {
-		return false, err
+		return nil, err
 	}
 	has14, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, 14)
 	if err != nil || has14 {
-		return false, err
+		return nil, err
 	}
 
-	current, err := ignoredSource.currentVersion(ctx, db)
+	// The recorded MAX, not currentVersion's healed reading: on this shape
+	// leases.granted_node (upstream ignored 0016) is legitimately absent and
+	// the reality check reads the cursor as 0. See cursorMaxVersion.
+	current, err := cursorMaxVersion(ctx, db, ignoredSource.cursorTable)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if current != 22 {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"ignored_schema_migrations has pre-upmerge row 22 without row 14 but MAX(version)=%d; cursor state is neither pre-upmerge (MAX=22) nor merged-lineage (row 14 present) — refusing to rewrite, repair manually",
 			current)
 	}
@@ -204,81 +267,97 @@ func reconcileUpmergeIgnoredCursor(ctx context.Context, db DBConn) (bool, error)
 	} {
 		ok, err := probe.ok()
 		if err != nil {
-			return false, fmt.Errorf("verifying pre-upmerge lineage (%s): %w", probe.desc, err)
+			return nil, fmt.Errorf("verifying pre-upmerge lineage (%s): %w", probe.desc, err)
 		}
 		if !ok {
-			return false, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"ignored_schema_migrations records fork migrations 20-22 but %s is missing; schema does not match the recorded cursor — refusing to rewrite, repair manually",
 				probe.desc)
 		}
 	}
 
 	if err := verifyForkCursorHashes(ctx, db, ignoredSource, upmergeRenumberedIgnoredFiles); err != nil {
-		return false, err
+		return nil, err
 	}
-
-	if _, err := db.ExecContext(ctx,
-		"DELETE FROM "+ignoredSource.cursorTable+" WHERE version BETWEEN 20 AND 22"); err != nil {
-		return false, fmt.Errorf("rewriting pre-upmerge ignored cursor: %w", err)
-	}
-	return true, nil
+	return &cursorRewrite{desc: "pre-upmerge ignored cursor", table: ignoredSource.cursorTable, lo: 20, hi: 22}, nil
 }
 
 // reconcileForkLineageCursors detects a database whose migration cursors were
-// written by a pre-merge fork binary and rewrites them to the renumbered
-// scheme. Returns whether either cursor was changed. Called from MigrateUp
-// before pending versions are computed; a no-op on fresh databases, upstream-
-// lineage databases, and databases already reconciled.
+// written by a pre-merge or pre-upmerge fork binary and rewrites them to the
+// renumbered scheme. Returns whether any cursor was changed. Called from
+// MigrateUp before pending versions are computed; a no-op on fresh databases,
+// upstream-lineage databases, and databases already reconciled.
+//
+// Every chain is verified before anything is deleted (planForkLineageRewrites
+// only reads); a refusal therefore leaves the working set as it was found,
+// and the error says so.
 func reconcileForkLineageCursors(ctx context.Context, db DBConn) (bool, error) {
-	changed, err := reconcileForkPreMergeCursors(ctx, db)
+	rewrites, err := planForkLineageRewrites(ctx, db)
 	if err != nil {
-		return changed, err
+		return false, fmt.Errorf("%w (refused before any cursor rewrite; the working set was left as found)", err)
 	}
-	// 2026-08 upmerge (see the block comment above the upmerge maps). The two
-	// upmerge chains are probed independently: unlike bd-dn6's ignored row 11,
-	// the fingerprints (row 73 without 56, row 22 without 14) are unambiguous
-	// on their own, and a crash between the two DELETEs must leave each chain
-	// individually recoverable on the next pass.
-	upMain, err := reconcileUpmergeMainCursor(ctx, db)
-	if err != nil {
-		return changed || upMain, err
+	for _, r := range rewrites {
+		if err := r.apply(ctx, db); err != nil {
+			return true, err
+		}
 	}
-	upIgnored, err := reconcileUpmergeIgnoredCursor(ctx, db)
-	if err != nil {
-		return changed || upMain || upIgnored, err
-	}
-	return changed || upMain || upIgnored, nil
+	return len(rewrites) > 0, nil
 }
 
-func reconcileForkPreMergeCursors(ctx context.Context, db DBConn) (bool, error) {
-	mainChanged, err := reconcileForkMainCursor(ctx, db)
+// planForkLineageRewrites runs every chain's verification and returns the
+// cursor rewrites to apply, in apply order. It issues no writes.
+func planForkLineageRewrites(ctx context.Context, db DBConn) ([]cursorRewrite, error) {
+	var rewrites []cursorRewrite
+
+	preMain, err := planForkMainCursor(ctx, db)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	if !mainChanged {
-		// No pre-merge fork main cursor (or row 54 was upstream's own lease
-		// migration — see the disambiguation in reconcileForkMainCursor).
+	if preMain != nil {
+		rewrites = append(rewrites, *preMain)
 		// Since the upstream-20260710 merge, upstream also owns an ignored
 		// migration 0011 (cleanup_orphaned_child_counters), so the ignored
 		// fingerprint row 11 is only meaningful together with the main one:
 		// running the ignored pass on a genuine upstream database would trip
 		// its refuse-to-rewrite guard.
-		return false, nil
+		preIgnored, err := planForkIgnoredCursor(ctx, db)
+		if err != nil {
+			return nil, err
+		}
+		if preIgnored != nil {
+			rewrites = append(rewrites, *preIgnored)
+		}
 	}
-	ignoredChanged, err := reconcileForkIgnoredCursor(ctx, db)
+
+	// 2026-08 upmerge (see the block comment above the upmerge maps). The two
+	// upmerge chains are probed independently: unlike bd-dn6's ignored row 11,
+	// the fingerprints (row 73 without 56, row 22 without 14) are unambiguous
+	// on their own, and a crash between the two DELETEs must leave each chain
+	// individually recoverable on the next pass.
+	upMain, err := planUpmergeMainCursor(ctx, db)
 	if err != nil {
-		return mainChanged, err
+		return nil, err
 	}
-	return mainChanged || ignoredChanged, nil
+	if upMain != nil {
+		rewrites = append(rewrites, *upMain)
+	}
+	upIgnored, err := planUpmergeIgnoredCursor(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if upIgnored != nil {
+		rewrites = append(rewrites, *upIgnored)
+	}
+	return rewrites, nil
 }
 
-func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
+func planForkMainCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
 	// Row 54 is the fork-lineage fingerprint: upstream's chain has never had a
 	// migration 0054 (it jumps 0053 → this merge's 0070), so only a pre-merge
 	// fork binary can have recorded it.
 	has54, err := cursorRowExists(ctx, db, mainSource.cursorTable, forkPreMergeMainMax)
 	if err != nil || !has54 {
-		return false, err
+		return nil, err
 	}
 
 	// Post-merge disambiguation: since the upstream-20260710 merge, upstream
@@ -291,10 +370,10 @@ func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
 	// rewrite, and the strict MAX(version) check below must not fire.
 	hasLease, err := columnExists(ctx, db, "issues", "lease_expires_at")
 	if err != nil {
-		return false, fmt.Errorf("disambiguating fork lineage (issues.lease_expires_at): %w", err)
+		return nil, fmt.Errorf("disambiguating fork lineage (issues.lease_expires_at): %w", err)
 	}
 	if hasLease {
-		return false, nil
+		return nil, nil
 	}
 
 	// Upstream 0055 (move_leases_to_table) DROPS the lease columns 0054
@@ -310,18 +389,18 @@ func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
 	// content hash there is upstream 0054's, proving the misread.
 	has55, err := cursorRowExists(ctx, db, mainSource.cursorTable, 55)
 	if err != nil {
-		return false, fmt.Errorf("disambiguating fork lineage (row 55): %w", err)
+		return nil, fmt.Errorf("disambiguating fork lineage (row 55): %w", err)
 	}
 	if has55 {
-		return false, nil
+		return nil, nil
 	}
 
-	current, err := mainSource.currentVersion(ctx, db)
+	current, err := cursorMaxVersion(ctx, db, mainSource.cursorTable)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if current != forkPreMergeMainMax {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"schema_migrations has fork-lineage row %d but MAX(version)=%d; cursor state is neither pre-merge fork (MAX=%d) nor reconciled (no row %d) — refusing to rewrite, repair manually",
 			forkPreMergeMainMax, current, forkPreMergeMainMax, forkPreMergeMainMax)
 	}
@@ -342,28 +421,28 @@ func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
 	for _, p := range probes {
 		ok, err := p.ok()
 		if err != nil {
-			return false, fmt.Errorf("verifying fork lineage (%s): %w", p.desc, err)
+			return nil, fmt.Errorf("verifying fork lineage (%s): %w", p.desc, err)
 		}
 		if !ok {
-			return false, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"schema_migrations records fork migrations 51-%d but %s is missing; schema does not match the recorded cursor — refusing to rewrite, repair manually",
 				forkPreMergeMainMax, p.desc)
 		}
 	}
 
 	if err := verifyForkCursorHashes(ctx, db, mainSource, forkRenumberedMainFiles); err != nil {
-		return false, err
+		return nil, err
 	}
 
-	if err := repairForkIssueColumnDrift(ctx, db); err != nil {
-		return false, err
-	}
-
-	if _, err := db.ExecContext(ctx,
-		"DELETE FROM "+mainSource.cursorTable+" WHERE version BETWEEN 51 AND ?", forkPreMergeMainMax); err != nil {
-		return false, fmt.Errorf("rewriting fork main cursor: %w", err)
-	}
-	return true, nil
+	// The pre-squash drift repair is a write (ALTERs plus its own commit), so
+	// it runs in the apply half, after every chain has verified.
+	return &cursorRewrite{
+		desc:    "fork main cursor",
+		prepare: repairForkIssueColumnDrift,
+		table:   mainSource.cursorTable,
+		lo:      51,
+		hi:      forkPreMergeMainMax,
+	}, nil
 }
 
 // forkIssueDriftColumns are the gt-role columns that exist only in the
@@ -443,21 +522,24 @@ func repairForkIssueColumnDrift(ctx context.Context, db DBConn) error {
 	return nil
 }
 
-func reconcileForkIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {
+func planForkIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
 	// Row 11 is the ignored-chain fork fingerprint: upstream's ignored chain
 	// tops out at 0010 and this merge renumbers the fork's 0011 to 0021, so
 	// only a pre-merge fork binary can have recorded row 11.
 	has11, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, forkPreMergeIgnoredMax)
 	if err != nil || !has11 {
-		return false, err
+		return nil, err
 	}
 
-	current, err := ignoredSource.currentVersion(ctx, db)
+	// The recorded MAX, not currentVersion's healed reading (see
+	// cursorMaxVersion): a pre-merge ignored chain predates every sentinel
+	// column the reality check looks for.
+	current, err := cursorMaxVersion(ctx, db, ignoredSource.cursorTable)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if current != forkPreMergeIgnoredMax {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"ignored_schema_migrations has fork-lineage row %d but MAX(version)=%d; cursor state is neither pre-merge fork (MAX=%d) nor reconciled (no row %d) — refusing to rewrite, repair manually",
 			forkPreMergeIgnoredMax, current, forkPreMergeIgnoredMax, forkPreMergeIgnoredMax)
 	}
@@ -471,24 +553,19 @@ func reconcileForkIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {
 	} {
 		ok, err := tableExists(ctx, db, probe.table)
 		if err != nil {
-			return false, fmt.Errorf("verifying fork lineage (%s): %w", probe.desc, err)
+			return nil, fmt.Errorf("verifying fork lineage (%s): %w", probe.desc, err)
 		}
 		if !ok {
-			return false, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"ignored_schema_migrations records fork migrations 10-%d but %s is missing; schema does not match the recorded cursor — refusing to rewrite, repair manually",
 				forkPreMergeIgnoredMax, probe.desc)
 		}
 	}
 
 	if err := verifyForkCursorHashes(ctx, db, ignoredSource, forkRenumberedIgnoredFiles); err != nil {
-		return false, err
+		return nil, err
 	}
-
-	if _, err := db.ExecContext(ctx,
-		"DELETE FROM "+ignoredSource.cursorTable+" WHERE version BETWEEN 10 AND ?", forkPreMergeIgnoredMax); err != nil {
-		return false, fmt.Errorf("rewriting fork ignored cursor: %w", err)
-	}
-	return true, nil
+	return &cursorRewrite{desc: "fork ignored cursor", table: ignoredSource.cursorTable, lo: 10, hi: forkPreMergeIgnoredMax}, nil
 }
 
 // verifyForkCursorHashes cross-checks each recorded content hash in the
@@ -564,7 +641,16 @@ type ForkLineageReport struct {
 	Status         ForkLineageStatus
 	MainVersion    int
 	IgnoredVersion int
-	Problems       []string // populated when Status == ForkLineageInconsistent
+	// IgnoredCursorMax is the recorded MAX(version) of ignored_schema_migrations.
+	// It differs from IgnoredVersion when the cursor-reality check (gh 5033)
+	// has healed the reading to 0 because a clone-local sentinel is absent —
+	// the pre-upmerge shape whose refusal read "MAX(version)=0" (gp-w0nu).
+	// IgnoredCursorNote then says so in one line; the reconciler compares the
+	// recorded MAX (cursorMaxVersion), so the doctor's fingerprint arithmetic
+	// below uses it too.
+	IgnoredCursorMax  int
+	IgnoredCursorNote string
+	Problems          []string // populated when Status == ForkLineageInconsistent
 }
 
 // VerifyForkLineageState probes the cursors and the actual schema
@@ -577,6 +663,14 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 	}
 	if report.IgnoredVersion, err = ignoredSource.currentVersion(ctx, db); err != nil {
 		return report, err
+	}
+	if report.IgnoredCursorMax, err = cursorMaxVersion(ctx, db, ignoredSource.cursorTable); err != nil {
+		return report, err
+	}
+	if report.IgnoredCursorMax != report.IgnoredVersion {
+		report.IgnoredCursorNote = fmt.Sprintf(
+			"ignored_schema_migrations records MAX(version)=%d but the cursor-reality check reads it as %d because a clone-local sentinel (wisps, wisp_dependencies or leases.granted_node) is absent; the ignored series is clone-local and the next migration pass re-runs it from %d — the fork reconciler compares the recorded MAX, not this reading",
+			report.IgnoredCursorMax, report.IgnoredVersion, report.IgnoredVersion)
 	}
 	has54, err := cursorRowExists(ctx, db, mainSource.cursorTable, forkPreMergeMainMax)
 	if err != nil {
@@ -624,10 +718,10 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 				"schema_migrations row %d coexists with MAX(version)=%d; reconciliation will refuse this cursor",
 				forkPreMergeMainMax, report.MainVersion))
 		}
-		if has11 && report.IgnoredVersion != forkPreMergeIgnoredMax {
+		if has11 && report.IgnoredCursorMax != forkPreMergeIgnoredMax {
 			report.Problems = append(report.Problems, fmt.Sprintf(
 				"ignored_schema_migrations row %d coexists with MAX(version)=%d; reconciliation will refuse this cursor",
-				forkPreMergeIgnoredMax, report.IgnoredVersion))
+				forkPreMergeIgnoredMax, report.IgnoredCursorMax))
 		}
 		if len(report.Problems) > 0 {
 			report.Status = ForkLineageInconsistent

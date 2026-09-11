@@ -72,22 +72,24 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
+	// dirtyTables(ctx, db, false): `dependencies` has an uncommitted, unstaged
+	// change in the working set.
+	expectDirtyDoltStatusRow(mock, "dependencies", false)
+	// The seed changed rows, so it is committed scoped+labeled right after
+	// pre-existing tables are unstaged, before the fork-lineage reconcile
+	// (whose refusal must leave dolt_status as found, gp-w0nu) and before the
+	// dirty-table guards run.
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
+		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
+
 	// reconcileForkLineageCursors: no fork-lineage fingerprint rows (main 54,
 	// ignored 11) and no pre-upmerge fingerprints (main 73, ignored 22), so
 	// the reconcile pass is a no-op before the dirty checks.
 	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
 	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
-
-	// dirtyTables(ctx, db, false): `dependencies` has an uncommitted, unstaged
-	// change in the working set.
-	expectDirtyDoltStatusRow(mock, "dependencies", false)
-	// The seed changed rows, so it is committed scoped+labeled right after
-	// pre-existing tables are unstaged, before the dirty-table guards run.
-	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
-		WillReturnRows(sqlmock.NewRows([]string{"status"}))
-	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
-		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
 	// committableDirtyTables -> dirtyTables(ctx, db, true): same dirty state.
 	expectDirtyDoltStatusRow(mock, "dependencies", false)
 
@@ -98,6 +100,7 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	// failed0053DirtyTablesAreRecoverable (dolt#11131 recovery gate) reads the
 	// current version first; at 42 (!= 52) the exemption declines and the
 	// dirty-table error path continues unchanged.
+	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
 	// pendingMigrationDirtyTables re-reads the current version and finds

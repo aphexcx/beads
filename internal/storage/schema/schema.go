@@ -590,18 +590,6 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 		return 0, nil
 	}
 
-	// bd-dn6: databases migrated by a pre-merge fork binary recorded the
-	// fork's migrations under numbers upstream now owns (main 51-54, ignored
-	// 10-11). Rewrite those cursor rows to the renumbered scheme BEFORE
-	// pending versions are computed, so this pass applies upstream's
-	// same-numbered migrations instead of silently skipping them. The DELETE
-	// only touches the cursor tables (exempt from the dirty-table guards) and
-	// is committed with the rest of the pass; a crash before the commit is
-	// harmless because detection re-probes actual schema state.
-	if _, err := reconcileForkLineageCursors(ctx, db); err != nil {
-		return 0, fmt.Errorf("reconciling fork-lineage migration cursors: %w", err)
-	}
-
 	dirtyBeforeAll, err := dirtyTables(ctx, db, false)
 	if err != nil {
 		return 0, fmt.Errorf("reading pre-migration status: %w", err)
@@ -621,11 +609,33 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// retry sees a dirty working set and refuses to converge. Commit the seed
 	// scoped and labeled now, after pre-existing staged tables were unstaged
 	// (so nothing else rides into the commit) and before the first step runs.
+	//
+	// It is also committed BEFORE the fork-lineage reconciliation below. That
+	// pass can refuse (its refuse-to-rewrite guard), and a refusal must leave
+	// dolt_status exactly as it was found: a seed row still sitting in the
+	// working set read as "dolt_ignore: modified" beside the debris of the
+	// refused pass (boomtown, 2026-09-11, gp-w0nu).
 	if seedChanged {
 		if err := commitSeededDoltIgnore(ctx, db); err != nil {
 			return 0, err
 		}
 	}
+
+	// bd-dn6: databases migrated by a pre-merge fork binary recorded the
+	// fork's migrations under numbers upstream now owns (main 51-54, ignored
+	// 10-11), and the 2026-08 upmerge left the same shape at main 70-73 /
+	// ignored 20-22. Rewrite those cursor rows to the renumbered scheme BEFORE
+	// pending versions are computed, so this pass applies upstream's
+	// same-numbered migrations instead of silently skipping them. Every chain
+	// is verified before anything is deleted, so a refusal leaves the working
+	// set as found. The DELETEs only touch the cursor tables (exempt from the
+	// dirty-table guards) and are committed with the rest of the pass; a
+	// crash before the commit is harmless because detection re-probes actual
+	// schema state.
+	if _, err := reconcileForkLineageCursors(ctx, db); err != nil {
+		return 0, fmt.Errorf("reconciling fork-lineage migration cursors: %w", err)
+	}
+
 	dirtyBefore, err := committableDirtyTables(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("reading pre-migration status: %w", err)

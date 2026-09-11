@@ -28,7 +28,17 @@ func CheckForkMigrationLineage(ss *SharedStore) DoctorCheck {
 	if store := ss.Store(); store != nil {
 		return checkForkMigrationLineage(context.Background(), store.DB())
 	}
-	if check, ok := checkForkMigrationLineageEmbedded(context.Background(), sharedStoreBeadsDir(ss)); ok {
+	beadsDir := sharedStoreBeadsDir(ss)
+	if check, ok := checkForkMigrationLineageEmbedded(context.Background(), beadsDir); ok {
+		return check
+	}
+	// A server-mode store whose write-mode open the migration pass REFUSED
+	// (the fork reconciler's refuse-to-rewrite guard is the case this check
+	// exists to explain) has no SharedStore and no embeddeddolt directory, so
+	// the check reported "N/A (no database)" on exactly the store the
+	// operator was diagnosing (boomtown, 2026-09-11, gp-w0nu). Read it over
+	// doctor's own read-only server connection instead.
+	if check, ok := checkForkMigrationLineageServer(context.Background(), beadsDir); ok {
 		return check
 	}
 	return DoctorCheck{
@@ -65,10 +75,43 @@ func checkForkMigrationLineageEmbedded(ctx context.Context, beadsDir string) (Do
 	return checkForkMigrationLineage(ctx, db), true
 }
 
+func checkForkMigrationLineageServer(ctx context.Context, beadsDir string) (DoctorCheck, bool) {
+	if beadsDir == "" || !IsDoltBackend(beadsDir) {
+		return DoctorCheck{}, false
+	}
+	conn, err := openDoltConn(beadsDir)
+	if err != nil {
+		// No server to ask (embedded mode, or a server-mode store whose
+		// server is down): the caller's "N/A (no database)" stands.
+		return DoctorCheck{}, false
+	}
+	defer conn.Close()
+	return checkForkMigrationLineage(ctx, conn.db), true
+}
+
 func checkForkMigrationLineage(ctx context.Context, db schema.DBConn) DoctorCheck {
+	report, check := classifyForkMigrationLineage(ctx, db)
+	if report.IgnoredCursorNote == "" {
+		return check
+	}
+	// One line naming the clone-local domain: the recorded ignored cursor and
+	// the reality-checked reading disagree, which is the shape whose refusal
+	// read "MAX(version)=0" over a table whose MAX was 22 on the wire.
+	if check.Status == StatusOK {
+		check.Status = StatusWarning
+	}
+	if check.Detail == "" {
+		check.Detail = report.IgnoredCursorNote
+	} else {
+		check.Detail = strings.TrimSuffix(check.Detail, ".") + ". " + report.IgnoredCursorNote
+	}
+	return check
+}
+
+func classifyForkMigrationLineage(ctx context.Context, db schema.DBConn) (schema.ForkLineageReport, DoctorCheck) {
 	report, err := schema.VerifyForkLineageState(ctx, db)
 	if err != nil {
-		return DoctorCheck{
+		return report, DoctorCheck{
 			Name:     forkLineageCheckName,
 			Status:   StatusWarning,
 			Message:  fmt.Sprintf("Could not check fork migration lineage: %v", err),
@@ -79,7 +122,7 @@ func checkForkMigrationLineage(ctx context.Context, db schema.DBConn) DoctorChec
 
 	switch report.Status {
 	case schema.ForkLineagePreMerge:
-		return DoctorCheck{
+		return report, DoctorCheck{
 			Name:   forkLineageCheckName,
 			Status: StatusWarning,
 			Message: fmt.Sprintf(
@@ -90,14 +133,14 @@ func checkForkMigrationLineage(ctx context.Context, db schema.DBConn) DoctorChec
 			Category: CategoryData,
 		}
 	case schema.ForkLineageReconciled:
-		return DoctorCheck{
+		return report, DoctorCheck{
 			Name:     forkLineageCheckName,
 			Status:   StatusOK,
 			Message:  fmt.Sprintf("Reconciled (main=v%d, ignored=v%d); fork and upstream schema effects verified", report.MainVersion, report.IgnoredVersion),
 			Category: CategoryData,
 		}
 	case schema.ForkLineageInconsistent:
-		return DoctorCheck{
+		return report, DoctorCheck{
 			Name:   forkLineageCheckName,
 			Status: StatusError,
 			Message: fmt.Sprintf(
@@ -108,7 +151,7 @@ func checkForkMigrationLineage(ctx context.Context, db schema.DBConn) DoctorChec
 			Category: CategoryData,
 		}
 	default: // ForkLineageNotApplicable
-		return DoctorCheck{
+		return report, DoctorCheck{
 			Name:     forkLineageCheckName,
 			Status:   StatusOK,
 			Message:  fmt.Sprintf("N/A (main=v%d predates the renumbered range; nothing to verify)", report.MainVersion),

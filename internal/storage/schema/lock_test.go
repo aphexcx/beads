@@ -362,6 +362,16 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectIgnorePatternSeed(mock, latest-1)
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
+	expectDoltStatusRows(mock)
+	// The seed changed rows (expectIgnorePatternSeed reports RowsAffected=1),
+	// so MigrateUp commits it scoped+labeled before the pass runs (#4566: the
+	// seed must not ride the per-step pass commits) — and before the
+	// fork-lineage reconciliation, whose refusal must leave dolt_status as
+	// found (gp-w0nu).
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
+		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
+		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
 	// bd-dn6 fork-lineage reconciliation probes both cursor tables for the
 	// pre-merge fork fingerprint rows (main 54, ignored 11); neither exists
 	// in this mocked world, so both cursors are left alone.
@@ -372,14 +382,6 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
 	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
-	expectDoltStatusRows(mock)
-	// The seed changed rows (expectIgnorePatternSeed reports RowsAffected=1),
-	// so MigrateUp commits it scoped+labeled before the pass runs (#4566: the
-	// seed must not ride the per-step pass commits).
-	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
-		WillReturnRows(sqlmock.NewRows([]string{"status"}))
-	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
-		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
 	expectDoltStatusRows(mock)
 	// MigrateUp probes the aux-rekey crash sentinel (bd-578h9.16); this
 	// mocked world has no local_metadata table, so no crashed pass.
@@ -542,15 +544,15 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 	// migrationWorkNeeded: main cursor behind -> work needed (short-circuits).
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", cursor)
+	// dirtyBeforeAll: `events` dirty (working set only, not staged).
+	expectDoltStatusDirtyEvents(mock)
+	// Nothing staged -> no unstage exec; seed was a no-op -> no seed commit.
 	// Fork-lineage reconciliation: no bd-dn6 fingerprint (main row 54) and no
 	// 2026-08 upmerge fingerprints (main row 73, ignored row 22) in this
 	// mocked world, so both reconcilers no-op.
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
 	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
-	// dirtyBeforeAll: `events` dirty (working set only, not staged).
-	expectDoltStatusDirtyEvents(mock)
-	// Nothing staged -> no unstage exec; seed was a no-op -> no seed commit.
 	// committableDirtyTables re-reads dolt_status (ignored tables excluded).
 	expectDoltStatusDirtyEvents(mock)
 	// auxRekeyResumePending: no local_metadata table, no crashed rekey pass.
@@ -558,6 +560,7 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	// failed0053DirtyTablesAreRecoverable: dirtyBefore is non-empty, so it
 	// reads the cursor once; != 52 ends the check (fork v53 recovery).
+	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", cursor)
 	// pendingMigrationDirtyTables: cursor read, then pending 0062's SQL
 	// touches `events` -> DirtyTablesError.
@@ -851,11 +854,9 @@ func TestMigrateUpWithLockFreshBootstrapHealCapabilityIsOneShot(t *testing.T) {
 	expectIgnorePatternSeedNoop(mock, LatestVersion()-2)
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion()-2)
-	// Fork-lineage reconciliation re-probes its fingerprints on the rerun
-	// (bd-dn6 row 54; 2026-08 upmerge rows 73 / ignored 22): all absent.
-	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
-	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
-	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
+	// The pre-migration dolt_status read now precedes the fork-lineage
+	// reconciliation (gp-w0nu), so the injected transient failure lands
+	// before any fingerprint is probed.
 	mock.ExpectQuery("(?s)SELECT s\\.table_name, s\\.staged\\s+FROM dolt_status s").
 		WillReturnError(errors.New("connection reset"))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
