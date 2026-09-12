@@ -2,13 +2,13 @@ package doctor
 
 import (
 	"context"
-	"regexp"
-	"strings"
-
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"testing"
+
+	sqlmock "github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
@@ -108,16 +108,18 @@ func TestForkLineageStoreHasServer(t *testing.T) {
 // the recorded MAX refusal, rather than claim the schema was verified.
 func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 	cases := []struct {
-		name                string
-		mainMax, ignoredMax int
-		oldScheme           bool
-		status              string
-		detail              string
+		name                                  string
+		mainMax, ignoredMax                   int
+		oldScheme, mixedScheme, missingEffect bool
+		status                                string
+		detail                                string
 	}{
-		{"bd-dn6", 54, 11, true, StatusWarning, "This database shows the bd-dn6 scheme."},
-		{"2026-08 upmerge", 73, 22, false, StatusWarning, "This database shows the 2026-08 upmerge scheme."},
-		{"unexpected main MAX", 74, 22, false, StatusError, "schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor"},
-		{"unexpected ignored MAX", 73, 28, false, StatusError, "ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"},
+		{"bd-dn6", 54, 11, true, false, false, StatusWarning, "This database shows the bd-dn6 scheme."},
+		{"2026-08 upmerge", 73, 22, false, false, false, StatusWarning, "This database shows the 2026-08 upmerge scheme."},
+		{"both schemes", 54, 22, true, true, false, StatusWarning, "This database shows the bd-dn6 and 2026-08 upmerge schemes."},
+		{"missing main effect", 73, 22, false, false, true, StatusError, "schema_migrations records fork migrations 70-73 but column comments.external_ref (fork 0072) is missing; schema does not match the recorded cursor"},
+		{"unexpected main MAX", 74, 22, false, false, false, StatusError, "schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor"},
+		{"unexpected ignored MAX", 73, 28, false, false, false, StatusError, "ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,18 +150,43 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 0, "leases", "granted_node")
 			query("SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", tc.ignoredMax)
 			row("schema_migrations", 54, 1)
-			row("ignored_schema_migrations", 11, 1)
+			if tc.mixedScheme {
+				row("ignored_schema_migrations", 11, 0)
+			} else {
+				row("ignored_schema_migrations", 11, 1)
+			}
 			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 0, "issues", "lease_expires_at")
 			if tc.oldScheme {
 				row("schema_migrations", 55, 0)
 				row("schema_migrations", 73, 0)
-				row("ignored_schema_migrations", 22, 0)
+				if tc.mixedScheme {
+					row("ignored_schema_migrations", 22, 1)
+					row("ignored_schema_migrations", 14, 0)
+				} else {
+					row("ignored_schema_migrations", 22, 0)
+				}
 			} else {
 				row("schema_migrations", 55, 1)
 				row("schema_migrations", 73, 1)
 				row("schema_migrations", 56, 0)
 				row("ignored_schema_migrations", 22, 1)
 				row("ignored_schema_migrations", 14, 0)
+			}
+
+			if tc.status == StatusWarning || tc.missingEffect {
+				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_label_snapshots")
+				externalRef := 1
+				if tc.missingEffect {
+					externalRef = 0
+				}
+				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", externalRef, "comments", "external_ref")
+				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 1, "comments", "updated_at")
+				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "attachments")
+				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_issue_snapshots")
+				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_project_snapshots")
+				if !tc.oldScheme || tc.mixedScheme {
+					query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 1, "wisp_comments", "external_ref")
+				}
 			}
 
 			check := checkForkMigrationLineage(context.Background(), db)
@@ -173,7 +200,7 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 				t.Fatalf("false verification: %s", check.Message)
 			}
 			if tc.status == StatusWarning {
-				for _, text := range []string{"bd-dn6 (fork 0051-0054", "ignored 0010-0011", "2026-08 upmerge (main 0070-0073", "ignored 0020-0022", "clone-local"} {
+				for _, text := range []string{"bd-dn6 (fork 0051-0054", "ignored 0010-0011 → 0020-0021 before the upmerge, now 0025-0026", "2026-08 upmerge (main 0070-0073", "ignored 0020-0022", "clone-local"} {
 					if !strings.Contains(check.Detail, text) {
 						t.Errorf("Detail does not contain %q: %s", text, check.Detail)
 					}

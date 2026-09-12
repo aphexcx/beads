@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -375,6 +376,31 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 	fresh := pinConn(t, ctx, db)
 	requireVersions(t, "fresh-session schema_migrations AS OF HEAD",
 		cursorVersions(t, ctx, fresh, mainSource.cursorTable+" AS OF 'HEAD'"), embeddedVersions(mainSource))
+}
+
+// A recorded fork migration cannot promise reconciliation when its DDL is
+// missing. The healthy fixture is built independently by the migration test.
+func TestForkReconcile_MissingMainEffectOnSQLServer(t *testing.T) {
+	port := startScratchDoltServer(t)
+	ctx := context.Background()
+	db := openScratchDatabase(t, ctx, port, "missing_main_effect")
+	conn := pinConn(t, ctx, db)
+	buildPreUpmergeStore(t, ctx, conn)
+	if _, err := conn.ExecContext(ctx, "ALTER TABLE comments DROP COLUMN external_ref"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "schema_migrations records fork migrations 70-73 but column comments.external_ref (fork 0072) is missing; schema does not match the recorded cursor"
+	report, err := VerifyForkLineageState(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Status != ForkLineageInconsistent || len(report.Problems) != 1 || report.Problems[0] != want {
+		t.Errorf("lineage with missing main effect = %+v; want inconsistent with %q", report, want)
+	}
+	if _, err := MigrateUp(ctx, conn); !errors.Is(err, errRefusedRewrite) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("MigrateUp = %v; want the same missing-effect refusal wrapping errRefusedRewrite", err)
+	}
 }
 
 // TestForkReconcile_RefusalLeavesWorkingSetAsFoundOnSQLServer pins scope
