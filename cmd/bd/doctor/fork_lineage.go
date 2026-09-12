@@ -153,7 +153,9 @@ func classifyForkMigrationLineage(ctx context.Context, db schema.DBConn) (schema
 			Message: fmt.Sprintf(
 				"Pre-merge fork migration cursor detected (main=v%d, ignored=v%d)",
 				report.MainVersion, report.IgnoredVersion),
-			Detail:   "This database was last migrated by a pre-merge fork binary. The next bd write command will reconcile the cursor to the renumbered scheme (fork 0051-0054 → 0070-0073, ignored 0010-0011 → 0020-0021) and apply upstream's 0051-0053.",
+			Detail: fmt.Sprintf(
+				"This database shows the %s scheme. The next bd write command will reconcile the cursor and apply pending upstream migrations. Supported renumberings: bd-dn6 (fork 0051-0054 → 0070-0073, ignored 0010-0011 → 0020-0021); 2026-08 upmerge (main 0070-0073 re-recorded after upstream 0056-0066, ignored 0020-0022 → 0025-0027).",
+				strings.Join(report.PreMergeSchemes, " and ")),
 			Fix:      "Run any bd write command (e.g. `bd migrate`) with the new binary to reconcile.",
 			Category: CategoryData,
 		}

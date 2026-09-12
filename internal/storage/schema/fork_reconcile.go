@@ -175,7 +175,7 @@ func cursorMaxVersion(ctx context.Context, db DBConn, table string) (int, error)
 	return current, nil
 }
 
-func planUpmergeMainCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
+func hasPreUpmergeMainCursor(ctx context.Context, db DBConn) (bool, error) {
 	// Row 73 (fork create_attachments) without row 56 (upstream
 	// add_comments_keyset_index) is the pre-upmerge fingerprint: any database
 	// that migrated through the merged lineage records 0056 before it can
@@ -183,10 +183,15 @@ func planUpmergeMainCursor(ctx context.Context, db DBConn) (*cursorRewrite, erro
 	// 56 without 73, never 73 without 56.
 	has73, err := cursorRowExists(ctx, db, mainSource.cursorTable, 73)
 	if err != nil || !has73 {
-		return nil, err
+		return false, err
 	}
 	has56, err := cursorRowExists(ctx, db, mainSource.cursorTable, 56)
-	if err != nil || has56 {
+	return !has56, err
+}
+
+func planUpmergeMainCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
+	preUpmerge, err := hasPreUpmergeMainCursor(ctx, db)
+	if err != nil || !preUpmerge {
 		return nil, err
 	}
 
@@ -231,17 +236,22 @@ func planUpmergeMainCursor(ctx context.Context, db DBConn) (*cursorRewrite, erro
 	return &cursorRewrite{desc: "pre-upmerge main cursor", table: mainSource.cursorTable, lo: 70, hi: 73}, nil
 }
 
-func planUpmergeIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
+func hasPreUpmergeIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {
 	// Row 22 (fork add_wisp_comment_external_ref) without row 14 (upstream
 	// add_wisp_comments_keyset_index) is the pre-upmerge ignored fingerprint,
 	// by the same prefix argument as the main chain: the merged series
 	// records 14 before anything can record 22.
 	has22, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, 22)
 	if err != nil || !has22 {
-		return nil, err
+		return false, err
 	}
 	has14, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, 14)
-	if err != nil || has14 {
+	return !has14, err
+}
+
+func planUpmergeIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
+	preUpmerge, err := hasPreUpmergeIgnoredCursor(ctx, db)
+	if err != nil || !preUpmerge {
 		return nil, err
 	}
 
@@ -638,13 +648,14 @@ func verifyForkCursorHashes(ctx context.Context, db DBConn, src migrationSource,
 }
 
 // ForkLineageStatus classifies a database's position relative to the bd-dn6
-// fork migration renumbering. Used by `bd doctor` to verify prod databases
-// before and after the binary swap.
+// and 2026-08 upmerge fork migration renumberings. Used by `bd doctor` to
+// verify prod databases before and after the binary swap.
 type ForkLineageStatus string
 
 const (
 	// ForkLineagePreMerge: pre-merge fork cursor rows present (main 54 and/or
-	// ignored 11); reconciliation will run on the next migration pass.
+	// ignored 11, or pre-upmerge main 73 / ignored 22 without upstream
+	// rows 56 / 14); reconciliation will run on the next migration pass.
 	ForkLineagePreMerge ForkLineageStatus = "pre-merge"
 	// ForkLineageReconciled: renumbered rows recorded and every verified
 	// effect from both lineages is present.
@@ -673,6 +684,9 @@ type ForkLineageReport struct {
 	IgnoredCursorMax  int
 	IgnoredCursorNote string
 	Problems          []string // populated when Status == ForkLineageInconsistent
+	// PreMergeSchemes names the detected renumberings: bd-dn6 and/or
+	// 2026-08 upmerge. Populated even when a cursor MAX is inconsistent.
+	PreMergeSchemes []string
 }
 
 // VerifyForkLineageState probes the cursors and the actual schema
@@ -730,25 +744,46 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 		}
 	}
 
+	preUpmergeMain, err := hasPreUpmergeMainCursor(ctx, db)
+	if err != nil {
+		return report, err
+	}
+	preUpmergeIgnored, err := hasPreUpmergeIgnoredCursor(ctx, db)
+	if err != nil {
+		return report, err
+	}
 	if has54 || has11 {
-		// A fingerprint row that coexists with an unexpected MAX is a state
-		// the reconciler refuses to rewrite — report it as inconsistent
-		// rather than "will reconcile on the next write" (which would be a
-		// false promise).
-		if has54 && report.MainVersion != forkPreMergeMainMax {
+		report.PreMergeSchemes = append(report.PreMergeSchemes, "bd-dn6")
+	}
+	if preUpmergeMain || preUpmergeIgnored {
+		report.PreMergeSchemes = append(report.PreMergeSchemes, "2026-08 upmerge")
+	}
+	// Check every detected fingerprint before returning PreMerge: one chain
+	// may need reconciliation while the other has a cursor it will refuse.
+	// MainVersion is the recorded MAX (mainSource has no healing sentinels);
+	// the ignored chain must use IgnoredCursorMax, never its healed version.
+	for _, fingerprint := range []struct {
+		present bool
+		table   string
+		wantMax int
+		gotMax  int
+	}{
+		{has54, mainSource.cursorTable, forkPreMergeMainMax, report.MainVersion},
+		{has11, ignoredSource.cursorTable, forkPreMergeIgnoredMax, report.IgnoredCursorMax},
+		{preUpmergeMain, mainSource.cursorTable, 73, report.MainVersion},
+		{preUpmergeIgnored, ignoredSource.cursorTable, 22, report.IgnoredCursorMax},
+	} {
+		if fingerprint.present && fingerprint.gotMax != fingerprint.wantMax {
 			report.Problems = append(report.Problems, fmt.Sprintf(
-				"schema_migrations row %d coexists with MAX(version)=%d; reconciliation will refuse this cursor",
-				forkPreMergeMainMax, report.MainVersion))
+				"%s row %d coexists with MAX(version)=%d; reconciliation will refuse this cursor",
+				fingerprint.table, fingerprint.wantMax, fingerprint.gotMax))
 		}
-		if has11 && report.IgnoredCursorMax != forkPreMergeIgnoredMax {
-			report.Problems = append(report.Problems, fmt.Sprintf(
-				"ignored_schema_migrations row %d coexists with MAX(version)=%d; reconciliation will refuse this cursor",
-				forkPreMergeIgnoredMax, report.IgnoredCursorMax))
-		}
-		if len(report.Problems) > 0 {
-			report.Status = ForkLineageInconsistent
-			return report, nil
-		}
+	}
+	if len(report.Problems) > 0 {
+		report.Status = ForkLineageInconsistent
+		return report, nil
+	}
+	if len(report.PreMergeSchemes) > 0 {
 		report.Status = ForkLineagePreMerge
 		return report, nil
 	}

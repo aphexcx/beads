@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -421,6 +422,9 @@ func TestVerifyForkLineageState_MixedCursor_Inconsistent(t *testing.T) {
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
 	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 
+	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+
 	report, err := VerifyForkLineageState(context.Background(), db)
 	if err != nil {
 		t.Fatalf("VerifyForkLineageState: %v", err)
@@ -731,4 +735,130 @@ func TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
 	}
+}
+
+// These cases pin the classification consumed by doctor, including a healed
+// ignored reading of 0 that must never replace the recorded MAX in the check.
+func TestVerifyForkLineageState_Upmerge(t *testing.T) {
+	cases := []struct {
+		name                                               string
+		mainMax, ignoredMax                                int
+		mainFingerprint, ignoredFingerprint, healedIgnored bool
+		oldMain                                            bool
+		want                                               ForkLineageStatus
+		problems                                           []string
+	}{
+		{name: "both pre-upmerge", mainMax: 73, ignoredMax: 22, mainFingerprint: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineagePreMerge},
+		{name: "main only", mainMax: 73, ignoredMax: 28, mainFingerprint: true, want: ForkLineagePreMerge},
+		{name: "ignored only", mainMax: 73, ignoredMax: 22, ignoredFingerprint: true, healedIgnored: true, want: ForkLineagePreMerge},
+		{name: "main unexpected MAX", mainMax: 74, ignoredMax: 22, mainFingerprint: true, ignoredFingerprint: true, want: ForkLineageInconsistent, problems: []string{"schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor"}},
+		{name: "ignored unexpected recorded MAX despite healed zero", mainMax: 73, ignoredMax: 28, mainFingerprint: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineageInconsistent, problems: []string{"ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"}},
+		{name: "both unexpected MAX", mainMax: 74, ignoredMax: 23, mainFingerprint: true, ignoredFingerprint: true, want: ForkLineageInconsistent, problems: []string{"schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor", "ignored_schema_migrations row 22 coexists with MAX(version)=23; reconciliation will refuse this cursor"}},
+		{name: "bd-dn6 main with inconsistent upmerge ignored", mainMax: 54, ignoredMax: 28, oldMain: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineageInconsistent, problems: []string{"ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"}},
+		{name: "merged main 73 ignored 1-28", mainMax: 73, ignoredMax: 28, want: ForkLineageReconciled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			expectCursorProbe(mock, "schema_migrations", true)
+			expectMaxVersion(mock, "schema_migrations", tc.mainMax)
+			expectCursorProbe(mock, "ignored_schema_migrations", true)
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+			expectTableProbe(mock, "wisps", true)
+			expectTableProbe(mock, "wisp_dependencies", true)
+			expectColumnProbe(mock, "leases", "granted_node", !tc.healedIgnored)
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+			expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+			if tc.oldMain {
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 0)
+			} else {
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
+			}
+			expectColumnProbe(mock, "issues", "lease_expires_at", false)
+			if tc.oldMain {
+				expectCursorRowProbe(mock, "schema_migrations", 55, 0)
+				expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+			} else {
+				expectCursorRowProbe(mock, "schema_migrations", 55, 1)
+				expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+			}
+			main56, ignored14 := 1, 1
+			if tc.mainFingerprint {
+				main56 = 0
+			}
+			if tc.ignoredFingerprint {
+				ignored14 = 0
+			}
+			if !tc.oldMain {
+				expectCursorRowProbe(mock, "schema_migrations", 56, main56)
+			}
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 14, ignored14)
+			if tc.want == ForkLineageReconciled {
+				expectReconciledLineageProbes(mock)
+			}
+
+			report, err := VerifyForkLineageState(context.Background(), db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Status != tc.want {
+				t.Fatalf("Status = %q, want %q; report: %+v", report.Status, tc.want, report)
+			}
+			var wantSchemes []string
+			if tc.oldMain {
+				wantSchemes = []string{"bd-dn6", "2026-08 upmerge"}
+			} else if tc.want != ForkLineageReconciled {
+				wantSchemes = []string{"2026-08 upmerge"}
+			}
+			if !reflect.DeepEqual(report.PreMergeSchemes, wantSchemes) {
+				t.Fatalf("PreMergeSchemes = %v, want %v", report.PreMergeSchemes, wantSchemes)
+			}
+			if !reflect.DeepEqual(report.Problems, tc.problems) {
+				t.Fatalf("Problems = %v, want %v", report.Problems, tc.problems)
+			}
+			if tc.healedIgnored && (report.IgnoredVersion != 0 || report.IgnoredCursorMax != tc.ignoredMax || report.IgnoredCursorNote == "") {
+				t.Fatalf("lost recorded/healed ignored distinction: %+v", report)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func expectReconciledLineageProbes(mock sqlmock.Sqlmock) {
+	for _, v := range []int{70, 71, 72, 73} {
+		expectCursorRowProbe(mock, "schema_migrations", v, 1)
+	}
+	expectTableProbe(mock, "linear_label_snapshots", true)
+	expectColumnProbe(mock, "comments", "external_ref", true)
+	expectColumnProbe(mock, "comments", "updated_at", true)
+	expectLineageIndexProbe(mock, "comments", "idx_comments_external_ref")
+	expectTableProbe(mock, "attachments", true)
+	expectLineageIndexProbe(mock, "issues", "idx_issues_status_updated_at")
+	expectLineageIndexProbe(mock, "issues", "idx_issues_defer_until")
+	expectLineageDefaultProbe(mock, "events")
+	expectLineageDefaultProbe(mock, "comments")
+	for _, v := range []int{20, 21} {
+		expectCursorRowProbe(mock, "ignored_schema_migrations", v, 1)
+	}
+	expectTableProbe(mock, "linear_issue_snapshots", true)
+	expectTableProbe(mock, "linear_project_snapshots", true)
+	expectLineageDefaultProbe(mock, "wisp_events")
+	for _, v := range []int{25, 26, 27} {
+		expectCursorRowProbe(mock, "ignored_schema_migrations", v, 1)
+	}
+}
+
+func expectLineageIndexProbe(mock sqlmock.Sqlmock, table, index string) {
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.STATISTICS`).WithArgs(table, index).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+}
+
+func expectLineageDefaultProbe(mock sqlmock.Sqlmock, table string) {
+	mock.ExpectQuery(`SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA\.COLUMNS`).WithArgs(table, "id").WillReturnRows(sqlmock.NewRows([]string{"COLUMN_DEFAULT"}).AddRow(nil))
 }

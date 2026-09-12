@@ -329,6 +329,9 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 	db := openScratchDatabase(t, ctx, port, "preupmerge")
 	conn := pinConn(t, ctx, db)
 	buildPreUpmergeStore(t, ctx, conn)
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineagePreMerge {
+		t.Fatalf("lineage before MigrateUp = %+v, %v; want pre-merge", report, err)
+	}
 
 	// The diagnosis, pinned in the migration session itself: the table's
 	// recorded MAX is 22 and the fork column is present — the in-session
@@ -358,6 +361,9 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 		cursorVersions(t, ctx, conn, ignoredSource.cursorTable), embeddedVersions(ignoredSource))
 	requireColumn(t, ctx, conn, "leases", "granted_node", true)
 	requireColumn(t, ctx, conn, "wisp_comments", "external_ref", true)
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineageReconciled {
+		t.Fatalf("lineage after MigrateUp = %+v, %v; want reconciled", report, err)
+	}
 	if dirty, err := dirtyTables(ctx, conn, true); err != nil {
 		t.Fatalf("dirtyTables: %v", err)
 	} else if len(dirty) != 0 {
