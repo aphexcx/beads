@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/testutil"
 )
 
 // TestLinearProjectSnapshotCRUD is bd-6cl P1's regression test —
@@ -15,9 +16,7 @@ import (
 // side field-scoped conflict detection. Mirrors the linear_issue
 // equivalent.
 func TestLinearProjectSnapshotCRUD(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode")
-	}
+	testutil.RequireLinearFixture(t)
 	env := newTestEnv(t, "psnap")
 	ctx := t.Context()
 
@@ -88,9 +87,7 @@ func TestLinearProjectSnapshotCRUD(t *testing.T) {
 // logic can distinguish "Linear has no content" from "we never
 // recorded content."
 func TestLinearProjectSnapshotEmptyContent(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode")
-	}
+	testutil.RequireLinearFixture(t)
 	env := newTestEnv(t, "psnpe")
 	ctx := t.Context()
 

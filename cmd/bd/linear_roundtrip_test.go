@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/linear"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/testutil"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -875,12 +876,10 @@ func enableLabelSyncForTest(t *testing.T, store interface {
 // wired together for label-sync roundtrip tests. Returns the parts the tests
 // need to seed state and observe results.
 //
-// Skips in short mode and when no Dolt server is available (standard pattern).
+// Honors BEADS_TEST_SKIP=linear-fixture and skips when no Dolt server is available.
 func setupLabelSyncTest(t *testing.T) (sourceStore *dolt.DoltStore, mock *mockLinearServer, lt *linear.Tracker, engine *tracker.Engine) {
 	t.Helper()
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+	testutil.RequireLinearFixture(t)
 
 	ctx := context.Background()
 	teamID := "test-team-uuid"
