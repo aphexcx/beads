@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -329,6 +330,9 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 	db := openScratchDatabase(t, ctx, port, "preupmerge")
 	conn := pinConn(t, ctx, db)
 	buildPreUpmergeStore(t, ctx, conn)
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineagePreMerge {
+		t.Fatalf("lineage before MigrateUp = %+v, %v; want pre-merge", report, err)
+	}
 
 	// The diagnosis, pinned in the migration session itself: the table's
 	// recorded MAX is 22 and the fork column is present — the in-session
@@ -358,6 +362,9 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 		cursorVersions(t, ctx, conn, ignoredSource.cursorTable), embeddedVersions(ignoredSource))
 	requireColumn(t, ctx, conn, "leases", "granted_node", true)
 	requireColumn(t, ctx, conn, "wisp_comments", "external_ref", true)
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineageReconciled {
+		t.Fatalf("lineage after MigrateUp = %+v, %v; want reconciled", report, err)
+	}
 	if dirty, err := dirtyTables(ctx, conn, true); err != nil {
 		t.Fatalf("dirtyTables: %v", err)
 	} else if len(dirty) != 0 {
@@ -369,6 +376,56 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 	fresh := pinConn(t, ctx, db)
 	requireVersions(t, "fresh-session schema_migrations AS OF HEAD",
 		cursorVersions(t, ctx, fresh, mainSource.cursorTable+" AS OF 'HEAD'"), embeddedVersions(mainSource))
+}
+
+// A recorded fork migration cannot promise reconciliation when its DDL is
+// missing. The healthy fixture is built independently by the migration test.
+func TestForkReconcile_MissingMainEffectOnSQLServer(t *testing.T) {
+	port := startScratchDoltServer(t)
+	ctx := context.Background()
+	db := openScratchDatabase(t, ctx, port, "missing_main_effect")
+	conn := pinConn(t, ctx, db)
+	buildPreUpmergeStore(t, ctx, conn)
+	if _, err := conn.ExecContext(ctx, "ALTER TABLE comments DROP COLUMN external_ref"); err != nil {
+		t.Fatal(err)
+	}
+
+	want := "schema_migrations records fork migrations 70-73 but column comments.external_ref (fork 0072) is missing; schema does not match the recorded cursor"
+	report, err := VerifyForkLineageState(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dropping the column also removes its index; doctor now reports both.
+	if report.Status != ForkLineageInconsistent || len(report.Problems) != 2 || report.Problems[0] != want || report.Problems[1] != "index comments.idx_comments_external_ref (fork 0072)" {
+		t.Errorf("lineage with missing main effect = %+v; want inconsistent with %q", report, want)
+	}
+	if _, err := MigrateUp(ctx, conn); !errors.Is(err, errRefusedRewrite) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("MigrateUp = %v; want the same missing-effect refusal wrapping errRefusedRewrite", err)
+	}
+}
+
+// Upstream 0052 already ran on this shape, so reconciliation starting at
+// main 0056 cannot restore its missing index.
+func TestForkReconcile_PreUpmergeMissingUpstreamIndexOnSQLServer(t *testing.T) {
+	port := startScratchDoltServer(t)
+	ctx := context.Background()
+	db := openScratchDatabase(t, ctx, port, "missing_upstream_index")
+	conn := pinConn(t, ctx, db)
+	buildPreUpmergeStore(t, ctx, conn)
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineagePreMerge {
+		t.Fatalf("healthy pre-upmerge lineage = %+v, %v; want pre-merge", report, err)
+	}
+	if _, err := conn.ExecContext(ctx, "DROP INDEX idx_issues_defer_until ON issues"); err != nil {
+		t.Fatal(err)
+	}
+	report, err := VerifyForkLineageState(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "index issues.idx_issues_defer_until (upstream 0052)"
+	if report.Status != ForkLineageInconsistent || len(report.Problems) != 1 || report.Problems[0] != want {
+		t.Fatalf("lineage with missing upstream index = %+v; want inconsistent with %q", report, want)
+	}
 }
 
 // TestForkReconcile_RefusalLeavesWorkingSetAsFoundOnSQLServer pins scope
@@ -495,5 +552,42 @@ func TestForkReconcile_MergedStore_MovesIgnoredCursorOnSQLServer(t *testing.T) {
 		t.Fatalf("dirtyTables: %v", err)
 	} else if len(dirty) != 0 {
 		t.Fatalf("pass left committable tables dirty: %v", sortedDirtyTableNames(dirty))
+	}
+}
+
+// A partial pass can reconcile main while leaving the clone-local ignored
+// cursor pre-upmerge. Missing main effects must still be diagnosed.
+func TestForkReconcile_MixedChainMissingMainEffectOnSQLServer(t *testing.T) {
+	port := startScratchDoltServer(t)
+	ctx := context.Background()
+	db := openScratchDatabase(t, ctx, port, "mixed_chain_missing_main_effect")
+	conn := pinConn(t, ctx, db)
+	buildPreUpmergeStore(t, ctx, conn)
+	if changed, err := applyPlanned(ctx, conn, planUpmergeMainCursor); err != nil || !changed {
+		t.Fatalf("reconcile fixture main cursor = %t, %v; want rewrite", changed, err)
+	}
+	if _, err := runMigrations(ctx, conn, mainSource, 55, 73, false); err != nil {
+		t.Fatalf("complete fixture main migrations: %v", err)
+	}
+	commitAll(t, ctx, conn, "fixture: main reconciled with ignored still pre-upmerge")
+	requireVersions(t, "mixed fixture main", cursorVersions(t, ctx, conn, mainSource.cursorTable), embeddedVersions(mainSource))
+	if pre, err := hasPreUpmergeIgnoredCursor(ctx, conn); err != nil || !pre {
+		t.Fatalf("fixture ignored pre-upmerge = %t, %v; want true", pre, err)
+	}
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineagePreMerge {
+		t.Fatalf("healthy mixed lineage = %+v, %v; want pre-merge", report, err)
+	}
+	if _, err := conn.ExecContext(ctx, "ALTER TABLE comments DROP COLUMN external_ref"); err != nil {
+		t.Fatal(err)
+	}
+	report, err := VerifyForkLineageState(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Status != ForkLineageInconsistent || !strings.Contains(strings.Join(report.Problems, "; "), "column comments.external_ref (fork 0072)") {
+		t.Fatalf("mixed lineage with missing main effect = %+v; want inconsistent naming comments.external_ref", report)
+	}
+	if len(report.PreMergeSchemes) != 1 || report.PreMergeSchemes[0] != "2026-08 upmerge" {
+		t.Fatalf("PreMergeSchemes = %v; want only 2026-08 upmerge", report.PreMergeSchemes)
 	}
 }

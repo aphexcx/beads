@@ -15,14 +15,13 @@ import (
 
 const forkLineageCheckName = "Fork Migration Lineage"
 
-// CheckForkMigrationLineage verifies the bd-dn6 fork migration renumbering
-// state: databases migrated by a pre-merge fork binary recorded the fork's
-// migrations under numbers upstream v1.1.0-rc.1 now owns (main 0051-0054,
-// ignored 0010-0011). The migration runner reconciles those cursors
-// automatically; this check reports where a database stands and — critically —
-// verifies column-by-column that a reconciled cursor matches the actual
-// schema, catching the silent skew where a version number claims DDL that
-// never ran.
+// CheckForkMigrationLineage verifies both the bd-dn6 fork renumbering
+// (main 0051-0054, ignored 0010-0011) and the 2026-08 upmerge renumbering
+// (main 0070-0073, ignored 0020-0022). The migration runner reconciles these
+// cursors automatically; this check verifies the required schema effects
+// before reporting a pre-merge cursor as reconcilable, and verifies both
+// fork and upstream effects on a reconciled cursor. It catches silent skew
+// where a recorded version claims DDL that never ran.
 //
 // Read-only diagnostic; it never gates anything.
 func CheckForkMigrationLineage(ss *SharedStore) DoctorCheck {
@@ -147,13 +146,19 @@ func classifyForkMigrationLineage(ctx context.Context, db schema.DBConn) (schema
 
 	switch report.Status {
 	case schema.ForkLineagePreMerge:
+		schemeWord := "scheme"
+		if len(report.PreMergeSchemes) > 1 {
+			schemeWord = "schemes"
+		}
 		return report, DoctorCheck{
 			Name:   forkLineageCheckName,
 			Status: StatusWarning,
 			Message: fmt.Sprintf(
 				"Pre-merge fork migration cursor detected (main=v%d, ignored=v%d)",
 				report.MainVersion, report.IgnoredVersion),
-			Detail:   "This database was last migrated by a pre-merge fork binary. The next bd write command will reconcile the cursor to the renumbered scheme (fork 0051-0054 → 0070-0073, ignored 0010-0011 → 0020-0021) and apply upstream's 0051-0053.",
+			Detail: fmt.Sprintf(
+				"This database shows the %s %s. The next bd write command will reconcile the cursor and apply pending upstream migrations. Supported renumberings: bd-dn6 (fork 0051-0054 → 0070-0073, ignored 0010-0011 → 0020-0021 before the upmerge, now 0025-0026); 2026-08 upmerge (main 0070-0073 re-recorded after upstream 0056-0066, ignored 0020-0022 → 0025-0027).",
+				strings.Join(report.PreMergeSchemes, " and "), schemeWord),
 			Fix:      "Run any bd write command (e.g. `bd migrate`) with the new binary to reconcile.",
 			Category: CategoryData,
 		}
