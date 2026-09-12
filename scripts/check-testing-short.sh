@@ -5,6 +5,7 @@ set -euo pipefail
 
 allowed=$(
   cat <<'EOF'
+cmd/bd/linear_sync_profile_test.go::TestLinearSyncRequestProfile
 internal/hooks/hooks_test.go::TestRunSync_Timeout
 internal/hooks/hooks_test.go::TestRunSync_KillsDescendants
 internal/testutil/fixtures/fixtures_test.go::TestXLargeDolt
