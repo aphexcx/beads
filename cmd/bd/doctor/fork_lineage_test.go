@@ -117,6 +117,7 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 		{"bd-dn6", 54, 11, true, false, false, StatusWarning, "This database shows the bd-dn6 scheme."},
 		{"2026-08 upmerge", 73, 22, false, false, false, StatusWarning, "This database shows the 2026-08 upmerge scheme."},
 		{"both schemes", 54, 22, true, true, false, StatusWarning, "This database shows the bd-dn6 and 2026-08 upmerge schemes."},
+		{"missing upstream tail effect", 73, 22, false, false, false, StatusError, "Missing: index issues.idx_issues_defer_until (upstream 0052)."},
 		{"missing main effect", 73, 22, false, false, true, StatusError, "schema_migrations records fork migrations 70-73 but column comments.external_ref (fork 0072) is missing; schema does not match the recorded cursor"},
 		{"unexpected main MAX", 74, 22, false, false, false, StatusError, "schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor"},
 		{"unexpected ignored MAX", 73, 28, false, false, false, StatusError, "ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"},
@@ -128,7 +129,7 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
-			query := func(sql string, value int, args ...any) {
+			query := func(sql string, value any, args ...any) {
 				expectation := mock.ExpectQuery(regexp.QuoteMeta(sql))
 				if len(args) == 1 {
 					expectation.WithArgs(args[0])
@@ -173,7 +174,7 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 				row("ignored_schema_migrations", 14, 0)
 			}
 
-			if tc.status == StatusWarning || tc.missingEffect {
+			if tc.status == StatusWarning || tc.missingEffect || tc.name == "missing upstream tail effect" {
 				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_label_snapshots")
 				externalRef := 1
 				if tc.missingEffect {
@@ -182,10 +183,29 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", externalRef, "comments", "external_ref")
 				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 1, "comments", "updated_at")
 				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "attachments")
+				if !tc.oldScheme {
+					for _, v := range []int{70, 71, 72, 73} {
+						row("schema_migrations", v, 1)
+					}
+					query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS", 1, "comments", "idx_comments_external_ref")
+					query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS", 1, "issues", "idx_issues_status_updated_at")
+					deferIndex := 1
+					if tc.name == "missing upstream tail effect" {
+						deferIndex = 0
+					}
+					query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS", deferIndex, "issues", "idx_issues_defer_until")
+					query("SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS", nil, "events", "id")
+					query("SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS", nil, "comments", "id")
+				}
 				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_issue_snapshots")
 				query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_project_snapshots")
 				if !tc.oldScheme || tc.mixedScheme {
 					query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 1, "wisp_comments", "external_ref")
+					row("ignored_schema_migrations", 20, 1)
+					row("ignored_schema_migrations", 21, 1)
+					query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_issue_snapshots")
+					query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_project_snapshots")
+					query("SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS", nil, "wisp_events", "id")
 				}
 			}
 
@@ -255,6 +275,11 @@ func TestCheckForkMigrationLineage_MixedChainMissingMainEffect(t *testing.T) {
 	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_issue_snapshots")
 	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_project_snapshots")
 	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 1, "wisp_comments", "external_ref")
+	row("ignored_schema_migrations", 20, 1)
+	row("ignored_schema_migrations", 21, 1)
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_issue_snapshots")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_project_snapshots")
+	query("SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS", nil, "wisp_events", "id")
 	for _, version := range []int{70, 71, 72, 73} {
 		row("schema_migrations", version, 1)
 	}

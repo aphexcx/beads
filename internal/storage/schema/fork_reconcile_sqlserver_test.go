@@ -395,11 +395,36 @@ func TestForkReconcile_MissingMainEffectOnSQLServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Status != ForkLineageInconsistent || len(report.Problems) != 1 || report.Problems[0] != want {
+	// Dropping the column also removes its index; doctor now reports both.
+	if report.Status != ForkLineageInconsistent || len(report.Problems) != 2 || report.Problems[0] != want || report.Problems[1] != "index comments.idx_comments_external_ref (fork 0072)" {
 		t.Errorf("lineage with missing main effect = %+v; want inconsistent with %q", report, want)
 	}
 	if _, err := MigrateUp(ctx, conn); !errors.Is(err, errRefusedRewrite) || !strings.Contains(err.Error(), want) {
 		t.Fatalf("MigrateUp = %v; want the same missing-effect refusal wrapping errRefusedRewrite", err)
+	}
+}
+
+// Upstream 0052 already ran on this shape, so reconciliation starting at
+// main 0056 cannot restore its missing index.
+func TestForkReconcile_PreUpmergeMissingUpstreamIndexOnSQLServer(t *testing.T) {
+	port := startScratchDoltServer(t)
+	ctx := context.Background()
+	db := openScratchDatabase(t, ctx, port, "missing_upstream_index")
+	conn := pinConn(t, ctx, db)
+	buildPreUpmergeStore(t, ctx, conn)
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineagePreMerge {
+		t.Fatalf("healthy pre-upmerge lineage = %+v, %v; want pre-merge", report, err)
+	}
+	if _, err := conn.ExecContext(ctx, "DROP INDEX idx_issues_defer_until ON issues"); err != nil {
+		t.Fatal(err)
+	}
+	report, err := VerifyForkLineageState(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "index issues.idx_issues_defer_until (upstream 0052)"
+	if report.Status != ForkLineageInconsistent || len(report.Problems) != 1 || report.Problems[0] != want {
+		t.Fatalf("lineage with missing upstream index = %+v; want inconsistent with %q", report, want)
 	}
 }
 

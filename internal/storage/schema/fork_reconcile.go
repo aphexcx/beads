@@ -696,8 +696,57 @@ type ForkLineageReport struct {
 	PreMergeSchemes []string
 }
 
+// preMergeExpectedProbe retains the planner's refusal for its own effects;
+// additional tail probes report their existing descriptions directly.
+type preMergeExpectedProbe struct {
+	lineageEffectProbe
+	problem string
+}
+
+func preMergeMainExpectedProbes(ctx context.Context, db DBConn, preUpmerge bool) []preMergeExpectedProbe {
+	if preUpmerge {
+		return combinePreMergeExpectedProbes(upmergeMainEffectProbes(ctx, db), mainReconciledProbes(ctx, db),
+			"schema_migrations records fork migrations 70-73 but %s is missing; schema does not match the recorded cursor")
+	}
+	// bd-dn6 has not applied upstream 0051 onward. Reconciliation renumbers
+	// the fork cursor, then applies those migrations; only fork effects are
+	// required beforehand. An August store has already applied them.
+	return combinePreMergeExpectedProbes(forkMainEffectProbes(ctx, db), nil,
+		fmt.Sprintf("schema_migrations records fork migrations 51-%d but %%s is missing; schema does not match the recorded cursor", forkPreMergeMainMax))
+}
+
+func preMergeIgnoredExpectedProbes(ctx context.Context, db DBConn, preUpmerge bool, recordedMax int) []preMergeExpectedProbe {
+	if preUpmerge {
+		// Use the recorded cursor, not the healed reading: a pre-upmerge
+		// cursor at 22 requires the tail's 20 block but not its 25 block.
+		return combinePreMergeExpectedProbes(upmergeIgnoredEffectProbes(ctx, db), ignoredReconciledProbes(ctx, db, recordedMax),
+			"ignored_schema_migrations records fork migrations 20-22 but %s is missing; schema does not match the recorded cursor")
+	}
+	// On bd-dn6, upstream ignored 0010 onward has not run yet; the next
+	// pass applies it after renumbering the fork's 0010-0011.
+	return combinePreMergeExpectedProbes(forkIgnoredEffectProbes(ctx, db), nil,
+		fmt.Sprintf("ignored_schema_migrations records fork migrations 10-%d but %%s is missing; schema does not match the recorded cursor", forkPreMergeIgnoredMax))
+}
+
+func combinePreMergeExpectedProbes(planner, tail []lineageEffectProbe, refusal string) []preMergeExpectedProbe {
+	var probes []preMergeExpectedProbe
+	seen := make(map[string]bool)
+	for _, group := range []struct {
+		probes  []lineageEffectProbe
+		wording string
+	}{{planner, refusal}, {tail, "%s"}} {
+		for _, probe := range group.probes {
+			if !seen[probe.desc] {
+				seen[probe.desc] = true
+				probes = append(probes, preMergeExpectedProbe{probe, fmt.Sprintf(group.wording, probe.desc)})
+			}
+		}
+	}
+	return probes
+}
+
 // mainReconciledProbes verifies the main chain once its cursor is in the
-// renumbered range. Pre-merge chains use their planner's effect probes instead.
+// renumbered range, also expected on a pre-upmerge chain.
 func mainReconciledProbes(ctx context.Context, db DBConn) []lineageEffectProbe {
 	return []lineageEffectProbe{
 		{"cursor row 0070 (fork create_linear_label_snapshots)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 70) }},
@@ -840,18 +889,17 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 		report.Status = ForkLineageInconsistent
 		return report, nil
 	}
-	// A recognized cursor is reconcilable only when the planner's required
-	// effects are present. Keep this after all MAX checks so cursor problems
-	// take precedence, and share the lists with the four planners.
+	// Verify the complete expected set for each pre-merge scheme after all
+	// MAX checks. Planner effects lead, followed by any additional tail
+	// effects that must already be present for this scheme.
 	for _, chain := range []struct {
 		present bool
-		probes  []lineageEffectProbe
-		refusal string
+		probes  []preMergeExpectedProbe
 	}{
-		{has54, forkMainEffectProbes(ctx, db), fmt.Sprintf("schema_migrations records fork migrations 51-%d but %%s is missing; schema does not match the recorded cursor", forkPreMergeMainMax)},
-		{has11, forkIgnoredEffectProbes(ctx, db), fmt.Sprintf("ignored_schema_migrations records fork migrations 10-%d but %%s is missing; schema does not match the recorded cursor", forkPreMergeIgnoredMax)},
-		{preUpmergeMain, upmergeMainEffectProbes(ctx, db), "schema_migrations records fork migrations 70-73 but %s is missing; schema does not match the recorded cursor"},
-		{preUpmergeIgnored, upmergeIgnoredEffectProbes(ctx, db), "ignored_schema_migrations records fork migrations 20-22 but %s is missing; schema does not match the recorded cursor"},
+		{has54, preMergeMainExpectedProbes(ctx, db, false)},
+		{has11, preMergeIgnoredExpectedProbes(ctx, db, false, report.IgnoredCursorMax)},
+		{preUpmergeMain, preMergeMainExpectedProbes(ctx, db, true)},
+		{preUpmergeIgnored, preMergeIgnoredExpectedProbes(ctx, db, true, report.IgnoredCursorMax)},
 	} {
 		if !chain.present {
 			continue
@@ -862,7 +910,7 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 				return report, fmt.Errorf("verifying %s: %w", probe.desc, err)
 			}
 			if !ok {
-				report.Problems = append(report.Problems, fmt.Sprintf(chain.refusal, probe.desc))
+				report.Problems = append(report.Problems, probe.problem)
 			}
 		}
 	}
