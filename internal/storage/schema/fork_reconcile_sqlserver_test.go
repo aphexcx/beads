@@ -529,3 +529,40 @@ func TestForkReconcile_MergedStore_MovesIgnoredCursorOnSQLServer(t *testing.T) {
 		t.Fatalf("pass left committable tables dirty: %v", sortedDirtyTableNames(dirty))
 	}
 }
+
+// A partial pass can reconcile main while leaving the clone-local ignored
+// cursor pre-upmerge. Missing main effects must still be diagnosed.
+func TestForkReconcile_MixedChainMissingMainEffectOnSQLServer(t *testing.T) {
+	port := startScratchDoltServer(t)
+	ctx := context.Background()
+	db := openScratchDatabase(t, ctx, port, "mixed_chain_missing_main_effect")
+	conn := pinConn(t, ctx, db)
+	buildPreUpmergeStore(t, ctx, conn)
+	if changed, err := applyPlanned(ctx, conn, planUpmergeMainCursor); err != nil || !changed {
+		t.Fatalf("reconcile fixture main cursor = %t, %v; want rewrite", changed, err)
+	}
+	if _, err := runMigrations(ctx, conn, mainSource, 55, 73, false); err != nil {
+		t.Fatalf("complete fixture main migrations: %v", err)
+	}
+	commitAll(t, ctx, conn, "fixture: main reconciled with ignored still pre-upmerge")
+	requireVersions(t, "mixed fixture main", cursorVersions(t, ctx, conn, mainSource.cursorTable), embeddedVersions(mainSource))
+	if pre, err := hasPreUpmergeIgnoredCursor(ctx, conn); err != nil || !pre {
+		t.Fatalf("fixture ignored pre-upmerge = %t, %v; want true", pre, err)
+	}
+	if report, err := VerifyForkLineageState(ctx, conn); err != nil || report.Status != ForkLineagePreMerge {
+		t.Fatalf("healthy mixed lineage = %+v, %v; want pre-merge", report, err)
+	}
+	if _, err := conn.ExecContext(ctx, "ALTER TABLE comments DROP COLUMN external_ref"); err != nil {
+		t.Fatal(err)
+	}
+	report, err := VerifyForkLineageState(ctx, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Status != ForkLineageInconsistent || !strings.Contains(strings.Join(report.Problems, "; "), "column comments.external_ref (fork 0072)") {
+		t.Fatalf("mixed lineage with missing main effect = %+v; want inconsistent naming comments.external_ref", report)
+	}
+	if len(report.PreMergeSchemes) != 1 || report.PreMergeSchemes[0] != "2026-08 upmerge" {
+		t.Fatalf("PreMergeSchemes = %v; want only 2026-08 upmerge", report.PreMergeSchemes)
+	}
+}

@@ -696,6 +696,56 @@ type ForkLineageReport struct {
 	PreMergeSchemes []string
 }
 
+// mainReconciledProbes verifies the main chain once its cursor is in the
+// renumbered range. Pre-merge chains use their planner's effect probes instead.
+func mainReconciledProbes(ctx context.Context, db DBConn) []lineageEffectProbe {
+	return []lineageEffectProbe{
+		{"cursor row 0070 (fork create_linear_label_snapshots)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 70) }},
+		{"cursor row 0071 (fork linear_snapshots_dolt_ignore)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 71) }},
+		{"cursor row 0072 (fork add_comment_external_ref)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 72) }},
+		{"cursor row 0073 (fork create_attachments)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 73) }},
+		{"table linear_label_snapshots (fork 0070)", func() (bool, error) { return tableExists(ctx, db, "linear_label_snapshots") }},
+		{"column comments.external_ref (fork 0072)", func() (bool, error) { return columnExists(ctx, db, "comments", "external_ref") }},
+		{"column comments.updated_at (fork 0072)", func() (bool, error) { return columnExists(ctx, db, "comments", "updated_at") }},
+		{"index comments.idx_comments_external_ref (fork 0072)", func() (bool, error) { return indexExists(ctx, db, "comments", "idx_comments_external_ref") }},
+		{"table attachments (fork 0073)", func() (bool, error) { return tableExists(ctx, db, "attachments") }},
+		{"index issues.idx_issues_status_updated_at (upstream 0052)", func() (bool, error) { return indexExists(ctx, db, "issues", "idx_issues_status_updated_at") }},
+		{"index issues.idx_issues_defer_until (upstream 0052)", func() (bool, error) { return indexExists(ctx, db, "issues", "idx_issues_defer_until") }},
+		{"events.id DEFAULT dropped (upstream 0051)", func() (bool, error) { return columnDefaultAbsent(ctx, db, "events", "id") }},
+		{"comments.id DEFAULT dropped (upstream 0051)", func() (bool, error) { return columnDefaultAbsent(ctx, db, "comments", "id") }},
+	}
+}
+
+func ignoredReconciledProbes(ctx context.Context, db DBConn, version int) []lineageEffectProbe {
+	var probes []lineageEffectProbe
+	// The ignored chain is clone-local; a fresh clone of a reconciled
+	// database legitimately has an empty ignored cursor until its first
+	// migration pass materializes the local tables. Only verify the ignored
+	// effects once the cursor reached the renumbered range.
+	if version >= 20 {
+		probes = append(probes,
+			// Row 20 carried the fork's create_linear_issue_snapshots before
+			// the 2026-08 upmerge and carries upstream's add_wisp_storage_class
+			// after it; either way a cursor at or past 20 must have the row.
+			lineageEffectProbe{"cursor row 0020 (ignored chain)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 20) }},
+			lineageEffectProbe{"cursor row 0021 (ignored chain)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 21) }},
+			lineageEffectProbe{"table linear_issue_snapshots (fork ignored 0020/0025)", func() (bool, error) { return tableExists(ctx, db, "linear_issue_snapshots") }},
+			lineageEffectProbe{"table linear_project_snapshots (fork ignored 0021/0026)", func() (bool, error) { return tableExists(ctx, db, "linear_project_snapshots") }},
+			lineageEffectProbe{"wisp_events.id DEFAULT dropped (upstream ignored 0010)", func() (bool, error) { return columnDefaultAbsent(ctx, db, "wisp_events", "id") }},
+		)
+	}
+	// Past the 2026-08 upmerge renumbering, the fork's ignored migrations are
+	// recorded at 25-27.
+	if version >= 25 {
+		probes = append(probes,
+			lineageEffectProbe{"cursor row 0025 (fork ignored create_linear_issue_snapshots)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 25) }},
+			lineageEffectProbe{"cursor row 0026 (fork ignored create_linear_project_snapshots)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 26) }},
+			lineageEffectProbe{"cursor row 0027 (fork ignored add_wisp_comment_external_ref)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 27) }},
+		)
+	}
+	return probes
+}
+
 // VerifyForkLineageState probes the cursors and the actual schema
 // (column-by-column) and classifies the database. Read-only.
 func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, error) {
@@ -816,6 +866,27 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 			}
 		}
 	}
+	// Reconciliation only repairs the pre-merge chains. Before promising it,
+	// verify any other chain already in its reconciled range using the same
+	// probes as the fully reconciled path below.
+	if len(report.PreMergeSchemes) > 0 {
+		var probes []lineageEffectProbe
+		if !has54 && !preUpmergeMain && report.MainVersion >= 70 {
+			probes = append(probes, mainReconciledProbes(ctx, db)...)
+		}
+		if !has11 && !preUpmergeIgnored {
+			probes = append(probes, ignoredReconciledProbes(ctx, db, report.IgnoredVersion)...)
+		}
+		for _, p := range probes {
+			ok, err := p.ok()
+			if err != nil {
+				return report, fmt.Errorf("verifying %s: %w", p.desc, err)
+			}
+			if !ok {
+				report.Problems = append(report.Problems, p.desc)
+			}
+		}
+	}
 	if len(report.Problems) > 0 {
 		report.Status = ForkLineageInconsistent
 		return report, nil
@@ -831,50 +902,7 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 	}
 
 	// Main cursor is in the renumbered range: verify both lineages' effects.
-	type probe struct {
-		desc string
-		ok   func() (bool, error)
-	}
-	probes := []probe{
-		{"cursor row 0070 (fork create_linear_label_snapshots)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 70) }},
-		{"cursor row 0071 (fork linear_snapshots_dolt_ignore)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 71) }},
-		{"cursor row 0072 (fork add_comment_external_ref)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 72) }},
-		{"cursor row 0073 (fork create_attachments)", func() (bool, error) { return cursorRowExists(ctx, db, mainSource.cursorTable, 73) }},
-		{"table linear_label_snapshots (fork 0070)", func() (bool, error) { return tableExists(ctx, db, "linear_label_snapshots") }},
-		{"column comments.external_ref (fork 0072)", func() (bool, error) { return columnExists(ctx, db, "comments", "external_ref") }},
-		{"column comments.updated_at (fork 0072)", func() (bool, error) { return columnExists(ctx, db, "comments", "updated_at") }},
-		{"index comments.idx_comments_external_ref (fork 0072)", func() (bool, error) { return indexExists(ctx, db, "comments", "idx_comments_external_ref") }},
-		{"table attachments (fork 0073)", func() (bool, error) { return tableExists(ctx, db, "attachments") }},
-		{"index issues.idx_issues_status_updated_at (upstream 0052)", func() (bool, error) { return indexExists(ctx, db, "issues", "idx_issues_status_updated_at") }},
-		{"index issues.idx_issues_defer_until (upstream 0052)", func() (bool, error) { return indexExists(ctx, db, "issues", "idx_issues_defer_until") }},
-		{"events.id DEFAULT dropped (upstream 0051)", func() (bool, error) { return columnDefaultAbsent(ctx, db, "events", "id") }},
-		{"comments.id DEFAULT dropped (upstream 0051)", func() (bool, error) { return columnDefaultAbsent(ctx, db, "comments", "id") }},
-	}
-	// The ignored chain is clone-local; a fresh clone of a reconciled
-	// database legitimately has an empty ignored cursor until its first
-	// migration pass materializes the local tables. Only verify the ignored
-	// effects once the cursor reached the renumbered range.
-	if report.IgnoredVersion >= 20 {
-		probes = append(probes,
-			// Row 20 carried the fork's create_linear_issue_snapshots before
-			// the 2026-08 upmerge and carries upstream's add_wisp_storage_class
-			// after it; either way a cursor at or past 20 must have the row.
-			probe{"cursor row 0020 (ignored chain)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 20) }},
-			probe{"cursor row 0021 (ignored chain)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 21) }},
-			probe{"table linear_issue_snapshots (fork ignored 0020/0025)", func() (bool, error) { return tableExists(ctx, db, "linear_issue_snapshots") }},
-			probe{"table linear_project_snapshots (fork ignored 0021/0026)", func() (bool, error) { return tableExists(ctx, db, "linear_project_snapshots") }},
-			probe{"wisp_events.id DEFAULT dropped (upstream ignored 0010)", func() (bool, error) { return columnDefaultAbsent(ctx, db, "wisp_events", "id") }},
-		)
-	}
-	// Past the 2026-08 upmerge renumbering, the fork's ignored migrations are
-	// recorded at 25-27.
-	if report.IgnoredVersion >= 25 {
-		probes = append(probes,
-			probe{"cursor row 0025 (fork ignored create_linear_issue_snapshots)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 25) }},
-			probe{"cursor row 0026 (fork ignored create_linear_project_snapshots)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 26) }},
-			probe{"cursor row 0027 (fork ignored add_wisp_comment_external_ref)", func() (bool, error) { return cursorRowExists(ctx, db, ignoredSource.cursorTable, 27) }},
-		)
-	}
+	probes := append(mainReconciledProbes(ctx, db), ignoredReconciledProbes(ctx, db, report.IgnoredVersion)...)
 	for _, p := range probes {
 		ok, err := p.ok()
 		if err != nil {

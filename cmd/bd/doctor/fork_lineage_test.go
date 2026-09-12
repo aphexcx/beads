@@ -215,3 +215,70 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 		})
 	}
 }
+
+// Reconciliation of the ignored chain cannot repair drift in the merged main.
+func TestCheckForkMigrationLineage_MixedChainMissingMainEffect(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	query := func(sql string, value any, args ...any) {
+		expectation := mock.ExpectQuery(regexp.QuoteMeta(sql))
+		if len(args) == 1 {
+			expectation.WithArgs(args[0])
+		}
+		if len(args) == 2 {
+			expectation.WithArgs(args[0], args[1])
+		}
+		expectation.WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(value))
+	}
+	row := func(table string, version, count int) {
+		query("SELECT COUNT(*) FROM "+table+" WHERE version = ?", count, version)
+	}
+	query("SELECT COUNT(*) FROM information_schema.tables", 1, "schema_migrations")
+	query("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", 73)
+	query("SELECT COUNT(*) FROM information_schema.tables", 1, "ignored_schema_migrations")
+	query("SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", 22)
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "wisps")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "wisp_dependencies")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 0, "leases", "granted_node")
+	query("SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", 22)
+	row("schema_migrations", 54, 1)
+	row("ignored_schema_migrations", 11, 1)
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 0, "issues", "lease_expires_at")
+	row("schema_migrations", 55, 1)
+	row("schema_migrations", 73, 1)
+	row("schema_migrations", 56, 1)
+	row("ignored_schema_migrations", 22, 1)
+	row("ignored_schema_migrations", 14, 0)
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_issue_snapshots")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_project_snapshots")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 1, "wisp_comments", "external_ref")
+	for _, version := range []int{70, 71, 72, 73} {
+		row("schema_migrations", version, 1)
+	}
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "linear_label_snapshots")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 0, "comments", "external_ref")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 1, "comments", "updated_at")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS", 1, "comments", "idx_comments_external_ref")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "attachments")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS", 1, "issues", "idx_issues_status_updated_at")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS", 1, "issues", "idx_issues_defer_until")
+	query("SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS", nil, "events", "id")
+	query("SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS", nil, "comments", "id")
+
+	report, check := classifyForkMigrationLineage(context.Background(), db)
+	if check.Status != StatusError || !strings.Contains(check.Detail, "Missing: column comments.external_ref (fork 0072).") {
+		t.Fatalf("check = %+v; want error naming the missing merged-main column", check)
+	}
+	if len(report.PreMergeSchemes) != 1 || report.PreMergeSchemes[0] != "2026-08 upmerge" {
+		t.Fatalf("report = %+v; want the pre-upmerge ignored scheme retained", report)
+	}
+	if strings.Contains(check.Detail, "next bd write command") || strings.Contains(check.Message, "verified") {
+		t.Fatalf("check promises reconciliation of a missing merged-main effect: %+v", check)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
