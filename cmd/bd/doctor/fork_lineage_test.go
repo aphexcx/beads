@@ -103,7 +103,7 @@ func TestForkLineageStoreHasServer(t *testing.T) {
 	}
 }
 
-// A pre-upmerge ignored cursor heals to zero because leases.granted_node
+// A pre-upmerge ignored cursor is clamped to 11 because leases.granted_node
 // does not exist yet. Doctor must still name the August scheme, or report
 // the recorded MAX refusal, rather than claim the schema was verified.
 func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
@@ -220,10 +220,15 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 				t.Fatalf("false verification: %s", check.Message)
 			}
 			if tc.status == StatusWarning {
-				for _, text := range []string{"bd-dn6 (fork 0051-0054", "ignored 0010-0011 → 0020-0021 before the upmerge, now 0025-0026", "2026-08 upmerge (main 0070-0073", "ignored 0020-0022", "clone-local"} {
+				for _, text := range []string{"bd-dn6 (fork 0051-0054", "ignored 0010-0011 → 0020-0021 before the upmerge, now 0025-0026", "2026-08 upmerge (main 0070-0073", "ignored 0020-0022"} {
 					if !strings.Contains(check.Detail, text) {
 						t.Errorf("Detail does not contain %q: %s", text, check.Detail)
 					}
+				}
+				// At recorded 11 the replay floor leaves the reading unchanged;
+				// only a higher recorded cursor needs the clone-local mismatch note.
+				if got := strings.Contains(check.Detail, "clone-local"); got != (tc.ignoredMax > 11) {
+					t.Errorf("clone-local cursor note present = %t for recorded ignored cursor %d", got, tc.ignoredMax)
 				}
 				if check.Fix != "Run any bd write command (e.g. `bd migrate`) with the new binary to reconcile." {
 					t.Fatalf("unexpected Fix: %s", check.Fix)

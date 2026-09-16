@@ -22,7 +22,7 @@ import (
 // cursor already at latest — main 0072's guarded ALTERs never run — and
 // rebuilds every ignored-chain table from scratch. ignored/0001 creates
 // wisp_comments without external_ref/updated_at; only the ignored chain can
-// add them (ignored/0022). Without that companion migration, wisp comment
+// add them (ignored/0027). Without that companion migration, wisp comment
 // reads that select those columns (issueops.GetIssueCommentsInTx,
 // doltTransaction.GetIssueComments) fail on every clone.
 //
@@ -78,7 +78,7 @@ func TestFreshCloneIgnoredChainRestoresWispCommentSyncColumns(t *testing.T) {
 		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisp_comments' AND COLUMN_NAME = 'external_ref'", 1)
 
 	// Simulate the fresh clone: drop every clone-local table the ignored
-	// chain owns (ignored/0001-0002 wisp tables and local state, 0020-0021
+	// chain owns (ignored/0001-0002 wisp tables and local state, 0025-0026
 	// Linear snapshots) plus the clone-local cursor itself. These are all
 	// dolt-ignored, so a clone starts without any of them.
 	exec("SET FOREIGN_KEY_CHECKS = 0")
@@ -130,11 +130,11 @@ func TestFreshCloneIgnoredChainRestoresWispCommentSyncColumns(t *testing.T) {
 
 	// --- Pre-fix broken clone repair ---
 	//
-	// Clones provisioned before ignored/0022 already have the bare
-	// wisp_comments (ignored cursor at 21) with local rows. Their wisp
+	// Clones provisioned before ignored/0027 already have the bare
+	// wisp_comments (ignored cursor at 26) with local rows. Their wisp
 	// tables sit in the working set as untracked dolt-ignored tables, and
 	// MigrateUp guards pending ignored migrations against pre-existing
-	// dirty tables — this leg proves that guard does not block 0022 from
+	// dirty tables — this leg proves that guard does not block 0027 from
 	// repairing exactly the clones the fix targets, and that local rows
 	// survive the repair.
 	exec("SET FOREIGN_KEY_CHECKS = 0")
@@ -148,8 +148,8 @@ func TestFreshCloneIgnoredChainRestoresWispCommentSyncColumns(t *testing.T) {
 	}
 	exec("SET FOREIGN_KEY_CHECKS = 1")
 
-	// Rebuild the pre-0022 clone state the way a pre-fix binary did: replay
-	// ignored 0001-0021 from the source files and record their cursor rows.
+	// Rebuild the pre-0027 clone state the way a pre-fix binary did: replay
+	// ignored 0001-0026 from the source files and record their cursor rows.
 	exec(`CREATE TABLE IF NOT EXISTS ignored_schema_migrations (
 		version INT PRIMARY KEY,
 		applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -167,7 +167,7 @@ func TestFreshCloneIgnoredChainRestoresWispCommentSyncColumns(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse version from %s: %v", name, err)
 		}
-		if version > 21 {
+		if version > 26 {
 			continue
 		}
 		data, err := os.ReadFile(path)
@@ -185,16 +185,16 @@ func TestFreshCloneIgnoredChainRestoresWispCommentSyncColumns(t *testing.T) {
 		}
 		replayed++
 	}
-	if replayed != 12 {
-		t.Fatalf("replayed %d pre-fix ignored migrations, want 12 (0001-0010, 0020, 0021)", replayed)
+	if replayed != 26 {
+		t.Fatalf("replayed %d pre-fix ignored migrations, want 26 (0001-0026)", replayed)
 	}
 	assertScalar(t, ctx, conn,
 		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisp_comments' AND COLUMN_NAME = 'external_ref'", 0)
 	exec("INSERT INTO wisps (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, ephemeral) VALUES ('bd-prefix', 'pre-fix wisp', '', '', '', '', 'open', 2, 'task', 1)")
 	exec("INSERT INTO wisp_comments (id, issue_id, author, text) VALUES ('wc-prefix-1', 'bd-prefix', 'tester', 'local comment from before the fix')")
 
-	// The broken clone's first pass under the fixed binary: only 0022 is
-	// pending, and it must run despite wisp_comments pre-existing with rows.
+	// The broken clone's first pass under the fixed binary: 0027 is pending
+	// and must run despite wisp_comments pre-existing with rows.
 	if _, err := schema.MigrateUp(ctx, conn); err != nil {
 		t.Fatalf("MigrateUp (pre-fix clone repair): %v", err)
 	}

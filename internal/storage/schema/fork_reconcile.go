@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
@@ -242,15 +243,19 @@ func planUpmergeMainCursor(ctx context.Context, db DBConn) (*cursorRewrite, erro
 }
 
 func hasPreUpmergeIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {
+	return hasPreUpmergeIgnoredCursorFrom(ctx, db, ignoredSource)
+}
+
+func hasPreUpmergeIgnoredCursorFrom(ctx context.Context, db DBConn, src migrationSource) (bool, error) {
 	// Row 22 (fork add_wisp_comment_external_ref) without row 14 (upstream
 	// add_wisp_comments_keyset_index) is the pre-upmerge ignored fingerprint,
 	// by the same prefix argument as the main chain: the merged series
 	// records 14 before anything can record 22.
-	has22, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, 22)
+	has22, err := cursorRowExists(ctx, db, src.cursorTable, 22)
 	if err != nil || !has22 {
 		return false, err
 	}
-	has14, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, 14)
+	has14, err := cursorRowExists(ctx, db, src.cursorTable, 14)
 	return !has14, err
 }
 
@@ -263,7 +268,11 @@ func upmergeIgnoredEffectProbes(ctx context.Context, db DBConn) []lineageEffectP
 }
 
 func planUpmergeIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
-	preUpmerge, err := hasPreUpmergeIgnoredCursor(ctx, db)
+	return planUpmergeIgnoredCursorFrom(ctx, db, ignoredSource)
+}
+
+func planUpmergeIgnoredCursorFrom(ctx context.Context, db DBConn, src migrationSource) (*cursorRewrite, error) {
+	preUpmerge, err := hasPreUpmergeIgnoredCursorFrom(ctx, db, src)
 	if err != nil || !preUpmerge {
 		return nil, err
 	}
@@ -271,7 +280,7 @@ func planUpmergeIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, e
 	// The recorded MAX, not currentVersion's healed reading: on this shape
 	// leases.granted_node (upstream ignored 0016) is legitimately absent and
 	// the reality check reads the cursor as 0. See cursorMaxVersion.
-	current, err := cursorMaxVersion(ctx, db, ignoredSource.cursorTable)
+	current, err := cursorMaxVersion(ctx, db, src.cursorTable)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +302,7 @@ func planUpmergeIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, e
 		}
 	}
 
-	if err := verifyForkCursorHashes(ctx, db, ignoredSource, upmergeRenumberedIgnoredFiles); err != nil {
+	if err := verifyForkCursorHashes(ctx, db, src, upmergeRenumberedIgnoredFiles); err != nil {
 		return nil, err
 	}
 	return &cursorRewrite{desc: "pre-upmerge ignored cursor", table: ignoredSource.cursorTable, lo: 20, hi: 22}, nil
@@ -339,12 +348,61 @@ func applyForkLineageRewrites(ctx context.Context, db DBConn, rewrites []cursorR
 	return len(rewrites) > 0, nil
 }
 
+// forkIgnoredCursorSource selects the rows the untrack repair will leave in
+// the live ignored cursor. A crash after DROP can leave its only copy in the
+// scratch table: verify that copy before seeding, restoring, or committing
+// anything. The planners still target their DELETEs at the restored live table.
+// A live cursor always wins over stale scratch, including operator rollbacks.
+func forkIgnoredCursorSource(ctx context.Context, db DBConn) (migrationSource, error) {
+	src := ignoredSource
+	present, err := schemaTableExists(ctx, db, src.cursorTable)
+	if err != nil || present {
+		return src, err
+	}
+	scratch, err := schemaTableExists(ctx, db, ignoredCursorUntrackTempTable)
+	if err != nil || !scratch {
+		return src, err
+	}
+
+	// Match restore eligibility AFTER seedDoltIgnorePatterns, without writing.
+	// Seeding adds the exact-name true pattern when absent (even over a broad
+	// false wildcard), but INSERT IGNORE preserves an exact operator override.
+	rows, err := db.QueryContext(ctx,
+		"SELECT pattern, ignored FROM dolt_ignore WHERE ? LIKE pattern", src.cursorTable)
+	if err != nil {
+		return src, fmt.Errorf("reading ignored cursor recovery policy: %w", err)
+	}
+	defer rows.Close()
+	restore := true
+	for rows.Next() {
+		var pattern string
+		var ignored bool
+		if err := rows.Scan(&pattern, &ignored); err != nil {
+			return src, err
+		}
+		if strings.EqualFold(pattern, src.cursorTable) {
+			restore = ignored
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return src, err
+	}
+	if restore {
+		src.cursorTable = ignoredCursorUntrackTempTable
+	}
+	return src, nil
+}
+
 // planForkLineageRewrites runs every chain's verification and returns the
 // cursor rewrites to apply, in apply order. It issues no writes.
 func planForkLineageRewrites(ctx context.Context, db DBConn) ([]cursorRewrite, error) {
 	var rewrites []cursorRewrite
 
 	preMain, err := planForkMainCursor(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	ignoredCursor, err := forkIgnoredCursorSource(ctx, db)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +413,7 @@ func planForkLineageRewrites(ctx context.Context, db DBConn) ([]cursorRewrite, e
 		// fingerprint row 11 is only meaningful together with the main one:
 		// running the ignored pass on a genuine upstream database would trip
 		// its refuse-to-rewrite guard.
-		preIgnored, err := planForkIgnoredCursor(ctx, db)
+		preIgnored, err := planForkIgnoredCursorFrom(ctx, db, ignoredCursor)
 		if err != nil {
 			return nil, err
 		}
@@ -376,7 +434,7 @@ func planForkLineageRewrites(ctx context.Context, db DBConn) ([]cursorRewrite, e
 	if upMain != nil {
 		rewrites = append(rewrites, *upMain)
 	}
-	upIgnored, err := planUpmergeIgnoredCursor(ctx, db)
+	upIgnored, err := planUpmergeIgnoredCursorFrom(ctx, db, ignoredCursor)
 	if err != nil {
 		return nil, err
 	}
@@ -568,10 +626,14 @@ func forkIgnoredEffectProbes(ctx context.Context, db DBConn) []lineageEffectProb
 }
 
 func planForkIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
+	return planForkIgnoredCursorFrom(ctx, db, ignoredSource)
+}
+
+func planForkIgnoredCursorFrom(ctx context.Context, db DBConn, src migrationSource) (*cursorRewrite, error) {
 	// Row 11 is the ignored-chain fork fingerprint: upstream's ignored chain
 	// tops out at 0010 and this merge renumbers the fork's 0011 to 0021, so
 	// only a pre-merge fork binary can have recorded row 11.
-	has11, err := cursorRowExists(ctx, db, ignoredSource.cursorTable, forkPreMergeIgnoredMax)
+	has11, err := cursorRowExists(ctx, db, src.cursorTable, forkPreMergeIgnoredMax)
 	if err != nil || !has11 {
 		return nil, err
 	}
@@ -579,7 +641,7 @@ func planForkIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, erro
 	// The recorded MAX, not currentVersion's healed reading (see
 	// cursorMaxVersion): a pre-merge ignored chain predates every sentinel
 	// column the reality check looks for.
-	current, err := cursorMaxVersion(ctx, db, ignoredSource.cursorTable)
+	current, err := cursorMaxVersion(ctx, db, src.cursorTable)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +663,7 @@ func planForkIgnoredCursor(ctx context.Context, db DBConn) (*cursorRewrite, erro
 		}
 	}
 
-	if err := verifyForkCursorHashes(ctx, db, ignoredSource, forkRenumberedIgnoredFiles); err != nil {
+	if err := verifyForkCursorHashes(ctx, db, src, forkRenumberedIgnoredFiles); err != nil {
 		return nil, err
 	}
 	return &cursorRewrite{desc: "fork ignored cursor", table: ignoredSource.cursorTable, lo: 10, hi: forkPreMergeIgnoredMax}, nil

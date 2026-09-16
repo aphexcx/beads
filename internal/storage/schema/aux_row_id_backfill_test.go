@@ -254,9 +254,10 @@ func TestRekeyAuxRowIDsRunsAllTablesWhenMarkerPending(t *testing.T) {
 	}
 }
 
-// expectAuxRekeyState mocks readAuxRekeyState: the local_metadata
-// table-existence probe, then (when the table exists) the one row-read that
-// returns both the in-flight sentinel and the #4380 drift record.
+// expectAuxRekeyState mocks readAuxRekeyState for the initial pass: the
+// local_metadata table-existence probe, then (when the table exists) the one
+// row-read that returns both the pass's in-flight sentinel and the #4380
+// drift record.
 func expectAuxRekeyState(mock sqlmock.Sqlmock, resume bool, drifted ...string) {
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
@@ -299,6 +300,43 @@ func expectSetAuxRekeySentinel(mock sqlmock.Sqlmock) {
 func expectClearAuxRekeySentinel(mock sqlmock.Sqlmock) {
 	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
 		WithArgs(auxRekeyPassInitial.sentinelKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectAuxRekeyStateForPass is expectAuxRekeyState generalized to name the
+// pass explicitly, for tests that exercise more than auxRekeyPassInitial
+// (e.g. rekeyAuxRowIDsAllPasses, which runs every pass in auxRekeyPasses off
+// the same shared drift record — see auxRowRekeyDriftedKey).
+func expectAuxRekeyStateForPass(mock sqlmock.Sqlmock, pass auxRekeyPass, resume bool, drifted ...string) {
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	rows := sqlmock.NewRows([]string{"key", "value"})
+	if resume {
+		rows.AddRow(pass.sentinelKey, "1")
+	}
+	if len(drifted) > 0 {
+		rows.AddRow(auxRowRekeyDriftedKey, strings.Join(drifted, ","))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT `key`, value FROM local_metadata WHERE `key` IN (?, ?)")).
+		WithArgs(pass.sentinelKey, auxRowRekeyDriftedKey).
+		WillReturnRows(rows)
+}
+
+// expectSetAuxRekeySentinelForPass is expectSetAuxRekeySentinel generalized to
+// name the pass explicitly; see expectAuxRekeyStateForPass.
+func expectSetAuxRekeySentinelForPass(mock sqlmock.Sqlmock, pass auxRekeyPass) {
+	mock.ExpectExec(`CREATE TABLE IF NOT EXISTS local_metadata`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("REPLACE INTO local_metadata (`key`, value) VALUES (?, '1')")).
+		WithArgs(pass.sentinelKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// expectClearAuxRekeySentinelForPass is expectClearAuxRekeySentinel
+// generalized to name the pass explicitly; see expectAuxRekeyStateForPass.
+func expectClearAuxRekeySentinelForPass(mock sqlmock.Sqlmock, pass auxRekeyPass) {
+	mock.ExpectExec(regexp.QuoteMeta("DELETE FROM local_metadata WHERE `key` = ?")).
+		WithArgs(pass.sentinelKey).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
@@ -391,6 +429,62 @@ func TestRekeyAuxRowIDsKeepsSentinelOnFailure(t *testing.T) {
 
 	if _, err := rekeyAuxRowIDs(context.Background(), db, auxRekeyPassInitial.shippedMainVersion-1, auxRekeyPassInitial); err == nil {
 		t.Fatal("expected the table failure to propagate")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestRekeyAuxRowIDsAllPassesSharesDriftRecordAcrossPasses verifies the
+// auxRowRekeyDriftedKey/auxRekeyPasses invariant documented on those two
+// declarations: every pass runs the identical rewrite over the identical
+// auxRekeyTables set, so one shared drift record is enough — whichever pass
+// retries a skipped table first does the work, and clearing the record
+// correctly makes every later pass's own retry a no-op.
+//
+// Here both passes' markers are already recorded (steady state, not a fresh
+// clone) and the shared record still names "events" as skipped. Pass 1
+// (auxRekeyPassInitial, first in auxRekeyPasses) must be the one that reads
+// the record as pending and retries exactly that table, then clears it. Pass
+// 2 (auxRekeyPassDerivedInsert) must then see nothing pending in its own
+// state read and stop there — it must not re-probe or re-scan the table pass
+// 1 already resolved.
+func TestRekeyAuxRowIDsAllPassesSharesDriftRecordAcrossPasses(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+	captureLog(t)
+
+	// Both passes' markers already recorded: the ignored cursor is at or past
+	// the later pass's markerVersion, so rekeyAuxRowIDsAllPasses' single
+	// pendingVersions read reports neither markerVersion as pending.
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations",
+		"version", auxRekeyPassDerivedInsert.markerVersion)
+	expectIgnoredSentinelProbes(mock, true)
+
+	// Pass 1: its own state read finds the shared drift record naming
+	// "events", so it retries just that table (the other three auxRekeyTables
+	// are left alone — a second table probe here would be an unmet
+	// expectation) and clears the record.
+	expectAuxRekeyStateForPass(mock, auxRekeyPassInitial, false, "events")
+	expectSetAuxRekeySentinelForPass(mock, auxRekeyPassInitial)
+	expectColumnExists(mock, false)
+	expectClearAuxRekeyDrifted(mock)
+	expectClearAuxRekeySentinelForPass(mock, auxRekeyPassInitial)
+
+	// Pass 2: reads its own state after the record is cleared — nothing
+	// pending, so it stops after this probe with no further queries.
+	expectAuxRekeyStateForPass(mock, auxRekeyPassDerivedInsert, false)
+
+	wrote, err := rekeyAuxRowIDsAllPasses(context.Background(), db, auxRekeyPassDerivedInsert.shippedMainVersion)
+	if err != nil {
+		t.Fatalf("rekeyAuxRowIDsAllPasses: %v", err)
+	}
+	if wrote {
+		t.Error("expected wrote=false: the resumed table had nothing left to re-key")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)

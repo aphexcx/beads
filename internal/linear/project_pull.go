@@ -343,7 +343,7 @@ func (t *Tracker) PullProjects(ctx context.Context, opts tracker.ProjectPullOpti
 	if t.store == nil {
 		return stats, fmt.Errorf("PullProjects: tracker has no store configured")
 	}
-	snapStore, snapOK := t.store.(storage.LinearProjectSnapshotStore)
+	snapStore, snapOK := tracker.LinearProjectSnapshotStoreFor(t.store)
 	if !snapOK {
 		// Backend doesn't support Project snapshots. Per mayor's
 		// bd-6cl Q3 decision (option B), this is a fatal config gap

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/tracker"
 )
 
 // bd-ajn: writers that persist the per-issue Linear-side snapshot used
@@ -75,7 +76,7 @@ func buildIssueSnapshot(issueID string, li *Issue, syncedAt time.Time) *storage.
 // Issue in hand). Failures are surfaced to the caller — the snapshot is
 // part of correctness, not best-effort.
 func (t *Tracker) writeIssueSnapshot(ctx context.Context, issueID string, li *Issue) error {
-	store, ok := t.store.(linearIssueSnapshotStore)
+	store, ok := tracker.LinearIssueSnapshotStoreFor(t.store)
 	if !ok {
 		return nil // snapshot capability not provided by this backend; degrade gracefully
 	}
@@ -119,7 +120,7 @@ func (t *Tracker) patchIssueSnapshotParentID(ctx context.Context, issueID, paren
 //
 // Always bumps SyncedAt on a real patch.
 func (t *Tracker) patchIssueSnapshot(ctx context.Context, issueID string, mutate func(*storage.LinearIssueSnapshot)) error {
-	store, ok := t.store.(linearIssueSnapshotStore)
+	store, ok := tracker.LinearIssueSnapshotStoreFor(t.store)
 	if !ok {
 		return nil
 	}

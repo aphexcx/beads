@@ -32,7 +32,7 @@ import (
 // LoadLocalStateAtSync is the exported form of loadLocalStateAtSync
 // — same semantics, exposed for cross-package callers (bd-6cl's
 // Linear-side Project pull resolver needs the same history lookup).
-func LoadLocalStateAtSync(ctx context.Context, store storage.Storage, issueID string, lastSync time.Time) (*types.Issue, error) {
+func LoadLocalStateAtSync(ctx context.Context, store Store, issueID string, lastSync time.Time) (*types.Issue, error) {
 	return loadLocalStateAtSync(ctx, store, issueID, lastSync)
 }
 
@@ -44,9 +44,19 @@ func LoadLocalStateAtSync(ctx context.Context, store storage.Storage, issueID st
 // Requires the backend to expose a historical query path. Returns a
 // sentinel error when the backend doesn't (mocks in tests); callers
 // fall back to whole-issue timestamp resolution in that case.
-func loadLocalStateAtSync(ctx context.Context, store storage.Storage, issueID string, lastSync time.Time) (*types.Issue, error) {
-	hv, ok := store.(storage.HistoryViewer)
-	if !ok {
+func loadLocalStateAtSync(ctx context.Context, store Store, issueID string, lastSync time.Time) (*types.Issue, error) {
+	var hv storage.HistoryViewer
+	if direct, ok := store.(*directStore); ok {
+		hv, _ = direct.Storage.(storage.HistoryViewer)
+		if hv == nil {
+			if dolt, ok := direct.Storage.(storage.DoltStorage); ok {
+				hv, _ = storage.UnwrapStore(dolt).(storage.HistoryViewer)
+			}
+		}
+	} else {
+		hv, _ = store.(storage.HistoryViewer)
+	}
+	if hv == nil {
 		return nil, errHistoryNotSupported
 	}
 	entries, err := hv.History(ctx, issueID)

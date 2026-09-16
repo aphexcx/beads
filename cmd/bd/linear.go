@@ -242,9 +242,6 @@ func init() {
 }
 
 func runLinearSync(cmd *cobra.Command, args []string) error {
-	if usesProxiedServer() {
-		return HandleErrorRespectJSON("linear sync is not supported in proxied-server mode")
-	}
 	evt := metrics.NewCommandEvent("linear-sync")
 	defer func() {
 		if c := metrics.Global(); c != nil {
@@ -341,16 +338,17 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		return HandleErrorRespectJSON("--milestones only applies when pulling from Linear")
 	}
 
-	if err := ensureStoreActive(); err != nil {
+	trackerStore, err := trackerStoreForCommand(rootCtx)
+	if err != nil {
 		return HandleErrorRespectJSON("database not available: %v", err)
 	}
 
-	if err := validateLinearConfig(cliTeams); err != nil {
+	if err := validateLinearConfigForStore(trackerStore, cliTeams); err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
 
 	ctx := rootCtx
-	teamIDs := getLinearTeamIDs(ctx, cliTeams)
+	teamIDs := getLinearTeamIDsForStore(ctx, trackerStore, cliTeams)
 	willPush := push || !pull
 
 	if willPush && len(teamIDs) > 1 && len(cliTeams) == 0 {
@@ -360,11 +358,11 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 
 	lt := &linear.Tracker{}
 	lt.SetTeamIDs(teamIDs)
-	if err := lt.Init(ctx, store); err != nil {
+	if err := lt.Init(ctx, trackerStore); err != nil {
 		return HandleErrorRespectJSON("initializing Linear tracker: %v", err)
 	}
 
-	wireLinearLabelSyncConfig(ctx, lt)
+	wireLinearLabelSyncConfigForStore(ctx, trackerStore, lt)
 
 	if willPush {
 		if err := lt.ValidatePushStateMappings(ctx); err != nil {
@@ -372,12 +370,12 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	engine := tracker.NewEngine(lt, store, actor)
+	engine := tracker.NewEngine(lt, trackerStore, actor)
 	engine.OnMessage = func(msg string) { fmt.Println("  " + msg) }
 	engine.OnWarning = func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
 
-	// Set up Linear-specific pull hooks
-	engine.PullHooks = buildLinearPullHooks(ctx, lt, linearPullHookOptions{
+	// Set up Linear-specific pull hooks.
+	engine.PullHooks = buildLinearPullHooksForStore(ctx, lt, trackerStore, linearPullHookOptions{
 		Milestones: milestones,
 		DryRun:     dryRun,
 		Actor:      actor,
@@ -398,7 +396,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 		opts.TypeFilter = append(opts.TypeFilter, types.IssueType(strings.ToLower(t)))
 	}
 	// Merge CLI --exclude-type with config linear.exclude_types
-	configExclude, _ := store.GetConfig(ctx, "linear.exclude_types")
+	configExclude, _ := trackerStore.GetConfig(ctx, "linear.exclude_types")
 	if configExclude != "" {
 		for _, t := range strings.Split(configExclude, ",") {
 			t = strings.TrimSpace(t)
@@ -412,7 +410,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	}
 	// Read config linear.exclude_labels — comma-separated list of labels to
 	// skip from push (e.g. "gt:agent" filters out polecat agent beads).
-	configExcludeLabels, _ := store.GetConfig(ctx, "linear.exclude_labels")
+	configExcludeLabels, _ := trackerStore.GetConfig(ctx, "linear.exclude_labels")
 	if configExcludeLabels != "" {
 		for _, l := range strings.Split(configExcludeLabels, ",") {
 			l = strings.TrimSpace(l)
@@ -421,7 +419,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 			}
 		}
 	}
-	applyLinearExcludeIDConfig(ctx, store, &opts)
+	applyLinearExcludeIDConfig(ctx, trackerStore, &opts)
 	if !includeEphemeral {
 		opts.ExcludeEphemeral = true
 	}
@@ -441,7 +439,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	}
 	allowProjectCreates := opts.ParentID != "" || len(opts.IssueIDs) > 0
 
-	engine.PushHooks = buildLinearPushHooks(ctx, lt, allowProjectCreates)
+	engine.PushHooks = buildLinearPushHooksForStore(ctx, trackerStore, lt, allowProjectCreates)
 
 	if preferLocal {
 		opts.ConflictResolution = tracker.ConflictLocal
@@ -480,7 +478,7 @@ func runLinearSync(cmd *cobra.Command, args []string) error {
 	// reconcile. opts.Push isn't readable after engine.Sync (passed by value).
 	effectivePush := push || (!push && !pull)
 	if effectivePush && result.Success && !syncIsScoped(&opts) {
-		reconcileLinearParents(ctx, lt, dryRun, jsonOutput, &result.Warnings)
+		reconcileLinearParentsForStore(ctx, trackerStore, lt, dryRun, jsonOutput, &result.Warnings)
 		// bd-1ay: separate pass for Project membership. Runs after
 		// the parent reconciler (since bd-9w3's buildLinearParentLinks
 		// silently skips Project-URL parents — those links are this
@@ -555,7 +553,11 @@ type linearPullHookOptions struct {
 // sync_push_pull.go) must call this after lt.Init — otherwise label sync
 // silently degrades to off for that path.
 func wireLinearLabelSyncConfig(ctx context.Context, lt *linear.Tracker) {
-	allCfg, _ := store.GetAllConfig(ctx)
+	wireLinearLabelSyncConfigForStore(ctx, tracker.NewStore(store), lt)
+}
+
+func wireLinearLabelSyncConfigForStore(ctx context.Context, st tracker.Store, lt *linear.Tracker) {
+	allCfg, _ := st.GetAllConfig(ctx)
 	lsCfg := loadLinearLabelSyncConfig(allCfg)
 	lt.SetLabelSyncConfig(lsCfg.Enabled, lsCfg.Exclude, lsCfg.CreateScope, func(format string, args ...interface{}) {
 		fmt.Fprintf(os.Stderr, "Warning: linear label sync: "+format+"\n", args...)
@@ -564,12 +566,12 @@ func wireLinearLabelSyncConfig(ctx context.Context, lt *linear.Tracker) {
 
 // buildLinearPullHooks creates PullHooks for Linear-specific pull behavior.
 func buildLinearPullHooks(ctx context.Context, lt *linear.Tracker, opts linearPullHookOptions) *tracker.PullHooks {
-	return buildLinearPullHooksForStore(ctx, lt, store, opts)
+	return buildLinearPullHooksForStore(ctx, lt, tracker.NewStore(store), opts)
 }
 
-func buildLinearPullHooksForStore(ctx context.Context, lt *linear.Tracker, st storage.Storage, opts linearPullHookOptions) *tracker.PullHooks {
-	idMode := getLinearIDMode(ctx)
-	hashLength := getLinearHashLength(ctx)
+func buildLinearPullHooksForStore(ctx context.Context, lt *linear.Tracker, st tracker.Store, opts linearPullHookOptions) *tracker.PullHooks {
+	idMode := getLinearIDModeForStore(ctx, st)
+	hashLength := getLinearHashLengthForStore(ctx, st)
 
 	hooks := &tracker.PullHooks{}
 	hookActor := opts.Actor
@@ -757,7 +759,7 @@ func isLinearMilestoneExternalRef(ref string) bool {
 	return strings.HasPrefix(strings.TrimSpace(ref), linearMilestoneExternalRefPrefix)
 }
 
-func ensureLinearMilestoneEpic(ctx context.Context, st storage.Storage, ms *linear.ProjectMilestone, actor string, generateID func(context.Context, *types.Issue) error) (string, error) {
+func ensureLinearMilestoneEpic(ctx context.Context, st tracker.Store, ms *linear.ProjectMilestone, actor string, generateID func(context.Context, *types.Issue) error) (string, error) {
 	milestoneID := strings.TrimSpace(ms.ID)
 	if milestoneID == "" {
 		return "", fmt.Errorf("Linear project milestone is missing id")
@@ -828,7 +830,7 @@ func ensureLinearMilestoneEpic(ctx context.Context, st storage.Storage, ms *line
 	return ref, nil
 }
 
-func findLinearMilestoneEpic(ctx context.Context, st storage.Storage, ref, milestoneID, title string) (*types.Issue, error) {
+func findLinearMilestoneEpic(ctx context.Context, st tracker.Store, ref, milestoneID, title string) (*types.Issue, error) {
 	if existing, err := st.GetIssueByExternalRef(ctx, ref); err == nil {
 		return existing, nil
 	} else if !errors.Is(err, storage.ErrNotFound) {
@@ -931,6 +933,10 @@ func isLinearMilestoneIssue(issue *types.Issue) bool {
 
 // buildLinearPushHooks creates PushHooks for Linear-specific push behavior.
 func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectCreates bool) *tracker.PushHooks {
+	return buildLinearPushHooksForStore(ctx, tracker.NewStore(store), lt, allowProjectCreates)
+}
+
+func buildLinearPushHooksForStore(ctx context.Context, st tracker.Store, lt *linear.Tracker, allowProjectCreates bool) *tracker.PushHooks {
 	config := lt.MappingConfig()
 	return &tracker.PushHooks{
 		FormatDescription: func(issue *types.Issue) string {
@@ -1037,7 +1043,7 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 			if isLinearMilestoneIssue(issue) {
 				return false
 			}
-			if projectID, _ := store.GetConfig(ctx, "linear.project_id"); projectID != "" {
+			if projectID, _ := st.GetConfig(ctx, "linear.project_id"); projectID != "" {
 				if issue.ExternalRef == nil || strings.TrimSpace(*issue.ExternalRef) == "" {
 					if !allowProjectCreates {
 						return false
@@ -1046,7 +1052,7 @@ func buildLinearPushHooks(ctx context.Context, lt *linear.Tracker, allowProjectC
 			}
 
 			// Apply push prefix filtering if configured
-			pushPrefix, _ := store.GetConfig(ctx, "linear.push_prefix")
+			pushPrefix, _ := st.GetConfig(ctx, "linear.push_prefix")
 			if pushPrefix == "" {
 				return true
 			}
@@ -1191,9 +1197,6 @@ func parseSinceFlag(s string) (time.Time, error) {
 }
 
 func runLinearStatus(cmd *cobra.Command, args []string) error {
-	if usesProxiedServer() {
-		return HandleErrorRespectJSON("linear status is not supported in proxied-server mode")
-	}
 	evt := metrics.NewCommandEvent("linear-status")
 	defer func() {
 		if c := metrics.Global(); c != nil {
@@ -1203,20 +1206,21 @@ func runLinearStatus(cmd *cobra.Command, args []string) error {
 
 	ctx := rootCtx
 
-	if err := ensureStoreActive(); err != nil {
+	trackerStore, err := trackerStoreForCommand(rootCtx)
+	if err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
 
-	apiKey, _ := getLinearConfig(ctx, "linear.api_key")
-	oauthClientID, _ := getLinearConfig(ctx, "linear.oauth_client_id")
-	oauthClientSecret, _ := getLinearConfig(ctx, "linear.oauth_client_secret")
-	teamIDs := getLinearTeamIDs(ctx, nil)
-	lastSync := tracker.LastSync(ctx, store, "linear")
+	apiKey, _ := getLinearConfigForStore(ctx, trackerStore, "linear.api_key")
+	oauthClientID, _ := getLinearConfigForStore(ctx, trackerStore, "linear.oauth_client_id")
+	oauthClientSecret, _ := getLinearConfigForStore(ctx, trackerStore, "linear.oauth_client_secret")
+	teamIDs := getLinearTeamIDsForStore(ctx, trackerStore, nil)
+	lastSync := tracker.LastSync(ctx, trackerStore, "linear")
 
 	hasOAuth := oauthClientID != "" && oauthClientSecret != ""
 	configured := (apiKey != "" || hasOAuth) && len(teamIDs) > 0
 
-	allIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	allIssues, err := trackerStore.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
 		return HandleErrorRespectJSON("%v", err)
 	}
@@ -1307,9 +1311,6 @@ func runLinearStatus(cmd *cobra.Command, args []string) error {
 }
 
 func runLinearTeams(cmd *cobra.Command, args []string) error {
-	if usesProxiedServer() {
-		return HandleErrorRespectJSON("linear teams is not supported in proxied-server mode")
-	}
 	evt := metrics.NewCommandEvent("linear-teams")
 	defer func() {
 		if c := metrics.Global(); c != nil {
@@ -1319,7 +1320,19 @@ func runLinearTeams(cmd *cobra.Command, args []string) error {
 
 	ctx := rootCtx
 
-	client, err := buildLinearClient(ctx, "")
+	// Team discovery is API-only and must not initialize or probe a local
+	// beads store. In proxied mode, read config through the existing UOW seam.
+	var configStore tracker.Store
+	var err error
+	if usesProxiedServer() {
+		configStore, err = trackerStoreForCommand(ctx)
+		if err != nil {
+			return HandleError("database not available: %v", err)
+		}
+	} else if store != nil {
+		configStore = tracker.NewStore(store)
+	}
+	client, err := buildLinearClientAPIOnly(ctx, "", configStore)
 	if err != nil {
 		return HandleError("%v", err)
 	}
@@ -1391,19 +1404,19 @@ func isValidUUID(s string) bool {
 // validateLinearConfig checks that required Linear configuration is present.
 // cliTeams is the list of team IDs from the --team flag (may be nil).
 func validateLinearConfig(cliTeams []string) error {
-	if err := ensureStoreActive(); err != nil {
-		return fmt.Errorf("database not available: %w", err)
-	}
+	return validateLinearConfigForStore(tracker.NewStore(store), cliTeams)
+}
 
+func validateLinearConfigForStore(st tracker.Store, cliTeams []string) error {
 	ctx := rootCtx
 
 	// Accept either OAuth credentials or API key.
-	oauthClientID, _ := getLinearConfig(ctx, "linear.oauth_client_id")
-	oauthClientSecret, _ := getLinearConfig(ctx, "linear.oauth_client_secret")
+	oauthClientID, _ := getLinearConfigForStore(ctx, st, "linear.oauth_client_id")
+	oauthClientSecret, _ := getLinearConfigForStore(ctx, st, "linear.oauth_client_secret")
 	hasOAuth := oauthClientID != "" && oauthClientSecret != ""
 
 	if !hasOAuth {
-		apiKey, _ := getLinearConfig(ctx, "linear.api_key")
+		apiKey, _ := getLinearConfigForStore(ctx, st, "linear.api_key")
 		if apiKey == "" {
 			return fmt.Errorf("Linear authentication not configured\n" +
 				"Options:\n" +
@@ -1412,7 +1425,7 @@ func validateLinearConfig(cliTeams []string) error {
 		}
 	}
 
-	teamIDs := getLinearTeamIDs(ctx, cliTeams)
+	teamIDs := getLinearTeamIDsForStore(ctx, st, cliTeams)
 	if len(teamIDs) == 0 {
 		return fmt.Errorf("no Linear team ID configured\nRun: bd config set linear.team_id \"TEAM_ID\"\nOr:  bd config set linear.team_ids \"TEAM_ID1,TEAM_ID2\"\nOr: export LINEAR_TEAM_ID=TEAM_ID")
 	}
@@ -1439,6 +1452,10 @@ func maskAPIKey(key string) string {
 // Priority: environment variable > project config.
 // Env vars take precedence so CI workers can override config without modifying config.yaml.
 func getLinearConfig(ctx context.Context, key string) (value string, source string) {
+	return getLinearConfigForStore(ctx, tracker.NewStore(store), key)
+}
+
+func getLinearConfigForStore(ctx context.Context, st tracker.Store, key string) (value string, source string) {
 	// Secret keys (e.g. linear.api_key) are stored in config.yaml, not the
 	// Dolt database, to avoid leaking secrets when pushing to remotes.
 	// Env vars are checked first so that LINEAR_OAUTH_CLIENT_ID/SECRET etc.
@@ -1457,8 +1474,8 @@ func getLinearConfig(ctx context.Context, key string) (value string, source stri
 	}
 
 	// Try to read from store (works in direct mode)
-	if store != nil {
-		value, _ = store.GetConfig(ctx, key) // Best effort: empty value is valid fallback
+	if st != nil {
+		value, _ = st.GetConfig(ctx, key) // Best effort: empty value is valid fallback
 		if value != "" {
 			return value, "project config (bd config)"
 		}
@@ -1506,8 +1523,12 @@ func linearConfigToEnvVar(key string) string {
 // getLinearTeamIDs resolves the effective team IDs from all config sources.
 // Precedence: cliTeams (--team flag) > linear.team_ids > LINEAR_TEAM_IDS > linear.team_id > LINEAR_TEAM_ID
 func getLinearTeamIDs(ctx context.Context, cliTeams []string) []string {
-	pluralVal, _ := getLinearConfig(ctx, "linear.team_ids")
-	singularVal, _ := getLinearConfig(ctx, "linear.team_id")
+	return getLinearTeamIDsForStore(ctx, tracker.NewStore(store), cliTeams)
+}
+
+func getLinearTeamIDsForStore(ctx context.Context, st tracker.Store, cliTeams []string) []string {
+	pluralVal, _ := getLinearConfigForStore(ctx, st, "linear.team_ids")
+	singularVal, _ := getLinearConfigForStore(ctx, st, "linear.team_id")
 	return tracker.ResolveProjectIDs(cliTeams, pluralVal, singularVal)
 }
 
@@ -1580,6 +1601,40 @@ func buildLinearClient(ctx context.Context, teamID string) (*linear.Client, erro
 	return linear.NewClient(apiKey, teamID), nil
 }
 
+func buildLinearClientAPIOnly(ctx context.Context, teamID string, st tracker.Store) (*linear.Client, error) {
+	oauthClientID := os.Getenv("LINEAR_OAUTH_CLIENT_ID")
+	oauthClientSecret := os.Getenv("LINEAR_OAUTH_CLIENT_SECRET")
+	if oauthClientID == "" {
+		oauthClientID = config.GetString("linear.oauth_client_id")
+	}
+	if oauthClientSecret == "" {
+		oauthClientSecret = config.GetString("linear.oauth_client_secret")
+	}
+	// Select the auth branch first and apply linear.api_endpoint once, after
+	// it — the shape Tracker.Init uses. Returning the OAuth client inline
+	// would leave this helper asymmetric between its own two branches, with a
+	// custom endpoint honored for an API key and ignored for OAuth.
+	var client *linear.Client
+	if oauthClientID != "" && oauthClientSecret != "" {
+		client = linear.NewOAuthClient(linear.OAuthConfig{ClientID: oauthClientID, ClientSecret: oauthClientSecret}, teamID)
+	} else {
+		apiKey := os.Getenv("LINEAR_API_KEY")
+		if apiKey == "" {
+			apiKey = config.GetString("linear.api_key")
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("Linear authentication not configured")
+		}
+		client = linear.NewClient(apiKey, teamID)
+	}
+	if st != nil {
+		if endpoint, _ := st.GetConfig(ctx, "linear.api_endpoint"); endpoint != "" {
+			client = client.WithEndpoint(endpoint)
+		}
+	}
+	return client, nil
+}
+
 // storeConfigLoader adapts the store to the linear.ConfigLoader interface.
 type storeConfigLoader struct {
 	ctx context.Context
@@ -1635,7 +1690,11 @@ func loadLinearLabelSyncConfig(cfg map[string]string) linearLabelSyncConfig {
 // getLinearIDMode returns the configured ID mode for Linear imports.
 // Supported values: "hash" (default) or "db".
 func getLinearIDMode(ctx context.Context) string {
-	mode, _ := getLinearConfig(ctx, "linear.id_mode")
+	return getLinearIDModeForStore(ctx, tracker.NewStore(store))
+}
+
+func getLinearIDModeForStore(ctx context.Context, st tracker.Store) string {
+	mode, _ := getLinearConfigForStore(ctx, st, "linear.id_mode")
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
 		return "hash"
@@ -1670,7 +1729,11 @@ func applyLinearExcludeIDConfig(ctx context.Context, reader configReader, opts *
 // getLinearHashLength returns the configured hash length for Linear imports.
 // Values are clamped to the supported range 3-8.
 func getLinearHashLength(ctx context.Context) int {
-	raw, _ := getLinearConfig(ctx, "linear.hash_length")
+	return getLinearHashLengthForStore(ctx, tracker.NewStore(store))
+}
+
+func getLinearHashLengthForStore(ctx context.Context, st tracker.Store) int {
+	raw, _ := getLinearConfigForStore(ctx, st, "linear.hash_length")
 	if raw == "" {
 		return 6
 	}
@@ -1820,10 +1883,14 @@ func syncIsScoped(opts *tracker.SyncOptions) bool {
 // Warnings (per-link failures, missing refs) are appended to the engine's
 // warning slice so the user sees them in the standard sync output.
 func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jsonOutput bool, warnings *[]string) {
-	if lt == nil || store == nil {
+	reconcileLinearParentsForStore(ctx, tracker.NewStore(store), lt, dryRun, jsonOutput, warnings)
+}
+
+func reconcileLinearParentsForStore(ctx context.Context, st tracker.Store, lt *linear.Tracker, dryRun, jsonOutput bool, warnings *[]string) {
+	if lt == nil || st == nil {
 		return
 	}
-	links, err := buildLinearParentLinks(ctx, lt)
+	links, err := buildLinearParentLinksForStore(ctx, st, lt)
 	if err != nil {
 		*warnings = append(*warnings, fmt.Sprintf("parent reconcile: building link set failed: %v", err))
 		return
@@ -1878,7 +1945,14 @@ func reconcileLinearParents(ctx context.Context, lt *linear.Tracker, dryRun, jso
 // bd-1ay scope; in the meantime, the migration tool itself sets projectId
 // on the descendants at conversion time.
 func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.ParentLink, error) {
-	issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
+	return buildLinearParentLinksForStore(ctx, tracker.NewStore(store), lt)
+}
+
+func buildLinearParentLinksForStore(ctx context.Context, st tracker.Store, lt *linear.Tracker) ([]linear.ParentLink, error) {
+	if st == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	issues, err := st.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
 		return nil, err
 	}
@@ -1920,7 +1994,7 @@ func buildLinearParentLinks(ctx context.Context, lt *linear.Tracker) ([]linear.P
 			// parent-child dep, which the migration tool doesn't create.)
 			continue
 		}
-		deps, err := store.GetDependenciesWithMetadata(ctx, issue.ID)
+		deps, err := st.GetDependenciesWithMetadata(ctx, issue.ID)
 		if err != nil {
 			return nil, fmt.Errorf("loading deps for %s: %w", issue.ID, err)
 		}

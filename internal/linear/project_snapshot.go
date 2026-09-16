@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/tracker"
 )
 
 // bd-6cl: writers for the per-epic Linear Project snapshot used by
@@ -59,7 +60,7 @@ func buildProjectSnapshot(issueID string, p *Project, syncedAt time.Time) *stora
 // in P4. Failures surface to the caller — the snapshot is part of
 // correctness, not best-effort.
 func (t *Tracker) writeProjectSnapshot(ctx context.Context, issueID string, p *Project) error {
-	store, ok := t.store.(linearProjectSnapshotStore)
+	store, ok := tracker.LinearProjectSnapshotStoreFor(t.store)
 	if !ok {
 		return nil // backend doesn't support Project snapshots — degrade gracefully
 	}

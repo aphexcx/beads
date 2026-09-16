@@ -31,7 +31,7 @@ func init() {
 type Tracker struct {
 	clients   map[string]*Client // keyed by team ID
 	config    *MappingConfig
-	store     storage.Storage
+	store     tracker.Store
 	teamIDs   []string // ordered list of configured team IDs
 	projectID string
 
@@ -82,11 +82,14 @@ func (t *Tracker) LoadSnapshot(ctx context.Context, issueID string) ([]SnapshotE
 		return nil, nil
 	}
 	var entries []storage.LinearLabelSnapshotEntry
-	err := t.store.RunInTransaction(ctx, "linear: read snapshot", func(tx storage.Transaction) error {
+	err := tracker.RunInStorageTransaction(ctx, t.store, "linear: read snapshot", func(tx storage.Transaction) error {
 		var err error
 		entries, err = tx.GetLinearLabelSnapshot(ctx, issueID)
 		return err
 	})
+	if errors.Is(err, tracker.ErrStorageTransactionsUnsupported) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +104,7 @@ func (t *Tracker) Name() string         { return "linear" }
 func (t *Tracker) DisplayName() string  { return "Linear" }
 func (t *Tracker) ConfigPrefix() string { return "linear" }
 
-func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
+func (t *Tracker) Init(ctx context.Context, store tracker.Store) error {
 	t.store = store
 
 	// Resolve authentication: OAuth client-credentials takes precedence over API key.
@@ -653,9 +656,13 @@ func (t *Tracker) writeSnapshot(ctx context.Context, issueID string, entries []s
 	if t.store == nil {
 		return nil
 	}
-	return t.store.RunInTransaction(ctx, fmt.Sprintf("linear: snapshot labels %s", issueID), func(tx storage.Transaction) error {
+	err := tracker.RunInStorageTransaction(ctx, t.store, fmt.Sprintf("linear: snapshot labels %s", issueID), func(tx storage.Transaction) error {
 		return tx.PutLinearLabelSnapshot(ctx, issueID, entries)
 	})
+	if errors.Is(err, tracker.ErrStorageTransactionsUnsupported) {
+		return nil
+	}
+	return err
 }
 
 // BatchPush implements tracker.BatchPushTracker. It partitions issues into
@@ -1879,7 +1886,7 @@ func BuildLabelCacheFromTracker(ctx context.Context, t *Tracker) (*LabelCache, e
 // configLoaderAdapter wraps storage.Storage to implement linear.ConfigLoader.
 type configLoaderAdapter struct {
 	ctx   context.Context
-	store storage.Storage
+	store tracker.Store
 }
 
 func (c *configLoaderAdapter) GetAllConfig() (map[string]string, error) {
