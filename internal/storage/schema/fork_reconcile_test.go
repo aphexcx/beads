@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -421,6 +423,9 @@ func TestVerifyForkLineageState_MixedCursor_Inconsistent(t *testing.T) {
 	expectColumnProbe(mock, "issues", "lease_expires_at", false)
 	expectCursorRowProbe(mock, "schema_migrations", 55, 0)
 
+	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+
 	report, err := VerifyForkLineageState(context.Background(), db)
 	if err != nil {
 		t.Fatalf("VerifyForkLineageState: %v", err)
@@ -730,5 +735,625 @@ func TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// These cases pin the classification consumed by doctor, including a healed
+// ignored reading of 0 that must never replace the recorded MAX in the check.
+func TestVerifyForkLineageState_Upmerge(t *testing.T) {
+	cases := []struct {
+		name                                               string
+		mainMax, ignoredMax                                int
+		mainFingerprint, ignoredFingerprint, healedIgnored bool
+		oldMain                                            bool
+		want                                               ForkLineageStatus
+		problems                                           []string
+	}{
+		{name: "both pre-upmerge", mainMax: 73, ignoredMax: 22, mainFingerprint: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineagePreMerge},
+		{name: "main only", mainMax: 73, ignoredMax: 28, mainFingerprint: true, want: ForkLineagePreMerge},
+		{name: "ignored only", mainMax: 73, ignoredMax: 22, ignoredFingerprint: true, healedIgnored: true, want: ForkLineagePreMerge},
+		{name: "main unexpected MAX", mainMax: 74, ignoredMax: 22, mainFingerprint: true, ignoredFingerprint: true, want: ForkLineageInconsistent, problems: []string{"schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor"}},
+		{name: "ignored unexpected recorded MAX despite healed zero", mainMax: 73, ignoredMax: 28, mainFingerprint: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineageInconsistent, problems: []string{"ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"}},
+		{name: "both unexpected MAX", mainMax: 74, ignoredMax: 23, mainFingerprint: true, ignoredFingerprint: true, want: ForkLineageInconsistent, problems: []string{"schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor", "ignored_schema_migrations row 22 coexists with MAX(version)=23; reconciliation will refuse this cursor"}},
+		{name: "bd-dn6 main with inconsistent upmerge ignored", mainMax: 54, ignoredMax: 28, oldMain: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineageInconsistent, problems: []string{"ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"}},
+		{name: "merged main 73 ignored 1-28", mainMax: 73, ignoredMax: 28, want: ForkLineageReconciled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			expectCursorProbe(mock, "schema_migrations", true)
+			expectMaxVersion(mock, "schema_migrations", tc.mainMax)
+			expectCursorProbe(mock, "ignored_schema_migrations", true)
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+			expectTableProbe(mock, "wisps", true)
+			expectTableProbe(mock, "wisp_dependencies", true)
+			expectColumnProbe(mock, "leases", "granted_node", !tc.healedIgnored)
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+			expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+			if tc.oldMain {
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 0)
+			} else {
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
+			}
+			expectColumnProbe(mock, "issues", "lease_expires_at", false)
+			if tc.oldMain {
+				expectCursorRowProbe(mock, "schema_migrations", 55, 0)
+				expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+			} else {
+				expectCursorRowProbe(mock, "schema_migrations", 55, 1)
+				expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+			}
+			main56, ignored14 := 1, 1
+			if tc.mainFingerprint {
+				main56 = 0
+			}
+			if tc.ignoredFingerprint {
+				ignored14 = 0
+			}
+			if !tc.oldMain {
+				expectCursorRowProbe(mock, "schema_migrations", 56, main56)
+			}
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 14, ignored14)
+			if tc.want == ForkLineagePreMerge {
+				if tc.mainFingerprint {
+					expectTableProbe(mock, "linear_label_snapshots", true)
+					expectColumnProbe(mock, "comments", "external_ref", true)
+					expectColumnProbe(mock, "comments", "updated_at", true)
+					expectTableProbe(mock, "attachments", true)
+					expectPreUpmergeMainTailProbes(mock, "")
+				}
+				if tc.ignoredFingerprint {
+					expectTableProbe(mock, "linear_issue_snapshots", true)
+					expectTableProbe(mock, "linear_project_snapshots", true)
+					expectColumnProbe(mock, "wisp_comments", "external_ref", true)
+					expectPreUpmergeIgnoredTailProbes(mock, "")
+				}
+			}
+			if tc.want == ForkLineagePreMerge {
+				if !tc.mainFingerprint && !tc.oldMain && tc.mainMax >= 70 {
+					expectMainReconciledLineageProbes(mock, true)
+				}
+				if !tc.ignoredFingerprint && !tc.healedIgnored && tc.ignoredMax >= 20 {
+					expectIgnoredReconciledLineageProbes(mock, tc.ignoredMax, true)
+				}
+			}
+			if tc.want == ForkLineageReconciled {
+				expectReconciledLineageProbes(mock)
+			}
+
+			report, err := VerifyForkLineageState(context.Background(), db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Status != tc.want {
+				t.Fatalf("Status = %q, want %q; report: %+v", report.Status, tc.want, report)
+			}
+			var wantSchemes []string
+			if tc.oldMain {
+				wantSchemes = []string{"bd-dn6", "2026-08 upmerge"}
+			} else if tc.want != ForkLineageReconciled {
+				wantSchemes = []string{"2026-08 upmerge"}
+			}
+			if !reflect.DeepEqual(report.PreMergeSchemes, wantSchemes) {
+				t.Fatalf("PreMergeSchemes = %v, want %v", report.PreMergeSchemes, wantSchemes)
+			}
+			if !reflect.DeepEqual(report.Problems, tc.problems) {
+				t.Fatalf("Problems = %v, want %v", report.Problems, tc.problems)
+			}
+			if tc.healedIgnored && (report.IgnoredVersion != 0 || report.IgnoredCursorMax != tc.ignoredMax || report.IgnoredCursorNote == "") {
+				t.Fatalf("lost recorded/healed ignored distinction: %+v", report)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func expectReconciledLineageProbes(mock sqlmock.Sqlmock) {
+	expectMainReconciledLineageProbes(mock, true)
+	expectIgnoredReconciledLineageProbes(mock, 27, true)
+}
+
+func expectMainReconciledLineageProbes(mock sqlmock.Sqlmock, externalRef bool) {
+	for _, v := range []int{70, 71, 72, 73} {
+		expectCursorRowProbe(mock, "schema_migrations", v, 1)
+	}
+	expectTableProbe(mock, "linear_label_snapshots", true)
+	expectColumnProbe(mock, "comments", "external_ref", externalRef)
+	expectColumnProbe(mock, "comments", "updated_at", true)
+	expectLineageIndexProbe(mock, "comments", "idx_comments_external_ref")
+	expectTableProbe(mock, "attachments", true)
+	expectLineageIndexProbe(mock, "issues", "idx_issues_status_updated_at")
+	expectLineageIndexProbe(mock, "issues", "idx_issues_defer_until")
+	expectLineageDefaultProbe(mock, "events")
+	expectLineageDefaultProbe(mock, "comments")
+}
+
+func expectIgnoredReconciledLineageProbes(mock sqlmock.Sqlmock, version int, issueSnapshots bool) {
+	for _, v := range []int{20, 21} {
+		expectCursorRowProbe(mock, "ignored_schema_migrations", v, 1)
+	}
+	expectTableProbe(mock, "linear_issue_snapshots", issueSnapshots)
+	expectTableProbe(mock, "linear_project_snapshots", true)
+	expectLineageDefaultProbe(mock, "wisp_events")
+	if version >= 25 {
+		for _, v := range []int{25, 26, 27} {
+			expectCursorRowProbe(mock, "ignored_schema_migrations", v, 1)
+		}
+	}
+}
+
+func expectLineageIndexProbe(mock sqlmock.Sqlmock, table, index string) {
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.STATISTICS`).WithArgs(table, index).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+}
+
+func expectLineageDefaultProbe(mock sqlmock.Sqlmock, table string) {
+	mock.ExpectQuery(`SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA\.COLUMNS`).WithArgs(table, "id").WillReturnRows(sqlmock.NewRows([]string{"COLUMN_DEFAULT"}).AddRow(nil))
+}
+
+// Each missing planner-probed effect must prevent the next-write promise,
+// including on the older bd-dn6 scheme. Expectations use the recorded DDL
+// independently of the production probe lists.
+func TestVerifyForkLineageState_PreMergeEffects(t *testing.T) {
+	type effect struct {
+		table, column, desc string
+	}
+	for _, tc := range []struct {
+		name, cursor, migrations               string
+		mainMax, ignoredMax                    int
+		oldMain, oldIgnored, upMain, upIgnored bool
+		effects                                []effect
+	}{
+		{"upmerge main after row 55 clears bd-dn6", "schema_migrations", "70-73", 73, 0, false, false, true, false, []effect{
+			{"linear_label_snapshots", "", "table linear_label_snapshots (fork 0070)"},
+			{"comments", "external_ref", "column comments.external_ref (fork 0072)"},
+			{"comments", "updated_at", "column comments.updated_at (fork 0072)"},
+			{"attachments", "", "table attachments (fork 0073)"},
+		}},
+		{"upmerge ignored", "ignored_schema_migrations", "20-22", 50, 22, false, false, false, true, []effect{
+			{"linear_issue_snapshots", "", "table linear_issue_snapshots (fork ignored 0020)"},
+			{"linear_project_snapshots", "", "table linear_project_snapshots (fork ignored 0021)"},
+			{"wisp_comments", "external_ref", "column wisp_comments.external_ref (fork ignored 0022)"},
+		}},
+		{"bd-dn6 main", "schema_migrations", "51-54", 54, 0, true, false, false, false, []effect{
+			{"linear_label_snapshots", "", "table linear_label_snapshots (fork 0051)"},
+			{"comments", "external_ref", "column comments.external_ref (fork 0053)"},
+			{"comments", "updated_at", "column comments.updated_at (fork 0053)"},
+			{"attachments", "", "table attachments (fork 0054)"},
+		}},
+		{"bd-dn6 ignored", "ignored_schema_migrations", "10-11", 50, 11, false, true, false, false, []effect{
+			{"linear_issue_snapshots", "", "table linear_issue_snapshots (fork ignored 0010)"},
+			{"linear_project_snapshots", "", "table linear_project_snapshots (fork ignored 0011)"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for missing := -1; missing < len(tc.effects); missing++ {
+				name := "all effects present"
+				if missing >= 0 {
+					name = "missing " + tc.effects[missing].desc
+				}
+				t.Run(name, func(t *testing.T) {
+					db, mock, err := sqlmock.New()
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer db.Close()
+					expectCursorProbe(mock, "schema_migrations", true)
+					expectMaxVersion(mock, "schema_migrations", tc.mainMax)
+					expectCursorProbe(mock, "ignored_schema_migrations", true)
+					expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+					if tc.ignoredMax > 0 {
+						expectTableProbe(mock, "wisps", false)
+					}
+					expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+					count := func(present bool) int {
+						if present {
+							return 1
+						}
+						return 0
+					}
+					expectCursorRowProbe(mock, "schema_migrations", 54, count(tc.oldMain || tc.upMain))
+					expectCursorRowProbe(mock, "ignored_schema_migrations", 11, count(tc.oldIgnored))
+					if tc.oldMain || tc.oldIgnored || tc.upMain {
+						expectColumnProbe(mock, "issues", "lease_expires_at", false)
+						// Upmerge stores retain row 54 after upstream row 55 drops the lease columns.
+						expectCursorRowProbe(mock, "schema_migrations", 55, count(tc.upMain))
+					}
+					expectCursorRowProbe(mock, "schema_migrations", 73, count(tc.upMain))
+					if tc.upMain {
+						expectCursorRowProbe(mock, "schema_migrations", 56, 0)
+					}
+					expectCursorRowProbe(mock, "ignored_schema_migrations", 22, count(tc.upIgnored))
+					if tc.upIgnored {
+						expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
+					}
+					for i, effect := range tc.effects {
+						if effect.column == "" {
+							expectTableProbe(mock, effect.table, i != missing)
+						} else {
+							expectColumnProbe(mock, effect.table, effect.column, i != missing)
+						}
+					}
+					if tc.upMain {
+						expectPreUpmergeMainTailProbes(mock, "")
+					}
+					if tc.upIgnored {
+						missingTable := ""
+						if missing >= 0 && tc.effects[missing].column == "" {
+							missingTable = tc.effects[missing].table
+						}
+						expectPreUpmergeIgnoredTailProbes(mock, missingTable)
+					}
+					report, err := VerifyForkLineageState(context.Background(), db)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := ForkLineagePreMerge
+					var problems []string
+					if missing >= 0 {
+						want = ForkLineageInconsistent
+						problems = []string{fmt.Sprintf("%s records fork migrations %s but %s is missing; schema does not match the recorded cursor", tc.cursor, tc.migrations, tc.effects[missing].desc)}
+					}
+					if tc.upIgnored && missing >= 0 && tc.effects[missing].column == "" {
+						version := "0020/0025"
+						if missing == 1 {
+							version = "0021/0026"
+						}
+						problems = append(problems, fmt.Sprintf("table %s (fork ignored %s)", tc.effects[missing].table, version))
+					}
+					if report.Status != want || !reflect.DeepEqual(report.Problems, problems) {
+						t.Fatalf("report = %+v; want %s with Problems %v", report, want, problems)
+					}
+					if err := mock.ExpectationsWereMet(); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestVerifyForkLineageState_NotApplicable(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectMaxVersion(mock, "schema_migrations", 50)
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
+	expectMaxVersion(mock, "ignored_schema_migrations", 0)
+	expectMaxVersion(mock, "ignored_schema_migrations", 0)
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 0)
+	// Absent fingerprint rows short-circuit their complementary row probes.
+	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+	report, err := VerifyForkLineageState(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Status != ForkLineageNotApplicable || len(report.PreMergeSchemes) != 0 || len(report.Problems) != 0 {
+		t.Fatalf("report = %+v; want not applicable without schemes or problems", report)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A pre-merge chain cannot hide drift in the other, already-reconciled chain.
+func TestVerifyForkLineageState_MixedChains(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		preMain        bool
+		ignoredVersion int
+		missing        string
+	}{
+		{"merged main missing column beside pre-upmerge ignored", false, 22, "column comments.external_ref (fork 0072)"},
+		{"pre-upmerge main beside reconciled ignored missing table", true, 27, "table linear_issue_snapshots (fork ignored 0020/0025)"},
+		{"healthy merged main beside pre-upmerge ignored", false, 22, ""},
+		{"healthy pre-upmerge main beside reconciled ignored", true, 27, ""},
+		{"pre-upmerge main beside empty ignored cursor", true, 0, ""},
+		{"pre-upmerge main beside ignored at first reconciled threshold", true, 20, ""},
+		{"pre-upmerge main beside ignored at upmerge threshold", true, 25, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			expectCursorProbe(mock, "schema_migrations", true)
+			expectMaxVersion(mock, "schema_migrations", 73)
+			expectCursorProbe(mock, "ignored_schema_migrations", true)
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredVersion)
+			if tc.ignoredVersion > 0 {
+				expectTableProbe(mock, "wisps", true)
+				expectTableProbe(mock, "wisp_dependencies", true)
+				expectColumnProbe(mock, "leases", "granted_node", true)
+			}
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredVersion)
+			expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 0)
+			expectColumnProbe(mock, "issues", "lease_expires_at", false)
+			expectCursorRowProbe(mock, "schema_migrations", 55, 1)
+			expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+			main56 := 1
+			if tc.preMain {
+				main56 = 0
+			}
+			expectCursorRowProbe(mock, "schema_migrations", 56, main56)
+			if tc.ignoredVersion >= 22 {
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+				ignored14 := 0
+				if tc.preMain {
+					ignored14 = 1
+				}
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 14, ignored14)
+			} else {
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+			}
+			if tc.preMain {
+				expectTableProbe(mock, "linear_label_snapshots", true)
+				expectColumnProbe(mock, "comments", "external_ref", true)
+				expectColumnProbe(mock, "comments", "updated_at", true)
+				expectTableProbe(mock, "attachments", true)
+				expectPreUpmergeMainTailProbes(mock, "")
+				if tc.ignoredVersion >= 20 {
+					expectIgnoredReconciledLineageProbes(mock, tc.ignoredVersion, tc.missing == "")
+				}
+			} else {
+				expectTableProbe(mock, "linear_issue_snapshots", true)
+				expectTableProbe(mock, "linear_project_snapshots", true)
+				expectColumnProbe(mock, "wisp_comments", "external_ref", true)
+				expectPreUpmergeIgnoredTailProbes(mock, "")
+				expectMainReconciledLineageProbes(mock, tc.missing == "")
+			}
+			report, err := VerifyForkLineageState(context.Background(), db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ForkLineagePreMerge
+			var problems []string
+			if tc.missing != "" {
+				want = ForkLineageInconsistent
+				problems = []string{tc.missing}
+			}
+			if report.Status != want || !reflect.DeepEqual(report.Problems, problems) {
+				t.Fatalf("report = %+v; want %s with Problems %v", report, want, problems)
+			}
+			if !reflect.DeepEqual(report.PreMergeSchemes, []string{"2026-08 upmerge"}) {
+				t.Fatalf("PreMergeSchemes = %v; want only 2026-08 upmerge", report.PreMergeSchemes)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// These expectations describe the tail additions independently of the
+// production lists. Planner probes with identical descriptions run only once.
+func expectPreUpmergeMainTailProbes(mock sqlmock.Sqlmock, missing string) {
+	for _, v := range []int{70, 71, 72, 73} {
+		expectCursorRowProbe(mock, "schema_migrations", v, 1)
+	}
+	for _, index := range []struct{ table, name string }{
+		{"comments", "idx_comments_external_ref"},
+		{"issues", "idx_issues_status_updated_at"},
+		{"issues", "idx_issues_defer_until"},
+	} {
+		count := 1
+		if index.name == missing {
+			count = 0
+		}
+		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.STATISTICS`).WithArgs(index.table, index.name).
+			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(count))
+	}
+	expectLineageDefaultProbe(mock, "events")
+	expectLineageDefaultProbe(mock, "comments")
+}
+
+func expectPreUpmergeIgnoredTailProbes(mock sqlmock.Sqlmock, missing string) {
+	for _, v := range []int{20, 21} {
+		expectCursorRowProbe(mock, "ignored_schema_migrations", v, 1)
+	}
+	// Tail descriptions include both old and new numbers, so these are
+	// distinct probes from the planner's single-number descriptions.
+	expectTableProbe(mock, "linear_issue_snapshots", missing != "linear_issue_snapshots")
+	expectTableProbe(mock, "linear_project_snapshots", missing != "linear_project_snapshots")
+	var value any
+	if missing == "wisp_events" {
+		value = "uuid()"
+	}
+	mock.ExpectQuery(`SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA\.COLUMNS`).WithArgs("wisp_events", "id").
+		WillReturnRows(sqlmock.NewRows([]string{"COLUMN_DEFAULT"}).AddRow(value))
+}
+
+func TestVerifyForkLineageState_PreUpmergeTailEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name, missing, problem string
+		main                   bool
+	}{
+		{"missing upstream defer index", "idx_issues_defer_until", "index issues.idx_issues_defer_until (upstream 0052)", true},
+		{"missing fork comment index", "idx_comments_external_ref", "index comments.idx_comments_external_ref (fork 0072)", true},
+		{"healed ignored missing upstream default drop", "wisp_events", "wisp_events.id DEFAULT dropped (upstream ignored 0010)", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			mainMax, ignoredMax := 50, 22
+			if tc.main {
+				mainMax, ignoredMax = 73, 0
+			}
+			expectCursorProbe(mock, "schema_migrations", true)
+			expectMaxVersion(mock, "schema_migrations", mainMax)
+			expectCursorProbe(mock, "ignored_schema_migrations", true)
+			expectMaxVersion(mock, "ignored_schema_migrations", ignoredMax)
+			if !tc.main {
+				expectTableProbe(mock, "wisps", true)
+				expectTableProbe(mock, "wisp_dependencies", true)
+				expectColumnProbe(mock, "leases", "granted_node", false)
+			}
+			expectMaxVersion(mock, "ignored_schema_migrations", ignoredMax)
+			if tc.main {
+				expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 0)
+				expectColumnProbe(mock, "issues", "lease_expires_at", false)
+				expectCursorRowProbe(mock, "schema_migrations", 55, 1)
+				expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+				expectCursorRowProbe(mock, "schema_migrations", 56, 0)
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+				expectTableProbe(mock, "linear_label_snapshots", true)
+				expectColumnProbe(mock, "comments", "external_ref", true)
+				expectColumnProbe(mock, "comments", "updated_at", true)
+				expectTableProbe(mock, "attachments", true)
+				expectPreUpmergeMainTailProbes(mock, tc.missing)
+			} else {
+				expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 0)
+				expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+				expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
+				expectTableProbe(mock, "linear_issue_snapshots", true)
+				expectTableProbe(mock, "linear_project_snapshots", true)
+				expectColumnProbe(mock, "wisp_comments", "external_ref", true)
+				expectPreUpmergeIgnoredTailProbes(mock, tc.missing)
+			}
+			report, err := VerifyForkLineageState(context.Background(), db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Status != ForkLineageInconsistent || !reflect.DeepEqual(report.Problems, []string{tc.problem}) {
+				t.Fatalf("report = %+v; want inconsistent with %q", report, tc.problem)
+			}
+			if !tc.main && (report.IgnoredCursorMax != 22 || report.IgnoredVersion != 0) {
+				t.Fatalf("lost recorded/healed cursor distinction: %+v", report)
+			}
+			if !reflect.DeepEqual(report.PreMergeSchemes, []string{"2026-08 upmerge"}) {
+				t.Fatalf("lost upmerge scheme: %+v", report)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// Every reconciled probe must be checked before PreMerge or explicitly
+// classified here. Keep descriptions literal so new tail probes cannot hide
+// behind migration-number ranges or a list generated from production code.
+func TestPreMergeExpectedProbes_EnumerateReconciledTail(t *testing.T) {
+	ctx := context.Background()
+	// Main's fingerprint requires MAX 73; it has no version-gated tail.
+	mainUpmerge := preMergeMainExpectedProbes(ctx, nil, true)
+	ignoredUpmerge := preMergeIgnoredExpectedProbes(ctx, nil, true, 22)
+	mainLegacy := preMergeMainExpectedProbes(ctx, nil, false)
+	ignoredLegacy := preMergeIgnoredExpectedProbes(ctx, nil, false, 11)
+
+	lateIgnored := map[string]string{
+		"cursor row 0025 (fork ignored create_linear_issue_snapshots)":   "The pre-upmerge fork records this at 20; the next pass records 25.",
+		"cursor row 0026 (fork ignored create_linear_project_snapshots)": "The pre-upmerge fork records this at 21; the next pass records 26.",
+		"cursor row 0027 (fork ignored add_wisp_comment_external_ref)":   "The pre-upmerge fork records this at 22; the next pass records 27.",
+	}
+	legacyMainAbsent := map[string]string{
+		"cursor row 0070 (fork create_linear_label_snapshots)":      "bd-dn6 records this at 51; the next pass records 70.",
+		"cursor row 0071 (fork linear_snapshots_dolt_ignore)":       "bd-dn6 records this at 52; the next pass records 71.",
+		"cursor row 0072 (fork add_comment_external_ref)":           "bd-dn6 records this at 53; the next pass records 72.",
+		"cursor row 0073 (fork create_attachments)":                 "bd-dn6 records this at 54; the next pass records 73.",
+		"index comments.idx_comments_external_ref (fork 0072)":      "The legacy planner does not require it; guarded 0072 creates it on the next pass.",
+		"index issues.idx_issues_status_updated_at (upstream 0052)": "Upstream 0052 first runs after the fork's 51-54 rows are removed.",
+		"index issues.idx_issues_defer_until (upstream 0052)":       "Upstream 0052 first runs after the fork's 51-54 rows are removed.",
+		"events.id DEFAULT dropped (upstream 0051)":                 "Upstream 0051 first runs after the fork's 51-54 rows are removed.",
+		"comments.id DEFAULT dropped (upstream 0051)":               "Upstream 0051 first runs after the fork's 51-54 rows are removed.",
+	}
+	legacyIgnoredAbsent := map[string]string{
+		"cursor row 0020 (ignored chain)":                                "bd-dn6 has only reached ignored 11; upstream 20 is applied after the rewrite.",
+		"cursor row 0021 (ignored chain)":                                "bd-dn6 has only reached ignored 11; upstream 21 is applied after the rewrite.",
+		"wisp_events.id DEFAULT dropped (upstream ignored 0010)":         "Upstream ignored 0010 first runs after the fork's 10-11 rows are removed.",
+		"cursor row 0025 (fork ignored create_linear_issue_snapshots)":   "bd-dn6 records this at 10; the next pass records 25.",
+		"cursor row 0026 (fork ignored create_linear_project_snapshots)": "bd-dn6 records this at 11; the next pass records 26.",
+		"cursor row 0027 (fork ignored add_wisp_comment_external_ref)":   "The legacy fork has no ignored comment-ref migration; 27 runs on the next pass.",
+	}
+	for _, tc := range []struct {
+		name            string
+		expected        []preMergeExpectedProbe
+		tail, planner   []lineageEffectProbe
+		absent, renamed map[string]string
+	}{
+		{"upmerge main 73", mainUpmerge, mainReconciledProbes(ctx, nil), nil, nil, nil},
+		{"upmerge ignored recorded 22", ignoredUpmerge, ignoredReconciledProbes(ctx, nil, 27), nil, lateIgnored, nil},
+		{"bd-dn6 main 54", mainLegacy, mainReconciledProbes(ctx, nil), forkMainEffectProbes(ctx, nil), legacyMainAbsent, map[string]string{
+			"table linear_label_snapshots (fork 0070)": "table linear_label_snapshots (fork 0051)", // Same table, original fork number.
+			"column comments.external_ref (fork 0072)": "column comments.external_ref (fork 0053)", // Same column, original fork number.
+			"column comments.updated_at (fork 0072)":   "column comments.updated_at (fork 0053)",   // Same column, original fork number.
+			"table attachments (fork 0073)":            "table attachments (fork 0054)",            // Same table, original fork number.
+		}},
+		{"bd-dn6 ignored 11", ignoredLegacy, ignoredReconciledProbes(ctx, nil, 27), forkIgnoredEffectProbes(ctx, nil), legacyIgnoredAbsent, map[string]string{
+			"table linear_issue_snapshots (fork ignored 0020/0025)":   "table linear_issue_snapshots (fork ignored 0010)",   // Same table, original fork number.
+			"table linear_project_snapshots (fork ignored 0021/0026)": "table linear_project_snapshots (fork ignored 0011)", // Same table, original fork number.
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expected := make(map[string]bool)
+			var gotDescs, plannerDescs []string
+			for _, probe := range tc.expected {
+				if expected[probe.desc] {
+					t.Errorf("duplicate expected probe %q", probe.desc)
+				}
+				expected[probe.desc] = true
+				gotDescs = append(gotDescs, probe.desc)
+			}
+			if tc.planner != nil {
+				for _, probe := range tc.planner {
+					plannerDescs = append(plannerDescs, probe.desc)
+				}
+				if !reflect.DeepEqual(gotDescs, plannerDescs) {
+					t.Fatalf("bd-dn6 expected set = %v; want exactly planner order %v", gotDescs, plannerDescs)
+				}
+			}
+			tail := make(map[string]bool)
+			for _, probe := range tc.tail {
+				tail[probe.desc] = true
+				classes := 0
+				if expected[probe.desc] {
+					classes++
+				}
+				if reason, ok := tc.absent[probe.desc]; ok {
+					classes++
+					if reason == "" {
+						t.Errorf("missing reason for %q", probe.desc)
+					}
+				}
+				if old, ok := tc.renamed[probe.desc]; ok {
+					classes++
+					if !expected[old] {
+						t.Errorf("renamed probe %q has no legacy probe %q", probe.desc, old)
+					}
+				}
+				if classes != 1 {
+					t.Errorf("tail probe %q has %d classifications; want exactly one", probe.desc, classes)
+				}
+			}
+			for desc := range tc.absent {
+				if !tail[desc] {
+					t.Errorf("stale absent-probe allowlist entry %q", desc)
+				}
+			}
+			for desc := range tc.renamed {
+				if !tail[desc] {
+					t.Errorf("stale renamed-probe entry %q", desc)
+				}
+			}
+		})
 	}
 }
