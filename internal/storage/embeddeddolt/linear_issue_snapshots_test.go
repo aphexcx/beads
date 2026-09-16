@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/testutil"
 )
 
 // TestLinearIssueSnapshotCRUD verifies the snapshot store satisfies the
@@ -15,9 +16,7 @@ import (
 // type or scan/bind mismatch in the store would silently corrupt the
 // snapshots that drive field-scoped conflict detection.
 func TestLinearIssueSnapshotCRUD(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode")
-	}
+	testutil.RequireLinearFixture(t)
 	env := newTestEnv(t, "snap")
 	ctx := t.Context()
 
@@ -92,9 +91,7 @@ func TestLinearIssueSnapshotCRUD(t *testing.T) {
 // logic in P4 can distinguish "field was empty at last sync" from "field
 // was never recorded."
 func TestLinearIssueSnapshotEmptyRelations(t *testing.T) {
-	if testing.Short() {
-		t.Skip("short mode")
-	}
+	testutil.RequireLinearFixture(t)
 	env := newTestEnv(t, "snape")
 	ctx := t.Context()
 

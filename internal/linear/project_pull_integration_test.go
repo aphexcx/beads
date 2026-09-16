@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
+	"github.com/steveyegge/beads/internal/testutil"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -28,9 +29,7 @@ import (
 // direct pullOneProject calls.
 func newPullProjectsEnv(t *testing.T) (*Tracker, *embeddeddolt.EmbeddedDoltStore) {
 	t.Helper()
-	if testing.Short() {
-		t.Skip("short mode")
-	}
+	testutil.RequireLinearFixture(t)
 	ctx := t.Context()
 	beadsDir := filepath.Join(t.TempDir(), ".beads")
 	store, err := embeddeddolt.Open(ctx, beadsDir, "pullproj", "main")
