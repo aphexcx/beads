@@ -185,7 +185,7 @@ func expectIgnoredCursorScratchDrop(mock sqlmock.Sqlmock, sweptIntoHead bool) {
 		return
 	}
 	expectIgnoredCursorUnstage(mock)
-	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD(?)")).
+	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('-f', ?)")).
 		WithArgs(ignoredCursorUntrackTempTable).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', ?, '--skip-empty')")).
@@ -201,6 +201,7 @@ func expectIgnoredCursorStagingDrop(mock sqlmock.Sqlmock) {
 
 // expectIgnoredCursorRestore mocks Phase B.
 func expectIgnoredCursorRestore(mock sqlmock.Sqlmock, sweptIntoHead bool) {
+	expectIgnoreResolution(mock, "", ignoredCursorRestoreTable, []doltIgnoreRow{{ignoredCursorRestoreTable, true}})
 	expectIgnoredCursorStagingDrop(mock)
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredCursorRestoreTable).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -613,6 +614,7 @@ func TestHealResumeDegradesForClientsThatCannotRunDDL(t *testing.T) {
 			expectIgnoredCursorGate(mock, "", false, nil, true)
 			expectIgnoreResolution(mock, "", ignoredSource.cursorTable, exactlyIgnored(true))
 			expectSchemaTableExists(mock, ignoredSource.cursorTable, false)
+			expectIgnoreResolution(mock, "", ignoredCursorRestoreTable, []doltIgnoreRow{{ignoredCursorRestoreTable, true}})
 			expectIgnoredCursorStagingDrop(mock)
 			mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredCursorRestoreTable).
 				WillReturnError(tt.err)
