@@ -22,6 +22,9 @@ func TestFirstTimeAuxRekeyRefusesDirtyEdits(t *testing.T) {
 			for _, table := range []string{"comments", "events"} {
 				t.Run(table, func(t *testing.T) {
 					db, mock := newMockDB(t)
+					// Upstream probes migration work inside this helper before status.
+					expectCursorProbe(mock, "schema_migrations", true)
+					expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", pass.shippedMainVersion-1)
 					for range 2 {
 						mock.ExpectQuery(`(?s)SELECT s\.table_name, s\.staged\s+FROM dolt_status s`).
 							WillReturnRows(sqlmock.NewRows([]string{"table_name", "staged"}).AddRow(table, false))
