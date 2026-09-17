@@ -47,6 +47,7 @@ const (
 	// any dolt_ignore pattern — a straggler must show up in dolt_status
 	// rather than hide.
 	ignoredCursorUntrackTempTable = "__temp__ignored_schema_migrations_untrack"
+	ignoredCursorRestoreTable     = "__temp__ignored_schema_migrations_restore"
 
 	ignoredCursorUntrackCommitMessage = "schema: untrack legacy ignored_schema_migrations so dolt_ignore can apply (gastownhall/beads#4356)"
 
@@ -59,6 +60,8 @@ const (
 // would silently stop carrying the next column, and this table is the only
 // copy of the cursor while the repair runs.
 var ignoredCursorScratch = migrationSource{cursorTable: ignoredCursorUntrackTempTable}
+
+var ignoredCursorRestore = migrationSource{cursorTable: ignoredCursorRestoreTable}
 
 // ignoredCursorAdvisory reports a reconcile step that declined without
 // changing anything. Overridable in tests: the whole point of the advisory
@@ -442,10 +445,19 @@ func commitIgnoredCursorUntrack(ctx context.Context, db DBConn) error {
 // lineage, so it is an ADD delta — the same shape a fresh clone has, on which
 // this wedge is impossible by construction.
 //
-// Only ever called with the cursor table absent, so the INSERT cannot
-// resurrect rows a live table no longer has.
+// Build under a staging name and publish the completed cursor with one RENAME.
+// CREATE implicitly commits in Dolt; grouping CREATE + INSERT in a transaction
+// still exposes an empty cursor after a crash. Keeping the live cursor absent
+// until all rows are ready lets the next open both plan against the scratch
+// and resume the restore. A live cursor remains authoritative for rollbacks.
 func restoreIgnoredCursorRows(ctx context.Context, db DBConn) error {
-	if _, err := db.ExecContext(ctx, ignoredSource.bootstrapSQL()); err != nil {
+	// A prior interrupted attempt may have been swept into HEAD. Remove its
+	// tracked identity before rebuilding: renaming a tracked staging table
+	// would leave a rename delta that cannot be staged as a deletion alone.
+	if err := dropIgnoredCursorRepairTable(ctx, db, ignoredCursorRestoreTable); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, ignoredCursorRestore.bootstrapSQL()); err != nil {
 		return fmt.Errorf("recreating %s: %w", ignoredSource.cursorTable, err)
 	}
 	// The column list is read off the SCRATCH table: it may have been written
@@ -455,10 +467,13 @@ func restoreIgnoredCursorRows(ctx context.Context, db DBConn) error {
 		return err
 	}
 	//nolint:gosec // G201: both table names are constants and the column list is a fixed allowlist.
-	restoreSQL := "INSERT IGNORE INTO " + ignoredSource.cursorTable + " (" + columns + ") SELECT " + columns +
+	restoreSQL := "INSERT IGNORE INTO " + ignoredCursorRestoreTable + " (" + columns + ") SELECT " + columns +
 		" FROM " + ignoredCursorUntrackTempTable
 	if _, err := db.ExecContext(ctx, restoreSQL); err != nil {
 		return fmt.Errorf("restoring %s rows: %w", ignoredSource.cursorTable, err)
+	}
+	if _, err := db.ExecContext(ctx, "RENAME TABLE "+ignoredCursorRestoreTable+" TO "+ignoredSource.cursorTable); err != nil {
+		return fmt.Errorf("publishing restored %s: %w", ignoredSource.cursorTable, err)
 	}
 	return dropIgnoredCursorScratch(ctx, db)
 }
@@ -470,9 +485,17 @@ func restoreIgnoredCursorRows(ctx context.Context, db DBConn) error {
 // delete delta — the same class of tracked residue this whole fix exists to
 // remove — so the deletion is committed, scoped to that table.
 func dropIgnoredCursorScratch(ctx context.Context, db DBConn) error {
+	// Keep the scratch recovery gate until staging residue is gone too.
+	if err := dropIgnoredCursorRepairTable(ctx, db, ignoredCursorRestoreTable); err != nil {
+		return err
+	}
+	return dropIgnoredCursorRepairTable(ctx, db, ignoredCursorUntrackTempTable)
+}
+
+func dropIgnoredCursorRepairTable(ctx context.Context, db DBConn, table string) error {
 	//nolint:gosec // G201: the table name is a constant.
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+ignoredCursorUntrackTempTable); err != nil {
-		return fmt.Errorf("dropping %s: %w", ignoredCursorUntrackTempTable, err)
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
+		return fmt.Errorf("dropping %s: %w", table, err)
 	}
 
 	// Publish this session's work before asking Dolt what the working set
@@ -483,10 +506,10 @@ func dropIgnoredCursorScratch(ctx context.Context, db DBConn) error {
 	// --skip-empty would commit nothing — leaving the tracked residue to ride
 	// some later unscoped auto-commit instead.
 	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
-		return fmt.Errorf("publishing the %s drop: %w", ignoredCursorUntrackTempTable, err)
+		return fmt.Errorf("publishing the %s drop: %w", table, err)
 	}
 
-	tracked, err := tableTrackedAtHead(ctx, db, "", ignoredCursorUntrackTempTable)
+	tracked, err := tableTrackedAtHead(ctx, db, "", table)
 	if err != nil || !tracked {
 		return err
 	}
@@ -494,9 +517,9 @@ func dropIgnoredCursorScratch(ctx context.Context, db DBConn) error {
 	// process, so scope the commit the same way its sibling does or unrelated
 	// staged tables ride into HEAD under a "drop stray scratch table" message.
 	if err := unstageBeforeIgnoredCursorUntrack(ctx, db); err != nil {
-		return fmt.Errorf("unstaging before dropping %s: %w", ignoredCursorUntrackTempTable, err)
+		return fmt.Errorf("unstaging before dropping %s: %w", table, err)
 	}
-	return commitScopedTableChange(ctx, db, ignoredCursorUntrackTempTable, ignoredCursorTempSweepCommitMessage)
+	return commitScopedTableChange(ctx, db, table, ignoredCursorTempSweepCommitMessage)
 }
 
 // ignoredCursorCopyColumns is the column list to move out of source, which is
