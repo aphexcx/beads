@@ -309,7 +309,7 @@ func TestMigrateUpDefersAfterCursorDropWithStagingOverride(t *testing.T) {
 	if ignored, err := tableActivelyIgnored(ctx, db, "", ignoredCursorRestoreTable); err != nil || ignored {
 		t.Fatalf("fixture staging override ignored = %v, err=%v", ignored, err)
 	}
-	if applied, err := MigrateUp(ctx, db); err != nil || applied != 0 {
+	if applied, err := MigrateUp(ctx, db); !errors.Is(err, ErrIgnoredCursorRestoreDeferred) || applied != 0 {
 		t.Errorf("open with staging override must defer migration: applied=%d, err=%v", applied, err)
 	}
 	if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || present {
@@ -385,7 +385,7 @@ func TestMigrateUpDefersAfterCursorDeletionCommitWithStagingOverride(t *testing.
 			if ignored, err := tableActivelyIgnored(ctx, db, "", ignoredCursorRestoreTable); err != nil || ignored {
 				t.Fatalf("fixture staging override ignored = %v, err=%v", ignored, err)
 			}
-			if applied, err := MigrateUp(ctx, db); err != nil || applied != 0 {
+			if applied, err := MigrateUp(ctx, db); !errors.Is(err, ErrIgnoredCursorRestoreDeferred) || applied != 0 {
 				t.Errorf("open after committed deletion must defer migration: applied=%d, err=%v", applied, err)
 			}
 			if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || present {
@@ -557,7 +557,7 @@ func TestMigrateUpDefersAfterCursorRenameDenied(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "DROP TABLE ignored_schema_migrations"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := MigrateUp(ctx, denyCursorRename{db}); err != nil {
+	if _, err := MigrateUp(ctx, denyCursorRename{db}); !errors.Is(err, ErrIgnoredCursorRestoreDeferred) {
 		t.Fatalf("restricted open must decline migration work: %v", err)
 	}
 	if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || present {
@@ -576,5 +576,49 @@ func TestMigrateUpDefersAfterCursorRenameDenied(t *testing.T) {
 	}
 	if pending, err := ignoredSource.pendingVersions(ctx, db); err != nil || len(pending) != 0 {
 		t.Fatalf("pending migrations after privileged reopen = %v, %v", pending, err)
+	}
+}
+
+// A first-time repair must discover missing restoration grants while the live
+// cursor is still present, not after committing its deletion into HEAD.
+func TestIgnoredCursorFirstRepairDeclinesBeforeDropWhenRenameDenied(t *testing.T) {
+	ctx := context.Background()
+	db := openCursorRecoveryDB(t, t.TempDir(), true)
+	for _, query := range []string{
+		ignoredSource.bootstrapSQL(),
+		"INSERT INTO ignored_schema_migrations (version, applied_at) VALUES (1, '2026-09-01 12:00:00')",
+		"INSERT INTO dolt_ignore VALUES ('ignored_schema_migrations', true), ('wisp_%', true)",
+	} {
+		if _, err := db.ExecContext(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', 'ignored_schema_migrations')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DrainCall(ctx, db, "CALL DOLT_COMMIT('-m', 'fixture: tracked legacy cursor')"); err != nil {
+		t.Fatal(err)
+	}
+	var before, after string
+	if err := db.QueryRowContext(ctx, "SELECT DOLT_HASHOF('HEAD')").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	healed, err := healTrackedIgnoredCursorTable(ctx, denyCursorRename{db})
+	if err != nil || healed {
+		t.Errorf("first repair without RENAME must decline: healed=%v, err=%v", healed, err)
+	}
+	if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || !present {
+		t.Errorf("first repair deleted the live cursor: present=%v, err=%v", present, err)
+	} else {
+		var preserved int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE applied_at = '2026-09-01 12:00:00'").Scan(&preserved); err != nil || preserved != 1 {
+			t.Errorf("live cursor rows=%d, err=%v; want original row", preserved, err)
+		}
+	}
+	if err := db.QueryRowContext(ctx, "SELECT DOLT_HASHOF('HEAD')").Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Errorf("first repair committed a deletion: HEAD moved from %s to %s", before, after)
 	}
 }
