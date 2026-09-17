@@ -257,6 +257,91 @@ func TestIgnoredCursorHealDeclinesBeforeDropWithoutStagingIgnore(t *testing.T) {
 	}
 }
 
+// A crash after DROP but before its Dolt commit leaves the cursor tracked at
+// HEAD and absent from the working set. An operator's staging ignore override
+// must defer the next migration pass without publishing an empty live cursor.
+func TestMigrateUpDefersAfterCursorDropWithStagingOverride(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := openCursorRecoveryDB(t, dir, true)
+	if _, err := MigrateUp(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE ignored_schema_migrations SET applied_at = '2026-09-01 12:00:00'"); err != nil {
+		t.Fatal(err)
+	}
+	var expected int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations").Scan(&expected); err != nil || expected == 0 {
+		t.Fatalf("fixture cursor rows = %d, err=%v", expected, err)
+	}
+	if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', 'ignored_schema_migrations')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DrainCall(ctx, db, "CALL DOLT_COMMIT('-m', 'fixture: tracked legacy cursor')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backupIgnoredCursorRows(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		ignoredCursorRestore.bootstrapSQL(),
+		"INSERT INTO " + ignoredCursorRestoreTable + " SELECT * FROM ignored_schema_migrations",
+		"INSERT INTO dolt_ignore VALUES ('wisp_ignored_schema_migrations_restore', false)",
+	} {
+		if _, err := db.ExecContext(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	interrupted := errors.New("interrupted after cursor DROP before commit")
+	if err := commitIgnoredCursorUntrack(ctx, interruptCursorRestore{db, interrupted, "DROP TABLE"}); !errors.Is(err, interrupted) {
+		t.Fatalf("untrack error = %v, want injected interruption", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openCursorRecoveryDB(t, dir, false)
+	if tracked, err := tableTrackedAtHead(ctx, db, "", ignoredSource.cursorTable); err != nil || !tracked {
+		t.Fatalf("fixture cursor tracked at HEAD = %v, err=%v", tracked, err)
+	}
+	if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || present {
+		t.Fatalf("fixture live cursor present = %v, err=%v", present, err)
+	}
+	if ignored, err := tableActivelyIgnored(ctx, db, "", ignoredCursorRestoreTable); err != nil || ignored {
+		t.Fatalf("fixture staging override ignored = %v, err=%v", ignored, err)
+	}
+	if applied, err := MigrateUp(ctx, db); err != nil || applied != 0 {
+		t.Errorf("open with staging override must defer migration: applied=%d, err=%v", applied, err)
+	}
+	if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || present {
+		t.Errorf("deferred restore bootstrapped a live cursor: present=%v, err=%v", present, err)
+	}
+	for _, table := range []string{ignoredCursorUntrackTempTable, ignoredCursorRestoreTable} {
+		var preserved int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table+" WHERE applied_at = '2026-09-01 12:00:00'").Scan(&preserved); err != nil || preserved != expected {
+			t.Errorf("%s saved cursor rows = %d, want %d; err=%v", table, preserved, expected, err)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	// Once the operator removes the override, the next open resumes from the
+	// saved rows instead of replaying migrations and replacing their timestamps.
+	if _, err := db.ExecContext(ctx, "DELETE FROM dolt_ignore WHERE pattern = 'wisp_ignored_schema_migrations_restore'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openCursorRecoveryDB(t, dir, false)
+	if _, err := MigrateUp(ctx, db); err != nil {
+		t.Fatalf("reopen after removing override: %v", err)
+	}
+	var preserved int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE applied_at = '2026-09-01 12:00:00'").Scan(&preserved); err != nil || preserved != expected {
+		t.Fatalf("cursor replayed after staging override: original rows=%d, want %d; err=%v", preserved, expected, err)
+	}
+}
+
 type denyCursorStagingSeed struct{ DBConn }
 
 func (db denyCursorStagingSeed) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
