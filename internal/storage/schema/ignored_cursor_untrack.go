@@ -172,6 +172,16 @@ func healTrackedIgnoredCursorTable(ctx context.Context, db DBConn) (bool, error)
 	// live cursor is still intact. Healthy opens must not seed it at all.
 	if err := checkIgnoredCursorRestore(ctx, db); err != nil {
 		ignoredCursorAdvisory("schema: cannot prepare cursor restoration, leaving the tracked table in place: %v\n", err)
+		// A previous attempt may have dropped the cursor without committing
+		// its deletion. Declining is safe only while a live cursor remains;
+		// otherwise MigrateUp would bootstrap an empty one and replay it.
+		cursorPresent, probeErr := schemaTableExists(ctx, db, ignoredSource.cursorTable)
+		if probeErr != nil {
+			return false, fmt.Errorf("probing %s: %w", ignoredSource.cursorTable, probeErr)
+		}
+		if !cursorPresent {
+			return false, errIgnoredCursorRestoreDeferred
+		}
 		return false, nil
 	}
 
