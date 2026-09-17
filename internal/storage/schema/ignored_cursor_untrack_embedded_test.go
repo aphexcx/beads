@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	embedded "github.com/dolthub/driver/v2"
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 type cursorRecoveryDB struct {
@@ -25,6 +26,7 @@ func openCursorRecoveryDB(t *testing.T, dir string, create bool) *cursorRecovery
 	t.Helper()
 	cfg := embedded.Config{
 		Directory: dir, CommitName: "migration test", CommitEmail: "test@example.com",
+		MultiStatements: true,
 	}
 	if !create {
 		cfg.Database = "cursor_recovery"
@@ -88,7 +90,7 @@ func testInterruptedCursorRestore(t *testing.T, after string, tracked bool) {
 	ctx := context.Background()
 	for _, query := range []string{
 		ignoredCursorScratch.bootstrapSQL(),
-		"INSERT INTO dolt_ignore VALUES ('ignored_schema_migrations', true), ('local_metadata', true), ('__temp__ignored_schema_migrations_restore', true)",
+		"INSERT INTO dolt_ignore VALUES ('ignored_schema_migrations', true), ('local_metadata', true), ('wisp_%', true)",
 		"CREATE TABLE wisps (id INT PRIMARY KEY)",
 		"CREATE TABLE wisp_dependencies (id INT PRIMARY KEY)",
 		"CREATE TABLE leases (id INT PRIMARY KEY, granted_node TEXT)",
@@ -110,11 +112,11 @@ func testInterruptedCursorRestore(t *testing.T, after string, tracked bool) {
 		t.Fatalf("restore error = %v, want injected interruption", err)
 	}
 	if tracked {
-		if present, err := schemaTableExists(ctx, db, "__temp__ignored_schema_migrations_restore"); err != nil {
+		if present, err := schemaTableExists(ctx, db, "wisp_ignored_schema_migrations_restore"); err != nil {
 			t.Fatal(err)
 		} else if present {
 			// Model residue that predates the ignore entry (or was force-added).
-			if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', '__temp__ignored_schema_migrations_restore')"); err != nil {
+			if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', 'wisp_ignored_schema_migrations_restore')"); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -151,10 +153,10 @@ func testInterruptedCursorRestore(t *testing.T, after string, tracked bool) {
 	if tracked, err := tableTrackedAtHead(ctx, db, "", ignoredCursorUntrackTempTable); err != nil || tracked {
 		t.Fatalf("scratch remains at HEAD: %v, %v", tracked, err)
 	}
-	if staging, err := schemaTableExists(ctx, db, "__temp__ignored_schema_migrations_restore"); err != nil || staging {
+	if staging, err := schemaTableExists(ctx, db, "wisp_ignored_schema_migrations_restore"); err != nil || staging {
 		t.Fatalf("staging table remains after recovery: %v, %v", staging, err)
 	}
-	if tracked, err := tableTrackedAtHead(ctx, db, "", "__temp__ignored_schema_migrations_restore"); err != nil || tracked {
+	if tracked, err := tableTrackedAtHead(ctx, db, "", "wisp_ignored_schema_migrations_restore"); err != nil || tracked {
 		t.Fatalf("staging table remains at HEAD: %v, %v", tracked, err)
 	}
 }
@@ -163,7 +165,7 @@ type commitDuringCursorRestore struct{ DBConn }
 
 func (db commitDuringCursorRestore) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	result, err := db.DBConn.ExecContext(ctx, query, args...)
-	if err == nil && strings.HasPrefix(query, "INSERT IGNORE INTO __temp__ignored_schema_migrations_restore") {
+	if err == nil && strings.HasPrefix(query, "INSERT IGNORE INTO wisp_ignored_schema_migrations_restore") {
 		if err := DrainCall(ctx, db.DBConn, "CALL DOLT_ADD('-A')"); err != nil {
 			return result, err
 		}
@@ -198,12 +200,160 @@ func TestIgnoredCursorRestoreConcurrentCommit(t *testing.T) {
 	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations").Scan(&count); err != nil || count != 2 {
 		t.Fatalf("cursor rows after reopen = %d, %v; want 2", count, err)
 	}
-	for _, table := range []string{ignoredSource.cursorTable, ignoredCursorUntrackTempTable, "__temp__ignored_schema_migrations_restore"} {
+	for _, table := range []string{ignoredSource.cursorTable, ignoredCursorUntrackTempTable, "wisp_ignored_schema_migrations_restore"} {
 		if tracked, err := tableTrackedAtHead(ctx, db, "", table); err != nil || tracked {
 			t.Fatalf("%s remains tracked after recovery: %v, %v", table, tracked, err)
 		}
 	}
 	if dirty, err := committableDirtyTables(ctx, db); err != nil || len(dirty) != 0 {
 		t.Fatalf("recovery left committable dirt: %v, %v", dirty, err)
+	}
+}
+
+// Missing or vetoed staging ignore state must be checked in the advisory zone,
+// while the tracked live cursor is still usable by a restricted client.
+func TestIgnoredCursorHealDeclinesBeforeDropWithoutStagingIgnore(t *testing.T) {
+	for _, overridden := range []bool{false, true} {
+		name := "missing_pattern"
+		if overridden {
+			name = "explicit_override"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openCursorRecoveryDB(t, t.TempDir(), true)
+			for _, query := range []string{
+				ignoredSource.bootstrapSQL(),
+				"INSERT INTO ignored_schema_migrations (version) VALUES (1)",
+				"INSERT INTO dolt_ignore VALUES ('ignored_schema_migrations', true)",
+			} {
+				if _, err := db.ExecContext(ctx, query); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if overridden {
+				if _, err := db.ExecContext(ctx, "INSERT INTO dolt_ignore VALUES ('wisp_ignored_schema_migrations_restore', false)"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', 'ignored_schema_migrations')"); err != nil {
+				t.Fatal(err)
+			}
+			if err := DrainCall(ctx, db, "CALL DOLT_COMMIT('-m', 'fixture: tracked legacy cursor')"); err != nil {
+				t.Fatal(err)
+			}
+			var client DBConn = db
+			if !overridden {
+				client = denyCursorStagingSeed{db}
+			}
+			healed, err := healTrackedIgnoredCursorTable(ctx, client)
+			if err != nil || healed {
+				t.Fatalf("unavailable staging ignore must decline before dropping the cursor: healed=%v, err=%v", healed, err)
+			}
+			var rows int
+			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = 1").Scan(&rows); err != nil || rows != 1 {
+				t.Fatalf("original cursor was changed: rows=%d, err=%v", rows, err)
+			}
+		})
+	}
+}
+
+type denyCursorStagingSeed struct{ DBConn }
+
+func (db denyCursorStagingSeed) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.HasPrefix(query, "INSERT IGNORE INTO dolt_ignore") {
+		return nil, &mysql.MySQLError{Number: 1142, Message: "INSERT command denied for dolt_ignore"}
+	}
+	return db.DBConn.ExecContext(ctx, query, args...)
+}
+
+func TestHealthyCursorOpenDoesNotSeedRepairStaging(t *testing.T) {
+	for _, restricted := range []bool{true, false} {
+		name := "staged_user_edits"
+		if restricted {
+			name = "restricted_client"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openCursorRecoveryDB(t, t.TempDir(), true)
+			if _, err := MigrateUp(ctx, db); err != nil {
+				t.Fatal(err)
+			}
+			for _, query := range []string{
+				"DELETE FROM dolt_ignore WHERE pattern = 'wisp_ignored_schema_migrations_restore'",
+				"CREATE TABLE user_edits (id INT PRIMARY KEY, value INT)",
+				"INSERT INTO user_edits VALUES (1, 10)",
+			} {
+				if _, err := db.ExecContext(ctx, query); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := DrainCall(ctx, db, "CALL DOLT_ADD('-A')"); err != nil {
+				t.Fatal(err)
+			}
+			if err := DrainCall(ctx, db, "CALL DOLT_COMMIT('-m', 'fixture: previous ignore set')"); err != nil {
+				t.Fatal(err)
+			}
+			var client DBConn = db
+			if restricted {
+				client = denyCursorStagingSeed{db}
+			} else {
+				if _, err := db.ExecContext(ctx, "UPDATE user_edits SET value = 20 WHERE id = 1"); err != nil {
+					t.Fatal(err)
+				}
+				if err := DrainCall(ctx, db, "CALL DOLT_ADD('user_edits')"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := MigrateUp(ctx, client); err != nil {
+				t.Fatalf("healthy open tried to seed repair-only state: %v", err)
+			}
+			var committed int
+			if err := db.QueryRowContext(ctx, "SELECT value FROM user_edits AS OF 'HEAD' WHERE id = 1").Scan(&committed); err != nil || committed != 10 {
+				t.Fatalf("healthy open committed user edits: value=%d, err=%v", committed, err)
+			}
+		})
+	}
+}
+
+func TestCursorRestoreDoesNotCommitStagedUserEdits(t *testing.T) {
+	ctx := context.Background()
+	db := openCursorRecoveryDB(t, t.TempDir(), true)
+	if _, err := seedDoltIgnorePatterns(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		ignoredCursorScratch.bootstrapSQL(),
+		"INSERT INTO " + ignoredCursorUntrackTempTable + " (version) VALUES (1)",
+		"CREATE TABLE user_edits (id INT PRIMARY KEY, value INT)",
+		"INSERT INTO user_edits VALUES (1, 10)",
+	} {
+		if _, err := db.ExecContext(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := DrainCall(ctx, db, "CALL DOLT_ADD('-A')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DrainCall(ctx, db, "CALL DOLT_COMMIT('-m', 'fixture: before user edits')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE user_edits SET value = 20 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DrainCall(ctx, db, "CALL DOLT_ADD('user_edits')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreIgnoredCursorRows(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	var committed, working int
+	if err := db.QueryRowContext(ctx, "SELECT value FROM user_edits AS OF 'HEAD' WHERE id = 1").Scan(&committed); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT value FROM user_edits WHERE id = 1").Scan(&working); err != nil {
+		t.Fatal(err)
+	}
+	if committed != 10 || working != 20 {
+		t.Fatalf("repair changed user edits: HEAD=%d working=%d; want 10, 20", committed, working)
 	}
 }

@@ -337,7 +337,6 @@ var doltIgnorePatterns = []string{
 	"bd_events_journal",
 	"bd_events_seq",
 	"ignored_schema_migrations",
-	ignoredCursorRestoreTable, // A concurrent blanket commit must not track the cursor's staging table.
 	"leases",
 	"local_metadata",
 	"repo_mtimes",
