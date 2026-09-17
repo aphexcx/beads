@@ -2,6 +2,7 @@ package schema
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -9,6 +10,11 @@ import (
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
+
+// A restricted opener may read through scratch but must not bootstrap an empty
+// live cursor and replay migrations. MigrateUp consumes this internal signal
+// as a successful, deferred open, preserving the access-denied decline policy.
+var errIgnoredCursorRestoreDeferred = errors.New("ignored cursor restoration deferred by permissions")
 
 // The ignored-lane migration cursor is dolt_ignore'd on every database this
 // binary opens, but dolt_ignore only exempts tables that have never been
@@ -234,6 +240,9 @@ func resumeIgnoredCursorUntrack(ctx context.Context, db DBConn) (bool, error) {
 		if dberrors.IsAccessDenied(err) {
 			ignoredCursorAdvisory("schema: not permitted to finish the interrupted %s untrack; continuing without it: %v\n",
 				ignoredSource.cursorTable, err)
+			if restore {
+				return false, errIgnoredCursorRestoreDeferred
+			}
 			return false, nil
 		}
 		return false, err

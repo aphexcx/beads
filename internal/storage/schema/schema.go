@@ -622,6 +622,9 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// pull from a not-yet-healed peer can re-introduce the tracked table,
 	// which only a probe that runs at EVERY open can catch.
 	healed, err := healTrackedIgnoredCursorTable(ctx, db)
+	if errors.Is(err, errIgnoredCursorRestoreDeferred) {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, fmt.Errorf("untracking legacy %s: %w", ignoredSource.cursorTable, err)
 	}
