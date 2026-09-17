@@ -342,6 +342,91 @@ func TestMigrateUpDefersAfterCursorDropWithStagingOverride(t *testing.T) {
 	}
 }
 
+// Once the cursor deletion is committed, an override on the restore namespace
+// or table must preserve a usable scratch cursor until restoration is allowed.
+func TestMigrateUpDefersAfterCursorDeletionCommitWithStagingOverride(t *testing.T) {
+	for _, pattern := range []string{"wisp_%", "wisp_ignored_schema_migrations_restore"} {
+		t.Run(pattern, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			db := openCursorRecoveryDB(t, dir, true)
+			if _, err := MigrateUp(ctx, db); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, "UPDATE ignored_schema_migrations SET applied_at = '2026-09-01 12:00:00'"); err != nil {
+				t.Fatal(err)
+			}
+			var expected int
+			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations").Scan(&expected); err != nil || expected == 0 {
+				t.Fatalf("fixture cursor rows = %d, err=%v", expected, err)
+			}
+			if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', 'ignored_schema_migrations')"); err != nil {
+				t.Fatal(err)
+			}
+			if err := DrainCall(ctx, db, "CALL DOLT_COMMIT('-m', 'fixture: tracked legacy cursor')"); err != nil {
+				t.Fatal(err)
+			}
+			if err := backupIgnoredCursorRows(ctx, db); err != nil {
+				t.Fatal(err)
+			}
+			if err := commitIgnoredCursorUntrack(ctx, db); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, "REPLACE INTO dolt_ignore (pattern, ignored) VALUES (?, false)", pattern); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db = openCursorRecoveryDB(t, dir, false)
+			if tracked, err := tableTrackedAtHead(ctx, db, "", ignoredSource.cursorTable); err != nil || tracked {
+				t.Fatalf("fixture cursor tracked at HEAD = %v, err=%v", tracked, err)
+			}
+			if ignored, err := tableActivelyIgnored(ctx, db, "", ignoredCursorRestoreTable); err != nil || ignored {
+				t.Fatalf("fixture staging override ignored = %v, err=%v", ignored, err)
+			}
+			if applied, err := MigrateUp(ctx, db); err != nil || applied != 0 {
+				t.Errorf("open after committed deletion must defer migration: applied=%d, err=%v", applied, err)
+			}
+			if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || present {
+				t.Errorf("deferred restore bootstrapped a live cursor: present=%v, err=%v", present, err)
+			}
+			var preserved int
+			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+ignoredCursorUntrackTempTable+" WHERE applied_at = '2026-09-01 12:00:00'").Scan(&preserved); err != nil || preserved != expected {
+				t.Errorf("saved cursor rows = %d, want %d; err=%v", preserved, expected, err)
+			}
+			if t.Failed() {
+				return
+			}
+			if _, err := db.ExecContext(ctx, "DELETE FROM dolt_ignore WHERE pattern = ?", pattern); err != nil {
+				t.Fatal(err)
+			}
+			// Removing the namespace override restores its original ignore row;
+			// the exact-table override had no row before the operator added it.
+			if pattern == "wisp_%" {
+				if _, err := db.ExecContext(ctx, "INSERT INTO dolt_ignore VALUES ('wisp_%', true)"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db = openCursorRecoveryDB(t, dir, false)
+			if _, err := MigrateUp(ctx, db); err != nil {
+				t.Fatalf("reopen after removing override: %v", err)
+			}
+			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE applied_at = '2026-09-01 12:00:00'").Scan(&preserved); err != nil || preserved != expected {
+				t.Fatalf("cursor replayed after staging override: original rows=%d, want %d; err=%v", preserved, expected, err)
+			}
+			for _, table := range []string{ignoredCursorUntrackTempTable, ignoredCursorRestoreTable} {
+				if present, err := schemaTableExists(ctx, db, table); err != nil || present {
+					t.Errorf("%s remains after recovery: present=%v, err=%v", table, present, err)
+				}
+			}
+		})
+	}
+}
+
 type denyCursorStagingSeed struct{ DBConn }
 
 func (db denyCursorStagingSeed) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
