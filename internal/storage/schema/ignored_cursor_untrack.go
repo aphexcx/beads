@@ -11,10 +11,10 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
 
-// A restricted opener may read through scratch but must not bootstrap an empty
-// live cursor and replay migrations. MigrateUp consumes this internal signal
-// as a successful, deferred open, preserving the access-denied decline policy.
-var errIgnoredCursorRestoreDeferred = errors.New("ignored cursor restoration deferred by permissions")
+// An opener blocked by permissions or a staging ignore override must preserve
+// scratch rather than bootstrap an empty live cursor and replay migrations.
+// MigrateUp consumes this internal signal as a successful, deferred open.
+var errIgnoredCursorRestoreDeferred = errors.New("ignored cursor restoration deferred")
 
 // The ignored-lane migration cursor is dolt_ignore'd on every database this
 // binary opens, but dolt_ignore only exempts tables that have never been
@@ -518,7 +518,11 @@ func checkIgnoredCursorRestore(ctx context.Context, db DBConn) error {
 		return err
 	}
 	if !ignored {
-		return fmt.Errorf("cannot restore %s: staging table %s must be dolt-ignored", ignoredSource.cursorTable, ignoredCursorRestoreTable)
+		// Before the first drop the caller can decline with the live cursor
+		// intact. After a committed drop, defer migration until the override
+		// is removed so the scratch cursor remains available for recovery.
+		return fmt.Errorf("%w: cannot restore %s: staging table %s must be dolt-ignored",
+			errIgnoredCursorRestoreDeferred, ignoredSource.cursorTable, ignoredCursorRestoreTable)
 	}
 	return nil
 }
