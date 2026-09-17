@@ -336,13 +336,13 @@ func TestForkReconcile_PreUpmergeStore_MigratesOnSQLServer(t *testing.T) {
 
 	// The diagnosis, pinned in the migration session itself: the table's
 	// recorded MAX is 22 and the fork column is present — the in-session
-	// reads see the working set — while the reality-checked reading is 0
+	// reads see the working set — while the reality-checked reading is 11
 	// because the pre-upmerge chain never ran upstream ignored 0016.
 	if got, err := cursorMaxVersion(ctx, conn, ignoredSource.cursorTable); err != nil || got != 22 {
 		t.Fatalf("cursorMaxVersion(ignored) = %d, %v; want 22 (the recorded cursor)", got, err)
 	}
-	if got, err := ignoredSource.currentVersion(ctx, conn); err != nil || got != 0 {
-		t.Fatalf("ignoredSource.currentVersion = %d, %v; want 0 (sentinel leases.granted_node absent on a pre-upmerge chain)", got, err)
+	if got, err := ignoredSource.currentVersion(ctx, conn); err != nil || got != 11 {
+		t.Fatalf("ignoredSource.currentVersion = %d, %v; want 11 (sentinel leases.granted_node absent on a pre-upmerge chain)", got, err)
 	}
 
 	applied, err := MigrateUp(ctx, conn)
@@ -525,7 +525,7 @@ func TestForkReconcile_RefusalLeavesWorkingSetAsFoundOnSQLServer(t *testing.T) {
 // TestForkReconcile_MergedStore_MovesIgnoredCursorOnSQLServer is citadel's
 // 2026-08-31 result, kept: a store already on the merged lineage (main 73
 // with 0056-0065, ignored 1-27) must have nothing to reconcile and simply
-// apply ignored 0028, main untouched.
+// apply ignored 0028-0029, main untouched.
 func TestForkReconcile_MergedStore_MovesIgnoredCursorOnSQLServer(t *testing.T) {
 	port := startScratchDoltServer(t)
 	ctx := context.Background()

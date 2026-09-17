@@ -31,8 +31,8 @@ const migrationsDir = "../schema/migrations"
 //   - upstream 0051-0053 and ignored 0010 actually applied (indexes exist,
 //     aux id DEFAULTs dropped) instead of being skipped as "already run"
 //   - the fork's DDL survived and its rows were re-recorded at 0070-0073 /
-//     0020-0021 with correct content hashes
-//   - the pre-merge rows (51-54 / 10-11) are gone
+//     0025-0026 with correct content hashes
+//   - the old fork numbers (51-54 / 10-11) now carry upstream hashes
 //   - a second MigrateUp is a clean no-op (reconciliation never re-fires)
 func TestForkLineageReconciliationEndToEnd(t *testing.T) {
 	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
@@ -173,11 +173,9 @@ func TestForkLineageReconciliationEndToEnd(t *testing.T) {
 		t.Fatalf("MigrateUp: %v", err)
 	}
 
-	// Cursor state: pre-merge rows gone, renumbered rows present, upstream
-	// rows recorded with upstream content.
+	// Cursor state: fork rows moved to their new numbers, with the old
+	// numbers now recorded with upstream content.
 	assertScalar(t, ctx, conn, "SELECT COALESCE(MAX(version),0) FROM schema_migrations", schema.LatestVersion())
-	assertScalar(t, ctx, conn, "SELECT COUNT(*) FROM schema_migrations WHERE version = 54", 0)
-	assertScalar(t, ctx, conn, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = 11", 0)
 	assertScalar(t, ctx, conn, "SELECT COALESCE(MAX(version),0) FROM ignored_schema_migrations", schema.LatestIgnoredVersion())
 
 	cursorHashes := map[string]struct {
@@ -188,11 +186,13 @@ func TestForkLineageReconciliationEndToEnd(t *testing.T) {
 		"upstream 0051":         {"schema_migrations", 51, "0051_drop_aux_id_defaults.up.sql"},
 		"upstream 0052":         {"schema_migrations", 52, "0052_add_date_indexes.up.sql"},
 		"upstream 0053":         {"schema_migrations", 53, "0053_repair_rig_wisps.up.sql"},
+		"upstream 0054":         {"schema_migrations", 54, "0054_add_lease_columns.up.sql"},
 		"fork 0070":             {"schema_migrations", 70, "0070_create_linear_label_snapshots.up.sql"},
 		"fork 0071":             {"schema_migrations", 71, "0071_linear_snapshots_dolt_ignore.up.sql"},
 		"fork 0072":             {"schema_migrations", 72, "0072_add_comment_external_ref.up.sql"},
 		"fork 0073":             {"schema_migrations", 73, "0073_create_attachments.up.sql"},
 		"upstream ignored 0010": {"ignored_schema_migrations", 10, "ignored/0010_drop_wisp_id_defaults.up.sql"},
+		"upstream ignored 0011": {"ignored_schema_migrations", 11, "ignored/0011_cleanup_orphaned_child_counters.up.sql"},
 		"fork ignored 0025":     {"ignored_schema_migrations", 25, "ignored/0025_create_linear_issue_snapshots.up.sql"},
 		"fork ignored 0026":     {"ignored_schema_migrations", 26, "ignored/0026_create_linear_project_snapshots.up.sql"},
 	}

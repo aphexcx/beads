@@ -152,7 +152,7 @@ type PushHooks struct {
 // integrations follow, eliminating duplication between Linear, GitLab, etc.
 type Engine struct {
 	Tracker   IssueTracker
-	Store     lifecycleStorage
+	Store     Store
 	Actor     string
 	PullHooks *PullHooks
 	PushHooks *PushHooks
@@ -169,22 +169,25 @@ type Engine struct {
 	warnings []string
 }
 
-type lifecycleStorage interface {
-	storage.Storage
-	storage.IssueLifecycleStore
-}
-
 // NewEngine creates a new sync engine for the given tracker and storage.
-func NewEngine(tracker IssueTracker, store lifecycleStorage, actor string) *Engine {
+//
+// store is typed rather than interface{} so the seam names its contract: a
+// storage.Storage satisfies Store and is adapted here, while a caller that
+// already adapted its store (trackerStoreForCommand) passes the adapter
+// straight through. NewStore is idempotent, so adapting twice is a no-op.
+func NewEngine(tracker IssueTracker, store Store, actor string) *Engine {
 	return &Engine{
 		Tracker: tracker,
-		Store:   store,
+		Store:   NewStore(store),
 		Actor:   actor,
 	}
 }
 
 // Sync performs a complete synchronization operation based on the given options.
 func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error) {
+	if e == nil || e.Store == nil {
+		return nil, fmt.Errorf("tracker sync store is not initialized")
+	}
 	ctx, span := syncTracer.Start(ctx, "tracker.sync",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -359,7 +362,7 @@ func (e *Engine) DetectConflicts(ctx context.Context, opts SyncOptions) ([]Confl
 
 	// bd-ajn: check capability surface once up front so the per-issue
 	// loop doesn't repeat type assertions.
-	snapStore, snapStoreOK := e.Store.(storage.LinearIssueSnapshotStore)
+	snapStore, snapStoreOK := LinearIssueSnapshotStoreFor(e.Store)
 	snapshotter, snapshotterOK := e.Tracker.(PostPullSnapshotter)
 
 	// First pass: select detection candidates without touching the API.
@@ -550,7 +553,7 @@ func (e *Engine) detectFieldScopedConflict(
 	// Local-side state at lastSync via dolt_history. nil result means
 	// the issue had no committed state at lastSync (created since);
 	// diffLocalFields treats that as "all populated fields new".
-	localAtSync, err := loadLocalStateAtSync(ctx, e.Store, issue.ID, lastSync)
+	localAtSync, err := loadTrackerLocalStateAtSync(ctx, e.Store, issue.ID, lastSync)
 	if err != nil {
 		if errors.Is(err, errHistoryNotSupported) {
 			// Backend without history capability — signal fallback.
@@ -875,18 +878,36 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs
 				updates["metadata"] = raw
 			}
 
-			if err := e.Store.RunInIssueLifecycleTransaction(ctx, fmt.Sprintf("bd: pull update %s", existing.ID), func(tx storage.IssueLifecycleTransaction) error {
-				// bd-ajn: the snapshot-backed label reconciler replaces the
-				// legacy Linear-authoritative sync when the tracker provides it.
-				if e.PullHooks != nil && e.PullHooks.ReconcileLabels != nil {
-					if err := applyPullIssueFields(ctx, tx, existing.ID, updates, e.Actor); err != nil {
-						return err
+			var updateErr error
+			customUpdateApplied := false
+			if e.PullHooks != nil && e.PullHooks.ReconcileLabels != nil {
+				// The custom Linear reconciler needs the direct backend's
+				// lifecycle transaction so fields, labels, and its snapshot move
+				// atomically. Proxied stores use the generic atomic updater below.
+				if direct, ok := e.Store.(*directStore); ok {
+					if lifecycle, ok := direct.Storage.(storage.IssueLifecycleStore); ok {
+						customUpdateApplied = true
+						updateErr = lifecycle.RunInIssueLifecycleTransaction(ctx, fmt.Sprintf("bd: pull update %s", existing.ID), func(tx storage.IssueLifecycleTransaction) error {
+							if err := applyPullIssueFields(ctx, tx, existing.ID, updates, e.Actor); err != nil {
+								return err
+							}
+							return e.PullHooks.ReconcileLabels(ctx, tx, existing.ID, conv.Issue.Labels, &extIssue, e.Actor)
+						})
 					}
-					return e.PullHooks.ReconcileLabels(ctx, tx, existing.ID, conv.Issue.Labels, &extIssue, e.Actor)
 				}
-				return applyPullIssueUpdate(ctx, tx, existing.ID, updates, conv.Issue.Labels, e.Actor)
-			}); err != nil {
-				e.warn("Failed to update %s: %v", existing.ID, err)
+			}
+			if !customUpdateApplied {
+				markPullIssueFields(updates)
+				updater, ok := e.Store.(IssueUpdater)
+				if !ok {
+					e.warn("tracker store does not support atomic issue updates")
+					stats.Errors++
+					continue
+				}
+				updateErr = updater.ApplyIssueUpdate(ctx, existing.ID, updates, conv.Issue.Labels, e.Actor)
+			}
+			if updateErr != nil {
+				e.warn("Failed to update %s: %v", existing.ID, updateErr)
 				stats.Errors++
 				if pulledIDs != nil {
 					pulledIDs[existing.ID] = true
@@ -1029,18 +1050,15 @@ func applyPullIssueUpdate(ctx context.Context, tx storage.IssueLifecycleTransact
 	return legacySyncIssueLabels(ctx, tx, id, labels, actor)
 }
 
-// applyPullIssueFields applies a pulled issue's fields while preserving the
-// caller's control over related collections such as labels.
-//
-// A pull always forces close policy. The remote tracker is authoritative for
-// the status it reports, and it knows nothing about local-only children or
-// local-only blockers — refusing an upstream close because of them would wedge
-// sync on state the remote cannot see and the operator did not create. Both the
-// pull and the conflict reimport route through here, so this is the one place
-// that decision lives.
 func applyPullIssueFields(ctx context.Context, tx storage.IssueLifecycleTransaction, id string, updates map[string]interface{}, actor string) error {
-	updates[issueops.OpForceClosePolicy] = true
+	markPullIssueFields(updates)
 	return tx.UpdateIssue(ctx, id, updates, actor)
+}
+
+// markPullIssueFields adds the external-authority close policy marker shared
+// by direct and proxied store adapters.
+func markPullIssueFields(updates map[string]interface{}) {
+	updates[issueops.OpForceClosePolicy] = true
 }
 
 func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
@@ -1344,7 +1362,21 @@ func (e *Engine) externalRefChangedAfter(ctx context.Context, local *types.Issue
 // never see this optional capability even when the concrete store underneath
 // implements it — the same reason cmd/bd type-asserts through
 // storage.UnwrapStore for RawDBAccessor, StoreLocator, and friends.
-func externalRefHistoryQuerier(store storage.Storage) (storage.ExternalRefHistoryQuerier, bool) {
+func externalRefHistoryQuerier(store Store) (ExternalRefHistoryStore, bool) {
+	if q, ok := store.(ExternalRefHistoryStore); ok {
+		return q, true
+	}
+	if direct, ok := store.(*directStore); ok {
+		if q, ok := direct.Storage.(ExternalRefHistoryStore); ok {
+			return q, true
+		}
+		if dolt, ok := direct.Storage.(storage.DoltStorage); ok {
+			if q, ok := storage.UnwrapStore(dolt).(ExternalRefHistoryStore); ok {
+				return q, true
+			}
+		}
+		return nil, false
+	}
 	if q, ok := store.(storage.ExternalRefHistoryQuerier); ok {
 		return q, true
 	}
@@ -1353,6 +1385,16 @@ func externalRefHistoryQuerier(store storage.Storage) (storage.ExternalRefHistor
 		return q, ok
 	}
 	return nil, false
+}
+
+func loadTrackerLocalStateAtSync(ctx context.Context, store Store, issueID string, lastSync time.Time) (*types.Issue, error) {
+	if direct, ok := store.(*directStore); ok {
+		return loadLocalStateAtSync(ctx, direct.Storage, issueID, lastSync)
+	}
+	if legacy, ok := store.(storage.Storage); ok {
+		return loadLocalStateAtSync(ctx, legacy, issueID, lastSync)
+	}
+	return nil, errHistoryNotSupported
 }
 
 func legacySyncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
@@ -1379,6 +1421,12 @@ func legacySyncIssueLabels(ctx context.Context, tx storage.Transaction, issueID 
 		}
 	}
 	return nil
+}
+
+// syncIssueLabels retains the store adapter's upstream helper name while the
+// fork keeps the explicit legacy name at pull-hook call sites.
+func syncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
+	return legacySyncIssueLabels(ctx, tx, issueID, desired, actor)
 }
 
 func equalNormalizedStrings(a, b []string) bool {
@@ -1432,7 +1480,7 @@ func parseSyncTime(value string) (time.Time, error) {
 // The sync engine records the timestamp in local metadata; older bd versions
 // wrote it to config, so fall back there for databases synced before the
 // refactor.
-func LastSync(ctx context.Context, store storage.Storage, configPrefix string) string {
+func LastSync(ctx context.Context, store Store, configPrefix string) string {
 	key := configPrefix + ".last_sync"
 	if value, err := store.GetLocalMetadata(ctx, key); err == nil && value != "" {
 		return value
@@ -1443,7 +1491,7 @@ func LastSync(ctx context.Context, store storage.Storage, configPrefix string) s
 
 // LastSyncTime returns LastSync parsed as a time.Time, or the zero time
 // when the tracker has never synced or the recorded value is unparseable.
-func LastSyncTime(ctx context.Context, store storage.Storage, configPrefix string) time.Time {
+func LastSyncTime(ctx context.Context, store Store, configPrefix string) time.Time {
 	raw := LastSync(ctx, store, configPrefix)
 	if raw == "" {
 		return time.Time{}
@@ -2196,9 +2244,13 @@ func (e *Engine) reimportIssue(ctx context.Context, c Conflict) {
 		}
 	}
 
-	if err := e.Store.RunInIssueLifecycleTransaction(ctx, fmt.Sprintf("bd: reimport update %s", c.IssueID), func(tx storage.IssueLifecycleTransaction) error {
-		return applyPullIssueFields(ctx, tx, c.IssueID, updates, e.Actor)
-	}); err != nil {
+	markPullIssueFields(updates)
+	updater, ok := e.Store.(IssueUpdater)
+	if !ok {
+		e.warn("tracker store does not support atomic issue updates")
+		return
+	}
+	if err := updater.ApplyIssueUpdate(ctx, c.IssueID, updates, nil, e.Actor); err != nil {
 		e.warn("Failed to update %s during reimport: %v", c.IssueID, err)
 		return
 	}
@@ -2276,7 +2328,7 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 // configured tracker→store mismatches.
 func (e *Engine) checkRequiredStoreCapabilities() error {
 	if _, ok := e.Tracker.(PostPullSnapshotter); ok {
-		if _, storeOK := e.Store.(storage.LinearIssueSnapshotStore); !storeOK {
+		if _, storeOK := LinearIssueSnapshotStoreFor(e.Store); !storeOK {
 			// Lead with the interface name (durable anchor — survives
 			// the bead system's archival cycle). Bead reference is the
 			// secondary historical anchor.
@@ -2289,7 +2341,7 @@ func (e *Engine) checkRequiredStoreCapabilities() error {
 		}
 	}
 	if _, ok := e.Tracker.(ProjectPuller); ok {
-		if _, storeOK := e.Store.(storage.LinearProjectSnapshotStore); !storeOK {
+		if _, storeOK := LinearProjectSnapshotStoreFor(e.Store); !storeOK {
 			return fmt.Errorf(
 				"storage backend does not implement storage.LinearProjectSnapshotStore "+
 					"required by tracker %q (ProjectPuller capability); "+
@@ -2468,7 +2520,7 @@ func (e *Engine) dependencyIssueResolver(ctx context.Context, extraIssues []*typ
 	}, nil
 }
 
-func dependencyExists(ctx context.Context, store storage.Storage, issueID, dependsOnID string, depType types.DependencyType) bool {
+func dependencyExists(ctx context.Context, store Store, issueID, dependsOnID string, depType types.DependencyType) bool {
 	if strings.TrimSpace(issueID) == "" || strings.TrimSpace(dependsOnID) == "" {
 		return false
 	}

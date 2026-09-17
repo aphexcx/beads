@@ -522,8 +522,8 @@ func TestNoDuplicateMigrationVersions(t *testing.T) {
 	if want, got := 73, LatestVersion(); got != want {
 		t.Errorf("LatestVersion() = %d, want %d (upstream 0053 tail + fork 0070-0073)", got, want)
 	}
-	if want, got := 28, LatestIgnoredVersion(); got != want {
-		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored tail 0024 + fork 0025-0027 + upstream's 0025 twin renumbered to 0028)", got, want)
+	if want, got := 29, LatestIgnoredVersion(); got != want {
+		t.Errorf("LatestIgnoredVersion() = %d, want %d (upstream ignored tail 0024 + fork 0025-0027 + upstream's 0025 twin renumbered to 0028 + upstream 0026 marker renumbered to 0029)", got, want)
 	}
 }
 
@@ -636,6 +636,7 @@ func TestPlanForkLineageRewrites_RefusalIssuesNoWrite(t *testing.T) {
 	defer db.Close()
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 0) // no bd-dn6 fingerprint
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectUpmergeMainVerification(t, mock)
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
@@ -656,6 +657,39 @@ func TestPlanForkLineageRewrites_RefusalIssuesNoWrite(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A pre-upmerge store can need only ignored migrations (main is already 73).
+// Refusal must precede the ignore seed and upstream tracked-cursor repair,
+// including DDL, commits, and unstaging any operator changes.
+func TestMigrateUpForkLineageRefusalPrecedesOpenTimeRepairs(t *testing.T) {
+	db, mock := newMockDB(t)
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectMaxVersion(mock, "schema_migrations", LatestVersion())
+	expectCursorProbe(mock, "ignored_schema_migrations", true)
+	expectMaxVersion(mock, "ignored_schema_migrations", 22)
+	expectTableProbe(mock, "wisps", true)
+	expectTableProbe(mock, "wisp_dependencies", true)
+	expectColumnProbe(mock, "leases", "granted_node", false)
+
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectUpmergeMainVerification(t, mock)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
+	expectMaxVersion(mock, "ignored_schema_migrations", 22)
+	expectTableProbe(mock, "linear_issue_snapshots", false)
+
+	applied, err := MigrateUp(context.Background(), db)
+	if applied != 0 || !errors.Is(err, errRefusedRewrite) {
+		t.Fatalf("MigrateUp = %d, %v; want no work and the lineage refusal", applied, err)
+	}
+	if !strings.Contains(err.Error(), "working set was left as found") {
+		t.Fatalf("refusal lost working-set guarantee: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -708,6 +742,7 @@ func TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified(t *testing.T) {
 	defer db.Close()
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectUpmergeMainVerification(t, mock)
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
@@ -739,7 +774,7 @@ func TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified(t *testing.T) {
 }
 
 // These cases pin the classification consumed by doctor, including a healed
-// ignored reading of 0 that must never replace the recorded MAX in the check.
+// ignored reading of 11 that must never replace the recorded MAX in the check.
 func TestVerifyForkLineageState_Upmerge(t *testing.T) {
 	cases := []struct {
 		name                                               string
@@ -753,7 +788,7 @@ func TestVerifyForkLineageState_Upmerge(t *testing.T) {
 		{name: "main only", mainMax: 73, ignoredMax: 28, mainFingerprint: true, want: ForkLineagePreMerge},
 		{name: "ignored only", mainMax: 73, ignoredMax: 22, ignoredFingerprint: true, healedIgnored: true, want: ForkLineagePreMerge},
 		{name: "main unexpected MAX", mainMax: 74, ignoredMax: 22, mainFingerprint: true, ignoredFingerprint: true, want: ForkLineageInconsistent, problems: []string{"schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor"}},
-		{name: "ignored unexpected recorded MAX despite healed zero", mainMax: 73, ignoredMax: 28, mainFingerprint: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineageInconsistent, problems: []string{"ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"}},
+		{name: "ignored unexpected recorded MAX despite replay floor", mainMax: 73, ignoredMax: 28, mainFingerprint: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineageInconsistent, problems: []string{"ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"}},
 		{name: "both unexpected MAX", mainMax: 74, ignoredMax: 23, mainFingerprint: true, ignoredFingerprint: true, want: ForkLineageInconsistent, problems: []string{"schema_migrations row 73 coexists with MAX(version)=74; reconciliation will refuse this cursor", "ignored_schema_migrations row 22 coexists with MAX(version)=23; reconciliation will refuse this cursor"}},
 		{name: "bd-dn6 main with inconsistent upmerge ignored", mainMax: 54, ignoredMax: 28, oldMain: true, ignoredFingerprint: true, healedIgnored: true, want: ForkLineageInconsistent, problems: []string{"ignored_schema_migrations row 22 coexists with MAX(version)=28; reconciliation will refuse this cursor"}},
 		{name: "merged main 73 ignored 1-28", mainMax: 73, ignoredMax: 28, want: ForkLineageReconciled},
@@ -845,7 +880,7 @@ func TestVerifyForkLineageState_Upmerge(t *testing.T) {
 			if !reflect.DeepEqual(report.Problems, tc.problems) {
 				t.Fatalf("Problems = %v, want %v", report.Problems, tc.problems)
 			}
-			if tc.healedIgnored && (report.IgnoredVersion != 0 || report.IgnoredCursorMax != tc.ignoredMax || report.IgnoredCursorNote == "") {
+			if tc.healedIgnored && (report.IgnoredVersion != 11 || report.IgnoredCursorMax != tc.ignoredMax || report.IgnoredCursorNote == "") {
 				t.Fatalf("lost recorded/healed ignored distinction: %+v", report)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
@@ -1236,7 +1271,7 @@ func TestVerifyForkLineageState_PreUpmergeTailEffects(t *testing.T) {
 			if report.Status != ForkLineageInconsistent || !reflect.DeepEqual(report.Problems, []string{tc.problem}) {
 				t.Fatalf("report = %+v; want inconsistent with %q", report, tc.problem)
 			}
-			if !tc.main && (report.IgnoredCursorMax != 22 || report.IgnoredVersion != 0) {
+			if !tc.main && (report.IgnoredCursorMax != 22 || report.IgnoredVersion != 11) {
 				t.Fatalf("lost recorded/healed cursor distinction: %+v", report)
 			}
 			if !reflect.DeepEqual(report.PreMergeSchemes, []string{"2026-08 upmerge"}) {

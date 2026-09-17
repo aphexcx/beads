@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -23,7 +22,7 @@ type IssueTracker interface {
 
 	// Init initializes the tracker with configuration from the beads config store.
 	// Called once before any sync operations.
-	Init(ctx context.Context, store storage.Storage) error
+	Init(ctx context.Context, store Store) error
 
 	// Validate checks that the tracker is properly configured and can connect.
 	Validate() error

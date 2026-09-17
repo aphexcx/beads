@@ -55,15 +55,26 @@ var auxRekeyPassDerivedInsert = auxRekeyPass{
 }
 
 // auxRekeyPasses lists every convergence pass, in the order MigrateUp runs
-// them.
+// them. Every pass here runs the identical rekeyAuxRowTable rewrite over the
+// identical auxRekeyTables set (see auxRowRekeyDriftedKey) — a future pass
+// that rewrites a different table set or a different derivation must not be
+// added to this list without also giving it its own drift record; sharing
+// auxRowRekeyDriftedKey across passes with different table sets or
+// derivations would let one pass clear a drift skip the other pass never
+// actually resolved.
 var auxRekeyPasses = []auxRekeyPass{auxRekeyPassInitial, auxRekeyPassDerivedInsert}
 
+// A pass's sentinel means "a rewrite is in flight", nothing else. MigrateUp
+// reads the sentinels to exempt the aux tables from the pre-existing-dirty
+// guards, because a crashed pass's own partial UPDATEs are sitting in the
+// working set — so a sentinel must not outlive an actual in-flight rewrite. A
+// drift skip (#4380) therefore clears it like any completed pass and records
+// auxRowRekeyDriftedKey instead.
+//
 // auxRowRekeyDriftedKey is the clone-local record (local_metadata,
 // dolt-ignored) of tables the re-key had to skip because their storage carries
 // dolthub/dolt#11131 encoding drift (#4380): a comma-separated table list,
-// absent when there is nothing skipped. It is pass-independent: the drift is a
-// property of the table's storage, so whichever pass hits it records it, and
-// whichever pass next retries those tables retires it.
+// absent when there is nothing skipped.
 //
 // It exists because the skip completes the pass, so MigrateUp records the
 // clone-local marker in that same pass and the marker gate can never re-admit
@@ -77,19 +88,19 @@ var auxRekeyPasses = []auxRekeyPass{auxRekeyPassInitial, auxRekeyPassDerivedInse
 // disagrees with) are committed data that travels on push/pull — migration 0057
 // documents bd's own 0048 as one way a lineage acquires it.
 //
-// The crash sentinel (pass.sentinelKey) means "a rewrite is in flight",
-// nothing else. MigrateUp reads it to exempt the aux tables from the
-// pre-existing-dirty guards, because a crashed pass's own partial UPDATEs are
-// sitting in the working set — so it must not outlive an actual in-flight
-// rewrite. A drift skip (#4380) therefore clears it like any completed pass
-// and records auxRowRekeyDriftedKey instead.
+// This one record is shared by every pass in auxRekeyPasses, which is only
+// correct because every pass runs the identical rekeyAuxRowTable rewrite over
+// the identical auxRekeyTables set (their gates — markerVersion,
+// shippedMainVersion — are all that differ): whichever pass retries a skipped
+// table first does the same work any other pass would have done, and clearing
+// the record on success correctly makes every other pass's retry a no-op.
 const auxRowRekeyDriftedKey = "aux_row_rekey_drifted"
 
-// auxRekeyState is what this clone still owes a re-key pass: a rewrite that
-// was in flight and never finished, and tables skipped for storage drift. Both
-// live in local_metadata, which is dolt-ignored and therefore clone-local —
-// and, per migration 0030, ephemeral: it is recreated empty by a working-set
-// reset, so "no record" is always a legitimate reading.
+// auxRekeyState is what this clone still owes the re-key: a rewrite that was in
+// flight and never finished, and tables skipped for storage drift. Both live in
+// local_metadata, which is dolt-ignored and therefore clone-local — and, per
+// migration 0030, ephemeral: it is recreated empty by a working-set reset, so
+// "no record" is always a legitimate reading.
 type auxRekeyState struct {
 	resume  bool
 	drifted []string
@@ -97,28 +108,19 @@ type auxRekeyState struct {
 
 func (s auxRekeyState) pending() bool { return s.resume || len(s.drifted) > 0 }
 
-// readAuxRekeyState reads one pass's crash sentinel and the pass-independent
-// drift record in one round trip. A missing local_metadata table means neither
-// is set: a fresh clone lacks the table until something recreates it —
-// setAuxRekeyInProgress creates it on demand.
-func readAuxRekeyState(ctx context.Context, db DBConn, sentinelKey string) (auxRekeyState, error) {
-	return readAuxRekeyStateKeys(ctx, db, []string{sentinelKey})
-}
-
-// readAnyAuxRekeyState reads EVERY pass's crash sentinel plus the drift
-// record, with one table probe and one row query regardless of how many
-// passes exist — it feeds MigrateUp's dirty-table exemption, which only needs
-// to know that some rekey rewrite is about to resume (resume) and which
-// tables a drift retry is about to touch (drifted).
-func readAnyAuxRekeyState(ctx context.Context, db DBConn) (auxRekeyState, error) {
-	keys := make([]string, len(auxRekeyPasses))
-	for i, pass := range auxRekeyPasses {
-		keys[i] = pass.sentinelKey
-	}
-	return readAuxRekeyStateKeys(ctx, db, keys)
-}
-
-func readAuxRekeyStateKeys(ctx context.Context, db DBConn, sentinelKeys []string) (auxRekeyState, error) {
+// readAuxRekeyState reads the given crash sentinels and the #4380 drift record
+// in one round trip. A missing local_metadata table means nothing is set: the
+// table is dolt-ignored and therefore clone-local, so a fresh clone lacks it
+// until something recreates it — setAuxRekeyInProgress creates it on demand.
+//
+// state.drifted is filtered against auxRekeyTables before it is returned: the
+// drift record is a free-form comma-separated cell, so this is the one place
+// that guarantees every name a caller sees is actually one of the re-keyed
+// tables. Callers rely on that — MigrateUp uses state.drifted directly to
+// exempt tables from the pre-existing-dirty guard, and an unfiltered name
+// there would let a non-aux table bypass those guards and get force-staged
+// into the migration commit.
+func readAuxRekeyState(ctx context.Context, db DBConn, sentinelKeys ...string) (auxRekeyState, error) {
 	var state auxRekeyState
 	var tableCount int
 	if err := db.QueryRowContext(ctx,
@@ -130,20 +132,18 @@ func readAuxRekeyStateKeys(ctx context.Context, db DBConn, sentinelKeys []string
 	if tableCount == 0 {
 		return state, nil
 	}
-	sentinelSet := make(map[string]bool, len(sentinelKeys))
 	placeholders := make([]string, 0, len(sentinelKeys)+1)
-	keys := make([]any, 0, len(sentinelKeys)+1)
-	for _, k := range sentinelKeys {
-		sentinelSet[k] = true
+	args := make([]any, 0, len(sentinelKeys)+1)
+	for _, key := range sentinelKeys {
 		placeholders = append(placeholders, "?")
-		keys = append(keys, k)
+		args = append(args, key)
 	}
 	placeholders = append(placeholders, "?")
-	keys = append(keys, auxRowRekeyDriftedKey)
-	//nolint:gosec // G201: the format inserts only "?" placeholders; values are bound.
+	args = append(args, auxRowRekeyDriftedKey)
+	//nolint:gosec // G201: only ? placeholders are interpolated; every value is bound.
 	rows, err := db.QueryContext(ctx,
 		fmt.Sprintf("SELECT `key`, value FROM local_metadata WHERE `key` IN (%s)", strings.Join(placeholders, ", ")),
-		keys...)
+		args...)
 	if err != nil {
 		// This is the one place the re-key reads a TEXT cell of local_metadata,
 		// so it is the one place a drifted local_metadata could panic the very
@@ -159,17 +159,30 @@ func readAuxRekeyStateKeys(ctx context.Context, db DBConn, sentinelKeys []string
 	for rows.Next() {
 		var key, value string
 		if err := rows.Scan(&key, &value); err != nil {
+			// Same drift degradation as the QueryContext and rows.Err() siblings
+			// that bracket this loop: this is the one place the re-key reads a
+			// TEXT cell of local_metadata, so a #11131 decode panic surfacing
+			// here — were a future migration ever to re-encode the table — must
+			// degrade to "nothing recorded" rather than re-break the open path
+			// this defense exists to protect. No reachable input triggers it
+			// today (a Dolt decode panic surfaces via Next/Err, not the Scan of
+			// already-streamed values), so this is purely defensive symmetry.
+			if isSchemaEncodingDriftErr(err) {
+				return auxRekeyState{}, nil
+			}
 			return auxRekeyState{}, err
 		}
-		switch {
-		case sentinelSet[key]:
-			state.resume = true
-		case key == auxRowRekeyDriftedKey:
+		switch key {
+		case auxRowRekeyDriftedKey:
 			for _, name := range strings.Split(value, ",") {
-				if name = strings.TrimSpace(name); name != "" {
+				if name = strings.TrimSpace(name); name != "" && auxRekeyTableNames[name] {
 					state.drifted = append(state.drifted, name)
 				}
 			}
+		default:
+			// The query only asks for the requested sentinel keys and the drift
+			// record, so any other returned key is a present sentinel.
+			state.resume = true
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -179,6 +192,37 @@ func readAuxRekeyStateKeys(ctx context.Context, db DBConn, sentinelKeys []string
 		return auxRekeyState{}, err
 	}
 	return state, nil
+}
+
+// auxRekeyExemptTables reports which aux tables MigrateUp must drop from its
+// dirtyBefore set before running the re-key: exactly the tables the upcoming
+// rekeyAuxRowIDsAllPasses will rewrite, unioned across every pass.
+//
+// It is deliberately derived from the same per-pass tablesToRekey selection the
+// rewrite itself uses, so the exemption can never be wider than the rewrite.
+// That matters because a post-marker resume re-keys only the recorded drifted
+// subset (bd-578h9 / #4380): exempting all four aux tables there — as a single
+// collapsed "some rewrite is in flight" bit would — drops a non-drifted aux
+// table's pre-existing user edits out of dirtyBefore, and stageSchemaTables
+// then sweeps them into the "schema: apply migrations" commit. Keying the
+// exemption off the exact rewrite set closes that asymmetry by construction.
+func auxRekeyExemptTables(ctx context.Context, db DBConn, mainVersionBefore int) (map[string]bool, error) {
+	pending, err := ignoredSource.pendingVersions(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("reading pending ignored migrations: %w", err)
+	}
+	exempt := make(map[string]bool)
+	for _, pass := range auxRekeyPasses {
+		state, err := readAuxRekeyState(ctx, db, pass.sentinelKey)
+		if err != nil {
+			return nil, fmt.Errorf("reading aux rekey state: %w", err)
+		}
+		tables, _ := pass.tablesToRekey(mainVersionBefore, pending, state)
+		for _, t := range tables {
+			exempt[t.name] = true
+		}
+	}
+	return exempt, nil
 }
 
 func setAuxRekeyInProgress(ctx context.Context, db DBConn, sentinelKey string) error {
@@ -262,6 +306,21 @@ var auxRekeyTables = []auxRekeyTable{
 	},
 }
 
+// auxRekeyTableNames is auxRekeyTables' name set, used by readAuxRekeyState to
+// filter the local_metadata drift record: that cell is a free-form
+// comma-separated string, not validated at write time by anything but this
+// package's own writer, so a stale or corrupted entry must not reach a caller
+// that trusts every name in state.drifted to be one of the four re-keyed
+// tables (schema.go's MigrateUp uses it unfiltered to exempt tables from the
+// pre-existing-dirty guard).
+var auxRekeyTableNames = func() map[string]bool {
+	names := make(map[string]bool, len(auxRekeyTables))
+	for _, t := range auxRekeyTables {
+		names[t.name] = true
+	}
+	return names
+}()
+
 // rekeyAuxRowIDs converges the primary keys that migration 0037 randomized
 // (bd-6dnrw.2). 0037 backfilled the CHAR(36) ids of events, comments,
 // issue_snapshots and compaction_snapshots with per-clone-random UUID()s, so
@@ -314,53 +373,73 @@ func rekeyAuxRowIDsAllPasses(ctx context.Context, db DBConn, mainVersionBefore i
 	return wrote, nil
 }
 
-func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass, pending []int) (bool, error) {
-	markerPending := false
-	for _, v := range pending {
-		if v == pass.markerVersion {
-			markerPending = true
-			break
+// tablesToRekey reports which aux tables this pass rewrites on the current
+// MigrateUp, and whether it runs at all. It is the single source of truth for
+// that selection: rekeyAuxRowIDsPending drives its own rewrite from it, and
+// MigrateUp's dirtyBefore exemption (auxRekeyExemptTables) unions it across
+// passes — so the set of tables exempted from the pre-existing-dirty guards can
+// never diverge from the set the rewrite actually touches (#4380).
+//
+// runs is false only when neither gate admits the pass. It stays true for a
+// post-marker resume whose table set is empty — a sentinel left set after the
+// drift record was already cleared — so the caller still proceeds to clear that
+// stale sentinel instead of leaking it.
+func (pass auxRekeyPass) tablesToRekey(mainVersionBefore int, pending []int, state auxRekeyState) ([]auxRekeyTable, bool) {
+	markerPending := slices.Contains(pending, pass.markerVersion)
+
+	// The marker gate is "once per clone" only for a pass that actually
+	// converged every table. A pass that skipped one for #11131 drift completed
+	// — so the marker was recorded in that same MigrateUp — and the marker alone
+	// would then bar re-entry forever, making the skip permanent. A crash
+	// sentinel or a drift record (state.pending()) re-admits the pass so it can
+	// finish once the storage is repaired.
+	if !markerPending && !state.pending() {
+		return nil, false
+	}
+	// The fresh-clone skip (record the marker, skip the rewrite — bd-578h9.4)
+	// must not fire on a lineage whose previous pass crashed mid-rekey: that
+	// pass already advanced the main cursor past the shipped version, but its
+	// sentinel — or a recorded drift skip — proves the rewrite never finished
+	// (bd-578h9.16).
+	if mainVersionBefore >= pass.shippedMainVersion && !state.pending() {
+		return nil, false
+	}
+
+	// A markerPending pass is the one-time convergence and covers all four
+	// tables. Once the marker is recorded, MigrateUp records it
+	// (ignoredSource.migrate) only after the rewrite returns without error, so a
+	// clone that still owes work past that point owes it for exactly the tables
+	// the drift record names. Re-keying any other table there would be wrong —
+	// those converged in the completed pass, and rows minted since carry
+	// app-minted ids already consistent across clones, so rewriting them on this
+	// clone alone manufactures the divergence the re-key exists to remove. This
+	// also covers a drift-resume pass that itself died on an unrelated error and
+	// left the sentinel set: still a post-marker pass, so still only the
+	// recorded tables.
+	if markerPending {
+		return auxRekeyTables, true
+	}
+	// This is a selection, not a validation filter: state.drifted is already
+	// guaranteed a subset of auxRekeyTables' names (readAuxRekeyState filters
+	// it), so slices.Contains here is what maps those names to the full
+	// auxRekeyTable structs (with their frozen columns) this pass actually needs.
+	var tables []auxRekeyTable
+	for _, t := range auxRekeyTables {
+		if slices.Contains(state.drifted, t.name) {
+			tables = append(tables, t)
 		}
 	}
+	return tables, true
+}
+
+func rekeyAuxRowIDsPending(ctx context.Context, db DBConn, mainVersionBefore int, pass auxRekeyPass, pending []int) (bool, error) {
 	state, err := readAuxRekeyState(ctx, db, pass.sentinelKey)
 	if err != nil {
 		return false, fmt.Errorf("reading aux rekey state: %w", err)
 	}
-	// The marker gate is "once per clone" only for a pass that actually
-	// converged every table. A pass that skipped one for #11131 drift completed
-	// — so the marker was recorded in that same MigrateUp — and the marker
-	// alone would then bar re-entry forever, making the skip permanent. The
-	// drift record re-admits the pass so it can finish once the storage is
-	// repaired.
-	if !markerPending && !state.pending() {
+	tables, runs := pass.tablesToRekey(mainVersionBefore, pending, state)
+	if !runs {
 		return false, nil
-	}
-	// The fresh-clone skip must not fire on a lineage whose previous pass
-	// crashed mid-rekey: that pass already advanced the main cursor past the
-	// shipped version, but its sentinel proves the rewrite never finished
-	// (bd-578h9.16). A recorded drift skip says the same thing.
-	if mainVersionBefore >= pass.shippedMainVersion && !state.pending() {
-		return false, nil
-	}
-
-	// Once the marker is recorded, the one-time pass has completed: MigrateUp
-	// records it (ignoredSource.migrate) only after this function returns
-	// without error, so a clone that still owes work past that point owes it for
-	// exactly the tables the drift record names. Re-keying any other table there
-	// would be wrong — those converged in the completed pass, and rows minted
-	// since carry app-minted ids that are already consistent across clones (see
-	// above), so rewriting them on this clone alone manufactures the divergence
-	// the re-key exists to remove. Note this covers a drift-resume pass that
-	// itself died on some unrelated error and left the sentinel set: it is still
-	// a post-marker pass, so it still touches only the recorded tables.
-	tables := auxRekeyTables
-	if !markerPending {
-		tables = nil
-		for _, t := range auxRekeyTables {
-			if slices.Contains(state.drifted, t.name) {
-				tables = append(tables, t)
-			}
-		}
 	}
 
 	// Sentinel before the first UPDATE: a crash anywhere in the rewrite
