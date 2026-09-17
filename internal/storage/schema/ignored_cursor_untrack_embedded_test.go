@@ -357,3 +357,54 @@ func TestCursorRestoreDoesNotCommitStagedUserEdits(t *testing.T) {
 		t.Fatalf("repair changed user edits: HEAD=%d working=%d; want 10, 20", committed, working)
 	}
 }
+
+type denyCursorRename struct{ DBConn }
+
+func (db denyCursorRename) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.HasPrefix(query, "RENAME TABLE wisp_ignored_schema_migrations_restore") {
+		return nil, &mysql.MySQLError{Number: 1142, Message: "ALTER command denied for cursor staging"}
+	}
+	return db.DBConn.ExecContext(ctx, query, args...)
+}
+
+func TestMigrateUpDefersAfterCursorRenameDenied(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := openCursorRecoveryDB(t, dir, true)
+	if _, err := MigrateUp(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE ignored_schema_migrations SET applied_at = '2026-09-01 12:00:00'"); err != nil {
+		t.Fatal(err)
+	}
+	var expected int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations").Scan(&expected); err != nil {
+		t.Fatal(err)
+	}
+	if err := backupIgnoredCursorRows(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE ignored_schema_migrations"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := MigrateUp(ctx, denyCursorRename{db}); err != nil {
+		t.Fatalf("restricted open must decline migration work: %v", err)
+	}
+	if present, err := schemaTableExists(ctx, db, ignoredSource.cursorTable); err != nil || present {
+		t.Fatalf("declined restore bootstrapped a live cursor: present=%v, err=%v", present, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openCursorRecoveryDB(t, dir, false)
+	if _, err := MigrateUp(ctx, db); err != nil {
+		t.Fatalf("privileged reopen: %v", err)
+	}
+	var preserved int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE applied_at = '2026-09-01 12:00:00'").Scan(&preserved); err != nil || preserved != expected {
+		t.Fatalf("cursor replayed after permission decline: original rows=%d, want %d; err=%v", preserved, expected, err)
+	}
+	if pending, err := ignoredSource.pendingVersions(ctx, db); err != nil || len(pending) != 0 {
+		t.Fatalf("pending migrations after privileged reopen = %v, %v", pending, err)
+	}
+}

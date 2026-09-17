@@ -643,6 +643,9 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// HEAD, so it must follow the fork's read-only lineage verification.
 	// Run it even at latest: a pull can reintroduce the tracked cursor.
 	healed, err := healTrackedIgnoredCursorTable(ctx, db)
+	if errors.Is(err, errIgnoredCursorRestoreDeferred) {
+		return 0, nil
+	}
 	if err != nil {
 		return 0, fmt.Errorf("untracking legacy %s: %w", ignoredSource.cursorTable, err)
 	}

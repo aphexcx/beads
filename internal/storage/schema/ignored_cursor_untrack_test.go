@@ -625,8 +625,8 @@ func TestHealResumeDegradesForClientsThatCannotRunDDL(t *testing.T) {
 			if tt.wantFatal && err == nil {
 				t.Fatal("healTrackedIgnoredCursorTable() error = nil, want the failure returned so a privileged opener retries")
 			}
-			if !tt.wantFatal && err != nil {
-				t.Fatalf("healTrackedIgnoredCursorTable() error = %v, want nil: a client that cannot run DDL must open read-degraded, not fail forever", err)
+			if !tt.wantFatal && !errors.Is(err, errIgnoredCursorRestoreDeferred) {
+				t.Fatalf("healTrackedIgnoredCursorTable() error = %v, want migration deferral so the restricted open cannot bootstrap an empty cursor", err)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatalf("unmet SQL expectations: %v", err)
