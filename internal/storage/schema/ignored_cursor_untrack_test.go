@@ -160,6 +160,7 @@ func expectIgnoredCursorUnstage(mock sqlmock.Sqlmock, staged ...string) {
 
 // expectIgnoredCursorUntrackCommit mocks the irreversible half of Phase A.
 func expectIgnoredCursorUntrackCommit(mock sqlmock.Sqlmock) {
+	expectIgnoreResolution(mock, "", ignoredCursorRestoreTable, []doltIgnoreRow{{ignoredCursorRestoreTable, true}})
 	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + ignoredSource.cursorTable)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("COMMIT")).
@@ -425,6 +426,7 @@ func TestHealIsFatalAfterTheDropAndIsNotADirtyTablesError(t *testing.T) {
 	expectIgnoredCursorGate(mock, "", true, exactlyIgnored(true), false)
 	expectIgnoredCursorBackup(mock, len(cursorTableColumns))
 	expectIgnoredCursorUnstage(mock)
+	expectIgnoreResolution(mock, "", ignoredCursorRestoreTable, []doltIgnoreRow{{ignoredCursorRestoreTable, true}})
 	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + ignoredSource.cursorTable)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("COMMIT")).

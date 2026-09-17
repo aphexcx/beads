@@ -47,7 +47,9 @@ const (
 	// any dolt_ignore pattern — a straggler must show up in dolt_status
 	// rather than hide.
 	ignoredCursorUntrackTempTable = "__temp__ignored_schema_migrations_untrack"
-	ignoredCursorRestoreTable     = "__temp__ignored_schema_migrations_restore"
+	// The existing wisp_% namespace is clone-local and already ignored on
+	// legacy databases. Reuse it instead of adding a mandatory ignore seed.
+	ignoredCursorRestoreTable = "wisp_ignored_schema_migrations_restore"
 
 	ignoredCursorUntrackCommitMessage = "schema: untrack legacy ignored_schema_migrations so dolt_ignore can apply (gastownhall/beads#4356)"
 
@@ -158,6 +160,12 @@ func healTrackedIgnoredCursorTable(ctx context.Context, db DBConn) (bool, error)
 	if err := unstageBeforeIgnoredCursorUntrack(ctx, db); err != nil {
 		ignoredCursorAdvisory("schema: cannot clear the staging area before untracking %s, leaving it in place: %v\n",
 			ignoredSource.cursorTable, err)
+		return false, nil
+	}
+	// This repair-only prerequisite belongs in the advisory zone, while the
+	// live cursor is still intact. Healthy opens must not seed it at all.
+	if err := checkIgnoredCursorRestore(ctx, db); err != nil {
+		ignoredCursorAdvisory("schema: cannot prepare cursor restoration, leaving the tracked table in place: %v\n", err)
 		return false, nil
 	}
 
@@ -451,15 +459,9 @@ func commitIgnoredCursorUntrack(ctx context.Context, db DBConn) error {
 // until all rows are ready lets the next open both plan against the scratch
 // and resume the restore. A live cursor remains authoritative for rollbacks.
 func restoreIgnoredCursorRows(ctx context.Context, db DBConn) error {
-	// Seeding precedes the heal. Refuse an explicit staging-table override:
-	// a concurrent blanket commit must never turn the publish into a tracked
-	// rename, which cannot subsequently be staged as a deletion alone.
-	ignored, err := tableActivelyIgnored(ctx, db, "", ignoredCursorRestoreTable)
-	if err != nil {
+	// Re-read the prerequisite on a resume as well as before a first-time drop.
+	if err := checkIgnoredCursorRestore(ctx, db); err != nil {
 		return err
-	}
-	if !ignored {
-		return fmt.Errorf("cannot restore %s: staging table %s must be dolt-ignored", ignoredSource.cursorTable, ignoredCursorRestoreTable)
 	}
 	// A prior interrupted attempt may have been swept into HEAD. Remove its
 	// tracked identity before rebuilding: renaming a tracked staging table
@@ -486,6 +488,20 @@ func restoreIgnoredCursorRows(ctx context.Context, db DBConn) error {
 		return fmt.Errorf("publishing restored %s: %w", ignoredSource.cursorTable, err)
 	}
 	return dropIgnoredCursorScratch(ctx, db)
+}
+
+// checkIgnoredCursorRestore keeps staging out of concurrent blanket commits
+// using the existing clone-local ignore namespace. It never seeds new state on
+// healthy opens or requires an extra DML grant on dolt_ignore.
+func checkIgnoredCursorRestore(ctx context.Context, db DBConn) error {
+	ignored, err := tableActivelyIgnored(ctx, db, "", ignoredCursorRestoreTable)
+	if err != nil {
+		return err
+	}
+	if !ignored {
+		return fmt.Errorf("cannot restore %s: staging table %s must be dolt-ignored", ignoredSource.cursorTable, ignoredCursorRestoreTable)
+	}
+	return nil
 }
 
 // dropIgnoredCursorScratch removes the scratch table and cleans up after the
