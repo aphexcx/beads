@@ -175,6 +175,7 @@ func expectIgnoredCursorUntrackCommit(mock sqlmock.Sqlmock) {
 // expectIgnoredCursorScratchDrop mocks the cleanup, including the straggler
 // sweep that only fires if a concurrent commit swept the scratch into HEAD.
 func expectIgnoredCursorScratchDrop(mock sqlmock.Sqlmock, sweptIntoHead bool) {
+	expectIgnoredCursorStagingDrop(mock)
 	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + ignoredCursorUntrackTempTable)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("COMMIT")).
@@ -192,13 +193,22 @@ func expectIgnoredCursorScratchDrop(mock sqlmock.Sqlmock, sweptIntoHead bool) {
 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
 }
 
+func expectIgnoredCursorStagingDrop(mock sqlmock.Sqlmock) {
+	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + ignoredCursorRestoreTable)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("^COMMIT$").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectHeadTableProbe(mock, "", ignoredCursorRestoreTable, false)
+}
+
 // expectIgnoredCursorRestore mocks Phase B.
 func expectIgnoredCursorRestore(mock sqlmock.Sqlmock, sweptIntoHead bool) {
-	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredSource.cursorTable).
+	expectIgnoredCursorStagingDrop(mock)
+	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredCursorRestoreTable).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectCursorCopyColumns(mock, ignoredCursorUntrackTempTable, len(cursorTableColumns))
-	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO " + ignoredSource.cursorTable)).
+	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO " + ignoredCursorRestoreTable)).
 		WillReturnResult(sqlmock.NewResult(0, 25))
+	mock.ExpectExec(regexp.QuoteMeta("RENAME TABLE " + ignoredCursorRestoreTable + " TO " + ignoredSource.cursorTable)).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	expectIgnoredCursorScratchDrop(mock, sweptIntoHead)
 }
 
@@ -603,7 +613,8 @@ func TestHealResumeDegradesForClientsThatCannotRunDDL(t *testing.T) {
 			expectIgnoredCursorGate(mock, "", false, nil, true)
 			expectIgnoreResolution(mock, "", ignoredSource.cursorTable, exactlyIgnored(true))
 			expectSchemaTableExists(mock, ignoredSource.cursorTable, false)
-			mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredSource.cursorTable).
+			expectIgnoredCursorStagingDrop(mock)
+			mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredCursorRestoreTable).
 				WillReturnError(tt.err)
 
 			_, err := healTrackedIgnoredCursorTable(context.Background(), db)

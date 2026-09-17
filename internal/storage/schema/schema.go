@@ -718,14 +718,10 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	// dirtyBefore would fail the pass on the read, re-creating the unopenable
 	// database this exemption path exists to rescue.
 	//
-	// auxRekeyExemptTables returns exactly the tables the upcoming
-	// rekeyAuxRowIDsAllPasses will rewrite, computed from the same per-pass
-	// selection the rewrite uses. Scoping the exemption to that set — rather
-	// than blanket-exempting all four aux tables whenever any rewrite is in
-	// flight — keeps a post-marker resume, which touches only the recorded
-	// drifted subset, from dropping a non-drifted aux table's pre-existing user
-	// edits out of dirtyBefore and into the migration commit (#4380).
-	auxRekeyExempt, err := auxRekeyExemptTables(ctx, db, mainVersionBefore)
+	// Exempt only tables with recorded crash/drift recovery state that the
+	// upcoming rekey will actually rewrite. First-time rewrites must refuse
+	// dirty aux tables here, before any migrations or rekey markers advance.
+	auxRekeyExempt, err := auxRekeyExemptTables(ctx, db, mainVersionBefore, dirtyBefore)
 	if err != nil {
 		return 0, err
 	}
