@@ -600,6 +600,9 @@ func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
 	return applied, err
 }
 
+// MigrateUp returns ErrIgnoredCursorRestoreDeferred with zero applied when an
+// interrupted cursor repair cannot finish. Only explicitly lenient open callers
+// may continue on the preserved scratch cursor; migrations have not completed.
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// Re-assert the canonical dolt_ignore patterns before anything else, and
 	// in particular before the migrationWorkNeeded short-circuit: a database
@@ -622,9 +625,6 @@ func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	// pull from a not-yet-healed peer can re-introduce the tracked table,
 	// which only a probe that runs at EVERY open can catch.
 	healed, err := healTrackedIgnoredCursorTable(ctx, db)
-	if errors.Is(err, errIgnoredCursorRestoreDeferred) {
-		return 0, nil
-	}
 	if err != nil {
 		return 0, fmt.Errorf("untracking legacy %s: %w", ignoredSource.cursorTable, err)
 	}

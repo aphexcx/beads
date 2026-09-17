@@ -158,9 +158,29 @@ func expectIgnoredCursorUnstage(mock sqlmock.Sqlmock, staged ...string) {
 	}
 }
 
+func expectIgnoredCursorPreflight(mock sqlmock.Sqlmock) {
+	const probe = "wisp_ignored_schema_migrations_restore_probe"
+	expectIgnoreResolution(mock, "", ignoredCursorRestoreTable, []doltIgnoreRow{{ignoredCursorRestoreTable, true}})
+	expectIgnoreResolution(mock, "", probe, []doltIgnoreRow{{"wisp_%", true}})
+	expectIgnoredCursorStagingDrop(mock)
+	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + probe)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("^COMMIT$").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectHeadTableProbe(mock, "", probe, false)
+	columns := expectCursorCopyColumns(mock, ignoredCursorUntrackTempTable, len(cursorTableColumns))
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredSource.cursorTable).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO " + ignoredSource.cursorTable + " (version) SELECT version FROM " + ignoredCursorUntrackTempTable + " WHERE 1 = 0")).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS " + ignoredCursorRestoreTable).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO " + ignoredCursorRestoreTable + " (" + columns + ") SELECT " + columns + " FROM " + ignoredCursorUntrackTempTable + " WHERE 1 = 0")).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("RENAME TABLE " + ignoredCursorRestoreTable + " TO " + probe)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + probe)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("^COMMIT$").WillReturnResult(sqlmock.NewResult(0, 0))
+	expectHeadTableProbe(mock, "", probe, false)
+}
+
 // expectIgnoredCursorUntrackCommit mocks the irreversible half of Phase A.
 func expectIgnoredCursorUntrackCommit(mock sqlmock.Sqlmock) {
-	expectIgnoreResolution(mock, "", ignoredCursorRestoreTable, []doltIgnoreRow{{ignoredCursorRestoreTable, true}})
+	expectIgnoredCursorPreflight(mock)
 	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + ignoredSource.cursorTable)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("COMMIT")).
@@ -426,7 +446,7 @@ func TestHealIsFatalAfterTheDropAndIsNotADirtyTablesError(t *testing.T) {
 	expectIgnoredCursorGate(mock, "", true, exactlyIgnored(true), false)
 	expectIgnoredCursorBackup(mock, len(cursorTableColumns))
 	expectIgnoredCursorUnstage(mock)
-	expectIgnoreResolution(mock, "", ignoredCursorRestoreTable, []doltIgnoreRow{{ignoredCursorRestoreTable, true}})
+	expectIgnoredCursorPreflight(mock)
 	mock.ExpectExec(regexp.QuoteMeta("DROP TABLE IF EXISTS " + ignoredSource.cursorTable)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(regexp.QuoteMeta("COMMIT")).
@@ -625,7 +645,7 @@ func TestHealResumeDegradesForClientsThatCannotRunDDL(t *testing.T) {
 			if tt.wantFatal && err == nil {
 				t.Fatal("healTrackedIgnoredCursorTable() error = nil, want the failure returned so a privileged opener retries")
 			}
-			if !tt.wantFatal && !errors.Is(err, errIgnoredCursorRestoreDeferred) {
+			if !tt.wantFatal && !errors.Is(err, ErrIgnoredCursorRestoreDeferred) {
 				t.Fatalf("healTrackedIgnoredCursorTable() error = %v, want migration deferral so the restricted open cannot bootstrap an empty cursor", err)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {

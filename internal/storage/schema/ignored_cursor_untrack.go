@@ -11,10 +11,11 @@ import (
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
 
-// An opener blocked by permissions or a staging ignore override must preserve
-// scratch rather than bootstrap an empty live cursor and replay migrations.
-// MigrateUp consumes this internal signal as a successful, deferred open.
-var errIgnoredCursorRestoreDeferred = errors.New("ignored cursor restoration deferred")
+// ErrIgnoredCursorRestoreDeferred means migration stopped with the saved cursor
+// intact because restoration is blocked by permissions or an ignore override.
+// Lenient opens may use the current schema; strict migration callers must report
+// this outcome instead of certifying the schema as current.
+var ErrIgnoredCursorRestoreDeferred = errors.New("ignored cursor restoration deferred; migrations are pending")
 
 // The ignored-lane migration cursor is dolt_ignore'd on every database this
 // binary opens, but dolt_ignore only exempts tables that have never been
@@ -170,7 +171,7 @@ func healTrackedIgnoredCursorTable(ctx context.Context, db DBConn) (bool, error)
 	}
 	// This repair-only prerequisite belongs in the advisory zone, while the
 	// live cursor is still intact. Healthy opens must not seed it at all.
-	if err := checkIgnoredCursorRestore(ctx, db); err != nil {
+	if err := preflightIgnoredCursorRestore(ctx, db); err != nil {
 		ignoredCursorAdvisory("schema: cannot prepare cursor restoration, leaving the tracked table in place: %v\n", err)
 		// A previous attempt may have dropped the cursor without committing
 		// its deletion. Declining is safe only while a live cursor remains;
@@ -180,7 +181,7 @@ func healTrackedIgnoredCursorTable(ctx context.Context, db DBConn) (bool, error)
 			return false, fmt.Errorf("probing %s: %w", ignoredSource.cursorTable, probeErr)
 		}
 		if !cursorPresent {
-			return false, errIgnoredCursorRestoreDeferred
+			return false, ErrIgnoredCursorRestoreDeferred
 		}
 		return false, nil
 	}
@@ -251,7 +252,7 @@ func resumeIgnoredCursorUntrack(ctx context.Context, db DBConn) (bool, error) {
 			ignoredCursorAdvisory("schema: not permitted to finish the interrupted %s untrack; continuing without it: %v\n",
 				ignoredSource.cursorTable, err)
 			if restore {
-				return false, errIgnoredCursorRestoreDeferred
+				return false, ErrIgnoredCursorRestoreDeferred
 			}
 			return false, nil
 		}
@@ -509,6 +510,64 @@ func restoreIgnoredCursorRows(ctx context.Context, db DBConn) error {
 	return dropIgnoredCursorScratch(ctx, db)
 }
 
+// preflightIgnoredCursorRestore exercises restoration grants before the live
+// cursor is dropped. In particular RENAME needs ALTER/DROP on staging as well
+// as CREATE/INSERT on its destination. A failed preflight stays advisory while
+// the live cursor exists; on an interrupted drop the caller instead defers.
+func preflightIgnoredCursorRestore(ctx context.Context, db DBConn) error {
+	if err := checkIgnoredCursorRestore(ctx, db); err != nil {
+		return err
+	}
+	const probe = "wisp_ignored_schema_migrations_restore_probe"
+	ignored, err := tableActivelyIgnored(ctx, db, "", probe)
+	if err != nil {
+		return err
+	}
+	if !ignored {
+		return fmt.Errorf("cursor restoration probe %s must be dolt-ignored", probe)
+	}
+	// Reserved repair tables may survive an interrupted preflight. Scope any
+	// tracked residue cleanup exactly as restoration does, before recreating it.
+	for _, table := range []string{ignoredCursorRestoreTable, probe} {
+		if err := dropIgnoredCursorRepairTable(ctx, db, table); err != nil {
+			return err
+		}
+	}
+	columns, err := ignoredCursorCopyColumns(ctx, db, ignoredCursorUntrackTempTable)
+	if err != nil {
+		return err
+	}
+	live, err := schemaTableExists(ctx, db, ignoredSource.cursorTable)
+	if err != nil {
+		return err
+	}
+	if live {
+		// Check the actual destination's table-scoped CREATE/INSERT grants, too.
+		// IF NOT EXISTS and an empty SELECT leave the live cursor untouched. Never
+		// issue its CREATE after an interrupted drop: that would publish it empty.
+		if _, err := db.ExecContext(ctx, ignoredSource.bootstrapSQL()); err != nil {
+			return err
+		}
+		//nolint:gosec // G201: constant table names and a fixed column allowlist.
+		query := "INSERT IGNORE INTO " + ignoredSource.cursorTable + " (version) SELECT version FROM " + ignoredCursorUntrackTempTable + " WHERE 1 = 0"
+		if _, err := db.ExecContext(ctx, query); err != nil {
+			return err
+		}
+	}
+	if _, err := db.ExecContext(ctx, ignoredCursorRestore.bootstrapSQL()); err != nil {
+		return err
+	}
+	//nolint:gosec // G201: constant table names and a fixed column allowlist.
+	query := "INSERT IGNORE INTO " + ignoredCursorRestoreTable + " (" + columns + ") SELECT " + columns + " FROM " + ignoredCursorUntrackTempTable + " WHERE 1 = 0"
+	if _, err := db.ExecContext(ctx, query); err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, "RENAME TABLE "+ignoredCursorRestoreTable+" TO "+probe); err != nil {
+		return err
+	}
+	return dropIgnoredCursorRepairTable(ctx, db, probe)
+}
+
 // checkIgnoredCursorRestore keeps staging out of concurrent blanket commits
 // using the existing clone-local ignore namespace. It never seeds new state on
 // healthy opens or requires an extra DML grant on dolt_ignore.
@@ -522,7 +581,7 @@ func checkIgnoredCursorRestore(ctx context.Context, db DBConn) error {
 		// intact. After a committed drop, defer migration until the override
 		// is removed so the scratch cursor remains available for recovery.
 		return fmt.Errorf("%w: cannot restore %s: staging table %s must be dolt-ignored",
-			errIgnoredCursorRestoreDeferred, ignoredSource.cursorTable, ignoredCursorRestoreTable)
+			ErrIgnoredCursorRestoreDeferred, ignoredSource.cursorTable, ignoredCursorRestoreTable)
 	}
 	return nil
 }
