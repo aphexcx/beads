@@ -89,6 +89,51 @@ func TestAuxRekeyExemptionsRequireRecoveryForTheTable(t *testing.T) {
 	}
 }
 
+func TestFirstTimeAuxRekeyPreservesFailed0053Recovery(t *testing.T) {
+	for _, interrupted := range []bool{true, false} {
+		name := "user_edits_without_recovery_evidence"
+		if interrupted {
+			name = "known_failed_v53"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, mock := newMockDB(t)
+			for range 2 {
+				expectDirtyDoltStatusRow(mock, "comments", false)
+			}
+			expectCursorProbe(mock, "schema_migrations", true)
+			expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 52)
+			expectCursorProbe(mock, "ignored_schema_migrations", true)
+			expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", "version", auxRekeyPassInitial.markerVersion-1)
+			expectIgnoredSentinelProbes(mock, true)
+			for _, pass := range auxRekeyPasses {
+				expectAuxRekeyStateForPass(mock, pass, false)
+			}
+			// Historical main-migration debris predates any aux-rekey sentinel.
+			expectCursorProbe(mock, "schema_migrations", true)
+			expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 52)
+			expectSchemaTableExists(mock, "wisp_dependencies", true)
+			expectColumnProbe(mock, "wisp_dependencies", "depends_on_issue_id", !interrupted)
+			reachedMigration := errors.New("reached migration after validated v53 recovery")
+			if interrupted {
+				mock.ExpectExec(regexp.QuoteMeta(mainSource.bootstrapSQL())).WillReturnError(reachedMigration)
+			} else {
+				expectColumnProbe(mock, "wisp_dependencies", "depends_on_wisp_id", true)
+				expectColumnProbe(mock, "wisp_dependencies", "depends_on_external", true)
+			}
+			_, err := migrateUpAfterReconcile(context.Background(), db, true, false, nil)
+			var dirtyErr *DirtyTablesError
+			if interrupted && !errors.Is(err, reachedMigration) {
+				t.Fatalf("failed-v53 migration debris was refused before recovery: %v", err)
+			} else if !interrupted && !errors.As(err, &dirtyErr) {
+				t.Fatalf("v52 user edits without recovery evidence must be refused: %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func nstr(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
 
 func commentDigest(issueID, author, text, createdAt string) string {

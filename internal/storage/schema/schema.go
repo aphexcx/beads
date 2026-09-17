@@ -745,9 +745,10 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, needed, seedChanged
 	// Exempt only tables with recorded crash/drift recovery state that the
 	// upcoming rekey will actually rewrite. First-time rewrites must refuse
 	// dirty aux tables here, before any migrations or rekey markers advance.
-	auxRekeyExempt, err := auxRekeyExemptTables(ctx, db, mainVersionBefore, dirtyBefore)
-	if err != nil {
-		return 0, err
+	auxRekeyExempt, auxRekeyErr := auxRekeyExemptTables(ctx, db, mainVersionBefore, dirtyBefore)
+	var auxDirtyErr *DirtyTablesError
+	if auxRekeyErr != nil && (mainVersionBefore != 52 || !errors.As(auxRekeyErr, &auxDirtyErr)) {
+		return 0, auxRekeyErr
 	}
 	for name := range auxRekeyExempt {
 		delete(dirtyBefore, name)
@@ -759,6 +760,10 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, needed, seedChanged
 		for table := range dirtyBefore {
 			delete(dirtyBefore, table)
 		}
+	} else if auxRekeyErr != nil {
+		// Only validated historical v53 debris can bypass the first-time
+		// rekey refusal without an aux sentinel; ordinary user edits cannot.
+		return 0, auxRekeyErr
 	}
 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
 	if err != nil {
