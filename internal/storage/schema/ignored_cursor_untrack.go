@@ -451,6 +451,16 @@ func commitIgnoredCursorUntrack(ctx context.Context, db DBConn) error {
 // until all rows are ready lets the next open both plan against the scratch
 // and resume the restore. A live cursor remains authoritative for rollbacks.
 func restoreIgnoredCursorRows(ctx context.Context, db DBConn) error {
+	// Seeding precedes the heal. Refuse an explicit staging-table override:
+	// a concurrent blanket commit must never turn the publish into a tracked
+	// rename, which cannot subsequently be staged as a deletion alone.
+	ignored, err := tableActivelyIgnored(ctx, db, "", ignoredCursorRestoreTable)
+	if err != nil {
+		return err
+	}
+	if !ignored {
+		return fmt.Errorf("cannot restore %s: staging table %s must be dolt-ignored", ignoredSource.cursorTable, ignoredCursorRestoreTable)
+	}
 	// A prior interrupted attempt may have been swept into HEAD. Remove its
 	// tracked identity before rebuilding: renaming a tracked staging table
 	// would leave a rename delta that cannot be staged as a deletion alone.
@@ -519,7 +529,12 @@ func dropIgnoredCursorRepairTable(ctx context.Context, db DBConn, table string) 
 	if err := unstageBeforeIgnoredCursorUntrack(ctx, db); err != nil {
 		return fmt.Errorf("unstaging before dropping %s: %w", table, err)
 	}
-	return commitScopedTableChange(ctx, db, table, ignoredCursorTempSweepCommitMessage)
+	// The staging table is ignored now but may have been tracked previously.
+	// Force its deletion into the index, just as the cursor untrack does.
+	if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', ?)", table); err != nil {
+		return fmt.Errorf("staging %s deletion: %w", table, err)
+	}
+	return DrainCall(ctx, db, "CALL DOLT_COMMIT('-m', ?, '--skip-empty')", ignoredCursorTempSweepCommitMessage)
 }
 
 // ignoredCursorCopyColumns is the column list to move out of source, which is

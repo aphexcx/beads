@@ -88,7 +88,7 @@ func testInterruptedCursorRestore(t *testing.T, after string, tracked bool) {
 	ctx := context.Background()
 	for _, query := range []string{
 		ignoredCursorScratch.bootstrapSQL(),
-		"INSERT INTO dolt_ignore VALUES ('ignored_schema_migrations', true), ('local_metadata', true)",
+		"INSERT INTO dolt_ignore VALUES ('ignored_schema_migrations', true), ('local_metadata', true), ('__temp__ignored_schema_migrations_restore', true)",
 		"CREATE TABLE wisps (id INT PRIMARY KEY)",
 		"CREATE TABLE wisp_dependencies (id INT PRIMARY KEY)",
 		"CREATE TABLE leases (id INT PRIMARY KEY, granted_node TEXT)",
@@ -110,6 +110,14 @@ func testInterruptedCursorRestore(t *testing.T, after string, tracked bool) {
 		t.Fatalf("restore error = %v, want injected interruption", err)
 	}
 	if tracked {
+		if present, err := schemaTableExists(ctx, db, "__temp__ignored_schema_migrations_restore"); err != nil {
+			t.Fatal(err)
+		} else if present {
+			// Model residue that predates the ignore entry (or was force-added).
+			if err := DrainCall(ctx, db, "CALL DOLT_ADD('-f', '__temp__ignored_schema_migrations_restore')"); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := DrainCall(ctx, db, "CALL DOLT_ADD('-A')"); err != nil {
 			t.Fatal(err)
 		}
@@ -148,5 +156,54 @@ func testInterruptedCursorRestore(t *testing.T, after string, tracked bool) {
 	}
 	if tracked, err := tableTrackedAtHead(ctx, db, "", "__temp__ignored_schema_migrations_restore"); err != nil || tracked {
 		t.Fatalf("staging table remains at HEAD: %v, %v", tracked, err)
+	}
+}
+
+type commitDuringCursorRestore struct{ DBConn }
+
+func (db commitDuringCursorRestore) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	result, err := db.DBConn.ExecContext(ctx, query, args...)
+	if err == nil && strings.HasPrefix(query, "INSERT IGNORE INTO __temp__ignored_schema_migrations_restore") {
+		if err := DrainCall(ctx, db.DBConn, "CALL DOLT_ADD('-A')"); err != nil {
+			return result, err
+		}
+		err = DrainCall(ctx, db.DBConn, "CALL DOLT_COMMIT('-m', 'fixture: concurrent blanket commit')")
+	}
+	return result, err
+}
+
+// A blanket commit DURING the same restore must not turn its final rename into
+// tracked dirt. Cleaning residue only at startup misses this window.
+func TestIgnoredCursorRestoreConcurrentCommit(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := openCursorRecoveryDB(t, dir, true)
+	if _, err := seedDoltIgnorePatterns(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, ignoredCursorScratch.bootstrapSQL()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO "+ignoredCursorUntrackTempTable+" (version) VALUES (1), (2)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreIgnoredCursorRows(ctx, commitDuringCursorRestore{db}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db = openCursorRecoveryDB(t, dir, false)
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM ignored_schema_migrations").Scan(&count); err != nil || count != 2 {
+		t.Fatalf("cursor rows after reopen = %d, %v; want 2", count, err)
+	}
+	for _, table := range []string{ignoredSource.cursorTable, ignoredCursorUntrackTempTable, "__temp__ignored_schema_migrations_restore"} {
+		if tracked, err := tableTrackedAtHead(ctx, db, "", table); err != nil || tracked {
+			t.Fatalf("%s remains tracked after recovery: %v, %v", table, tracked, err)
+		}
+	}
+	if dirty, err := committableDirtyTables(ctx, db); err != nil || len(dirty) != 0 {
+		t.Fatalf("recovery left committable dirt: %v, %v", dirty, err)
 	}
 }
