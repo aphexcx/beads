@@ -600,6 +600,9 @@ func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
 	return applied, err
 }
 
+// MigrateUp returns ErrIgnoredCursorRestoreDeferred with zero applied when an
+// interrupted cursor repair cannot finish. Only explicitly lenient open callers
+// may continue on the preserved scratch cursor; migrations have not completed.
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
@@ -739,16 +742,13 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, needed, seedChanged
 	// dirtyBefore would fail the pass on the read, re-creating the unopenable
 	// database this exemption path exists to rescue.
 	//
-	// auxRekeyExemptTables returns exactly the tables the upcoming
-	// rekeyAuxRowIDsAllPasses will rewrite, computed from the same per-pass
-	// selection the rewrite uses. Scoping the exemption to that set — rather
-	// than blanket-exempting all four aux tables whenever any rewrite is in
-	// flight — keeps a post-marker resume, which touches only the recorded
-	// drifted subset, from dropping a non-drifted aux table's pre-existing user
-	// edits out of dirtyBefore and into the migration commit (#4380).
-	auxRekeyExempt, err := auxRekeyExemptTables(ctx, db, mainVersionBefore)
-	if err != nil {
-		return 0, err
+	// Exempt only tables with recorded crash/drift recovery state that the
+	// upcoming rekey will actually rewrite. First-time rewrites must refuse
+	// dirty aux tables here, before any migrations or rekey markers advance.
+	auxRekeyExempt, auxRekeyErr := auxRekeyExemptTables(ctx, db, mainVersionBefore, dirtyBefore)
+	var auxDirtyErr *DirtyTablesError
+	if auxRekeyErr != nil && (mainVersionBefore != 52 || !errors.As(auxRekeyErr, &auxDirtyErr)) {
+		return 0, auxRekeyErr
 	}
 	for name := range auxRekeyExempt {
 		delete(dirtyBefore, name)
@@ -760,6 +760,10 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, needed, seedChanged
 		for table := range dirtyBefore {
 			delete(dirtyBefore, table)
 		}
+	} else if auxRekeyErr != nil {
+		// Only validated historical v53 debris can bypass the first-time
+		// rekey refusal without an aux sentinel; ordinary user edits cannot.
+		return 0, auxRekeyErr
 	}
 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
 	if err != nil {
