@@ -341,3 +341,81 @@ func TestEmbeddedDeferAutoWakeUnownedRowHomePrefix(t *testing.T) {
 		t.Errorf("citadel store left its local wisp %s deferred: status=%q defer_until=%v, want open", wisp.ID, status, deferUntil)
 	}
 }
+
+// userGlobalBDConfig finds the per-machine bd config.yaml under a store's
+// HOME (bdEnv sets HOME to the store dir), whichever of bd's two locations
+// `bd config set node_id` wrote.
+func userGlobalBDConfig(t *testing.T, home string) string {
+	t.Helper()
+	for _, rel := range [][]string{{".config", "bd", "config.yaml"}, {"Library", "Application Support", "bd", "config.yaml"}} {
+		path := filepath.Join(append([]string{home}, rel...)...)
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	t.Fatalf("no user-global bd config.yaml under %s", home)
+	return ""
+}
+
+// TestEmbeddedDeferAutoWakeScopeIsPerStore pins the round-2 Major: node_id is
+// user-global (~/.config/bd/config.yaml), so it sits under every store on the
+// machine. The owner scope must arm only in a store whose own config declares
+// federation.prefix_home; a plain project on the same machine, same node_id,
+// no federation key, keeps waking its expired defers as before.
+func TestEmbeddedDeferAutoWakeScopeIsPerStore(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	f := setupFederatedDeferStores(t, bd, "citadel", "--labels", "owner:citadel")
+
+	// The plain project reads the same per-machine config the citadel store
+	// wrote node_id into: HOME is per store dir in this harness, so the file
+	// is copied byte for byte to the plain project's HOME.
+	plainDir, _, _ := bdInit(t, bd, "--prefix", "pl", "--skip-hooks", "--skip-agents")
+	src := userGlobalBDConfig(t, f.citadelDir)
+	dst := filepath.Join(plainDir, strings.TrimPrefix(src, f.citadelDir))
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := bdCommand(t, bd, plainDir, "config", "get", "node_id"); !strings.Contains(got, "citadel") {
+		t.Fatalf("precondition: plain project does not see node_id=citadel: %q", got)
+	}
+
+	plain := bdCreate(t, bd, plainDir, "Plain snooze", "--type", "task")
+	bdDefer(t, bd, plainDir, plain.ID, "--until", "2020-01-01")
+	ids, stderr := wakeReadyIDsStderr(t, bd, plainDir)
+	if !ids[plain.ID] {
+		t.Errorf("plain project did not wake %s: node_id alone must not arm the owner scope", plain.ID)
+	}
+	if strings.Contains(stderr, "defer-wake: skipped") {
+		t.Errorf("plain project reported a skip:\n%s", stderr)
+	}
+	status, deferUntil := showDeferState(t, bd, plainDir, plain.ID)
+	if status != "open" || deferUntil != nil {
+		t.Errorf("plain project after ready: status=%q defer_until=%v, want open with defer_until cleared", status, deferUntil)
+	}
+
+	// The federated pair on the same node_id still scopes: the peer skips,
+	// the owner wakes.
+	ids, stderr = wakeReadyIDsStderr(t, bd, f.jadegateDir)
+	if ids[f.issueID] {
+		t.Errorf("jadegate store woke %s, which owner:citadel reserves for the citadel node", f.issueID)
+	}
+	if !strings.Contains(stderr, "defer-wake: skipped 1 ") {
+		t.Errorf("jadegate store did not report the skipped row on stderr:\n%s", stderr)
+	}
+	ids, _ = wakeReadyIDsStderr(t, bd, f.citadelDir)
+	if !ids[f.issueID] {
+		t.Errorf("citadel store did not wake its own %s", f.issueID)
+	}
+}

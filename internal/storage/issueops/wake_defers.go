@@ -28,9 +28,12 @@ const OwnerLabelPrefix = "owner:"
 
 // PrefixHomeConfigKey is the config.yaml namespace that names the home node
 // of a bead prefix: federation.prefix_home.hw: citadel. An expired defer with
-// no owner label wakes only on that node. The key lives in the git-tracked
-// .beads/config.yaml on purpose: every clone of the store carries the same
-// answer, and only the node whose node_id matches acts on it.
+// no owner label wakes only on that node. The key is set on every clone of
+// the store by hand (a store's .beads directory is typically gitignored, so
+// nothing carries it between clones); the same value goes everywhere, and
+// only the node whose node_id matches acts on it. Declaring it for any
+// prefix is also what arms the owner scope in that store: see
+// deferWakeScopeFromConfig.
 const PrefixHomeConfigKey = "federation.prefix_home."
 
 // DeferWakeSkip is one expired dated defer the owner scope left alone on this
@@ -81,37 +84,44 @@ func WakeDefersCommitMessage(n int) string {
 // OWNER SCOPE. In a federated store every replica runs this sweep over the
 // same issues rows, and a wake is a write: two replicas waking the same row
 // mint divergent commits on the same cells and the next pull conflicts. So
-// on a replica that names itself (config.NodeID, the identity the lease
-// guard already uses) an issue wakes only where it belongs: on the node its
-// owner:<node> label names, else on the node federation.prefix_home.<prefix>
-// declares home for its prefix. A row with neither wakes nowhere until one of
-// them is set, and every other node reports it skipped and writes nothing. A
-// deployment with no node_id keeps the old behavior: it has said nothing about
-// being one replica among several, and waking every expired defer there is
-// the whole contract. The scope is applied to the snapshot SELECT only, like
-// the reclaim scope; the per-row UPDATE re-checks by id. It governs the
-// permanent issues table alone: wisps are clone-local (dolt_ignored) and never
-// federate, so the node that made a wisp is the only node that has it, and
-// the only one that can wake it.
+// in a store whose own config declares federation.prefix_home.<prefix> (see
+// deferWakeScopeFromConfig: that key, not node_id, is what marks a store as
+// federated) an issue wakes only where it belongs: on the node its
+// owner:<node> label names, else on the node the prefix's declared home
+// names. A row with neither wakes nowhere until one of them is set, and every
+// other node reports it skipped and writes nothing. Who this node is comes
+// from config.NodeID, the identity the lease guard already uses; a scoped
+// store whose node has no node_id can own nothing and skips every row, and
+// says so. A store with no federation.prefix_home key runs the legacy sweep
+// byte for byte, node_id or not: node_id is user-global and sits under every
+// store on the machine, and a plain project must keep waking its defers. The
+// scope is applied to the snapshot SELECT only, like the reclaim scope; the
+// per-row UPDATE re-checks by id. It governs the permanent issues table
+// alone: wisps are clone-local (dolt_ignored) and never federate, so the
+// node that made a wisp is the only node that has it, and the only one that
+// can wake it.
 //
 // The caller owns Dolt versioning (commit iff len(result.Issues) > 0) and must
 // treat sweep failure as advisory — a ready listing never fails because the
 // wake could not run.
 func WakeExpiredDefersInTx(ctx context.Context, tx DBTX) (WakeDefersResult, error) {
 	var result WakeDefersResult
-	localNode := NodeID(ctx)
-	issues, skipped, err := wakeExpiredDefersInTable(ctx, tx, sqlbuild.IssuesFilterTables, "events", localNode)
+	scope := deferWakeScopeFromConfig(ctx)
+	issues, skipped, err := wakeExpiredDefersInTable(ctx, tx, sqlbuild.IssuesFilterTables, "events", scope)
 	if err != nil {
 		return result, err
 	}
 	result.Issues = issues
 	result.Skipped = skipped
 	// Wisps carry the same status/defer_until columns and `bd defer` reaches
-	// them through the same UpdateIssue routing. The table is tolerated absent
-	// for pre-wisp databases, like every other wisp probe. No owner scope
-	// here (localNode ""): wisp tables are dolt_ignored, so a wisp exists
-	// only on the node that made it and no peer could ever wake it instead.
-	wisps, _, err := wakeExpiredDefersInTable(ctx, tx, sqlbuild.WispsFilterTables, "wisp_events", "")
+	// them through the same UpdateIssue routing. No owner scope here (nil):
+	// wisp tables are dolt_ignored, so a wisp exists only on the node that
+	// made it and no peer could ever wake it instead. The unscoped shape
+	// names no labels table, so a database mid-migration with wisps but no
+	// wisp_labels is still swept, and IsTableNotExist below can only mean the
+	// wisps table itself is absent: a pre-wisp database, tolerated like every
+	// other wisp probe.
+	wisps, _, err := wakeExpiredDefersInTable(ctx, tx, sqlbuild.WispsFilterTables, "wisp_events", nil)
 	switch {
 	case err == nil:
 		result.Wisps = wisps
@@ -120,23 +130,58 @@ func WakeExpiredDefersInTx(ctx context.Context, tx DBTX) (WakeDefersResult, erro
 	default:
 		return result, err
 	}
-	reportDeferWakeSkips(result.Skipped, localNode)
+	if scope != nil {
+		reportDeferWakeSkips(result.Skipped, scope.localNode)
+	}
 	return result, nil
 }
 
-func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.FilterTables, eventsTable, localNode string) (woken []string, skipped []DeferWakeSkip, err error) {
+// deferWakeScope is the owner scope of one store: who this node is and where
+// each prefix lives. nil means the store is not federated and the sweep is
+// the legacy sweep.
+type deferWakeScope struct {
+	localNode string
+	homeOf    func(prefix string) string
+}
+
+// deferWakeScopeFromConfig arms the owner scope only where the store's own
+// config says it is federated: at least one federation.prefix_home.<prefix>
+// key. node_id alone never arms it: it is user-global (~/.config/bd), so it
+// sits under every store on the machine, federated or not, and a plain
+// project must keep waking its defers. config.AllKeys enumerates the config
+// files, not AutomaticEnv, so an environment variable alone cannot arm the
+// scope either — though BD_FEDERATION_PREFIX_HOME_<PREFIX> overrides a
+// declared prefix's home the way every bd key can be overridden.
+func deferWakeScopeFromConfig(ctx context.Context) *deferWakeScope {
+	for _, key := range config.AllKeys() {
+		if strings.HasPrefix(key, PrefixHomeConfigKey) {
+			return &deferWakeScope{localNode: NodeID(ctx), homeOf: prefixHomeFromConfig}
+		}
+	}
+	return nil
+}
+
+func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.FilterTables, eventsTable string, scope *deferWakeScope) (woken []string, skipped []DeferWakeSkip, err error) {
 	// Snapshot first so each genuinely-woken row gets its own event. The
 	// UPDATE below repeats the whole predicate, so a row rescued between the
 	// SELECT and its UPDATE (re-deferred further out, claimed, closed) matches
-	// nothing and is skipped rather than clobbered. The owner label rides
-	// along so the owner scope decides per row before any UPDATE is issued.
+	// nothing and is skipped rather than clobbered. In a scoped store the
+	// owner label rides along so the scope decides per row before any UPDATE
+	// is issued; unscoped, the snapshot names no labels table at all. A label
+	// that is literally "owner:" (empty value) is left out of the pick so
+	// MIN() lands on a real owner when both exist.
+	ownerCol, args := "''", []any(nil)
+	if scope != nil {
+		ownerCol = fmt.Sprintf("COALESCE((SELECT MIN(l.label) FROM %s l WHERE l.issue_id = t.id AND l.label LIKE ? AND l.label <> ?), '')", tables.Labels)
+		args = []any{OwnerLabelPrefix + "%", OwnerLabelPrefix}
+	}
 	//nolint:gosec // G201: table names are the hardcoded sqlbuild constants from the caller above.
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
-		SELECT t.id, COALESCE((SELECT MIN(l.label) FROM %s l WHERE l.issue_id = t.id AND l.label LIKE ?), '')
+		SELECT t.id, %s
 		FROM %s t
 		WHERE t.status = 'deferred' AND t.defer_until IS NOT NULL
 		  AND t.defer_until <= UTC_TIMESTAMP()
-	`, tables.Labels, tables.Main), OwnerLabelPrefix+"%")
+	`, ownerCol, tables.Main), args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("wake expired defers: scan %s: %w", tables.Main, err)
 	}
@@ -147,8 +192,9 @@ func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.Filt
 			_ = rows.Close()
 			return nil, nil, fmt.Errorf("wake expired defers: scan %s row: %w", tables.Main, err)
 		}
-		if localNode != "" {
-			if owner := deferWakeOwner(id, ownerLabel, prefixHomeFromConfig); owner != localNode {
+		if scope != nil {
+			owner := deferWakeOwner(id, ownerLabel, scope.homeOf)
+			if owner == "" || owner != scope.localNode {
 				skipped = append(skipped, DeferWakeSkip{ID: id, Owner: owner})
 				continue
 			}
@@ -206,10 +252,12 @@ func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.Filt
 // deferWakeOwner resolves the node an expired defer belongs to: the node its
 // owner:<node> label names, else the declared home of its prefix — the
 // longest declared prefix wins, so beads-vscode-1 asks for beads-vscode
-// before beads — else "". homeOf answers federation.prefix_home.<prefix>.
+// before beads — else "". An owner label with an empty value ("owner:") is
+// no label, so the prefix home still applies. homeOf answers
+// federation.prefix_home.<prefix>.
 func deferWakeOwner(id, ownerLabel string, homeOf func(prefix string) string) string {
-	if ownerLabel != "" {
-		return strings.TrimSpace(strings.TrimPrefix(ownerLabel, OwnerLabelPrefix))
+	if owner := strings.TrimSpace(strings.TrimPrefix(ownerLabel, OwnerLabelPrefix)); owner != "" {
+		return owner
 	}
 	parts := strings.Split(id, "-")
 	for n := len(parts) - 1; n >= 1; n-- {
@@ -282,8 +330,12 @@ func formatDeferWakeSkipSummary(skipped []DeferWakeSkip, localNode string) strin
 		}
 		fmt.Fprintf(&b, "%q (%d)", owner, counts[owner])
 	}
-	return fmt.Sprintf("defer-wake: skipped %d expired dated %s not owned by this node (%q): %s. "+
+	node := fmt.Sprintf("%q", localNode)
+	if localNode == "" {
+		node = "node_id unset"
+	}
+	return fmt.Sprintf("defer-wake: skipped %d expired dated %s not owned by this node (%s): %s. "+
 		"Only the owning node wakes them; label the row %s<node> or set %s<prefix> on every clone. (bd -v lists up to %d.)\n",
-		len(skipped), pluralWord(len(skipped), "defer", "defers"), localNode, b.String(),
+		len(skipped), pluralWord(len(skipped), "defer", "defers"), node, b.String(),
 		OwnerLabelPrefix, PrefixHomeConfigKey, deferWakeSkipDetailRows)
 }

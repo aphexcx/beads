@@ -12,6 +12,8 @@ func TestDeferWakeOwner(t *testing.T) {
 		{"owner label wins over the prefix home", "hw-abc", "owner:jadegate", "jadegate"},
 		{"owner label is trimmed", "hw-abc", "owner: citadel ", "citadel"},
 		{"unlabelled row belongs to the prefix home", "hw-abc", "", "citadel"},
+		{"empty owner value is no label: the prefix home applies", "hw-abc", "owner:", "citadel"},
+		{"empty owner value with no prefix home has no owner", "gp-abc", "owner: ", ""},
 		{"wisp ids resolve their store prefix", "hw-wisp-abc", "", "citadel"},
 		{"longest declared prefix wins", "beads-vscode-1", "", "laptop"},
 		{"undeclared prefix has no owner", "gp-abc", "", ""},
@@ -39,5 +41,8 @@ func TestFormatDeferWakeSkipSummary(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("summary missing %q:\n%s", want, line)
 		}
+	}
+	if line := formatDeferWakeSkipSummary([]DeferWakeSkip{{ID: "hw-1", Owner: "citadel"}}, ""); !strings.Contains(line, "(node_id unset)") {
+		t.Errorf("summary for a node without node_id should say so:\n%s", line)
 	}
 }
