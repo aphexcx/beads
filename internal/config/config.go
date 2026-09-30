@@ -1062,15 +1062,19 @@ func GetIdentity(flagValue string) string {
 func NodeID() string {
 	if v == nil {
 		// A library consumer that never called Initialize (the public
-		// beads.OpenBestAvailable / OpenFromConfig): the same sources, read
-		// directly, so the reclaim guard and the defer-wake owner scope see
-		// the node the operator named there too.
+		// beads.OpenBestAvailable / OpenFromConfig): the same sources with
+		// the same precedence, read directly — the environment first, then
+		// the user-level files documented over native over legacy — so the
+		// reclaim guard and the defer-wake owner scope see the node the
+		// operator named there too. A node_id written into a workspace's
+		// own config.yaml, which the user-global write path refuses, is not
+		// consulted here.
 		for _, name := range []string{"BEADS_NODE_ID", "BD_NODE_ID"} {
 			if val := strings.TrimSpace(os.Getenv(name)); val != "" {
 				return val
 			}
 		}
-		val, _ := readUserGlobalYamlValue("node_id")
+		val, _ := readUserGlobalYamlValueMerged("node_id")
 		return strings.TrimSpace(val)
 	}
 	return strings.TrimSpace(GetString("node_id"))

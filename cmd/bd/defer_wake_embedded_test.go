@@ -461,9 +461,12 @@ func openEmbeddedSDK(t *testing.T, ctx context.Context, beadsDir string) beads.S
 // TestEmbeddedDeferAutoWakeOwnerScopedSDKRead is the round-3 finding: a
 // library client opens the workspace through the public
 // beads.OpenBestAvailable, which never initializes bd's process config, and
-// reads ready work. The owner scope must come from the store's own
-// .beads/config.yaml, so a non-owning node's SDK read skips the row and only
-// the owner's wakes it. Not parallel: it sets this process's environment.
+// reads ready work. The owner scope must come from the store's own config
+// files, so a non-owning node's SDK read skips the row and only the owner's
+// wakes it. The prefix home is declared in .beads/config.local.yaml, the
+// untracked override file bd merges over config.yaml (round 4), so the
+// local file is what both the CLI defer and the SDK reads honor here. Not
+// parallel: it sets this process's environment.
 func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
 	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
 		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
@@ -471,7 +474,9 @@ func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
 
 	bd := buildEmbeddedBD(t)
 	dir, beadsDir, _ := bdInit(t, bd, "--prefix", "hw", "--skip-hooks", "--skip-agents")
-	bdCommand(t, bd, dir, "config", "set", "federation.prefix_home.hw", "citadel")
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.local.yaml"), []byte("federation.prefix_home.hw: citadel\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	issue := bdCreate(t, bd, dir, "SDK snooze", "--type", "task", "--labels", "owner:citadel")
 	bdDefer(t, bd, dir, issue.ID, "--until", "2020-01-01")
 

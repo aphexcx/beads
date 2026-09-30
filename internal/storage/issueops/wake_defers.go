@@ -160,7 +160,7 @@ func WithDeferWakeWorkspace(ctx context.Context, beadsDir string) context.Contex
 
 // deferWakeScopeFromConfig arms the owner scope only where the store's own
 // config says it is federated: at least one federation.prefix_home.<prefix>
-// key in its .beads/config.yaml. node_id alone never arms it: it is
+// key in its .beads/config.yaml or config.local.yaml. node_id alone never arms it: it is
 // user-global (~/.config/bd), so it sits under every store on the machine,
 // federated or not, and a plain project must keep waking its defers. With
 // the workspace on the context the file is the only source, never the
@@ -172,11 +172,15 @@ func WithDeferWakeWorkspace(ctx context.Context, beadsDir string) context.Contex
 // AutomaticEnv, still cannot arm the scope on its own.
 func deferWakeScopeFromConfig(ctx context.Context) *deferWakeScope {
 	if dir, ok := ctx.Value(deferWakeWorkspaceKey{}).(string); ok && dir != "" {
-		if !config.WorkspaceYamlHasPrefix(dir, PrefixHomeConfigKey) {
+		// Both files Initialize merges for a workspace, config.local.yaml
+		// over config.yaml, so a local override of a prefix's home (or a
+		// local declaration) decides here exactly as it does in bd's own
+		// process.
+		if !config.WorkspaceEffectiveYamlHasPrefix(dir, PrefixHomeConfigKey) {
 			return nil
 		}
 		return &deferWakeScope{localNode: NodeID(ctx), homeOf: func(prefix string) string {
-			home, _ := config.WorkspaceYamlValue(dir, PrefixHomeConfigKey+prefix)
+			home, _ := config.WorkspaceEffectiveYamlValue(dir, PrefixHomeConfigKey+prefix)
 			return home
 		}}
 	}
