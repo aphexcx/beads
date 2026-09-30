@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -47,6 +48,14 @@ func showDeferState(t *testing.T, bd, dir, id string) (string, interface{}) {
 // wakeReadyIDs runs bd ready --json (plus extra args) and returns the listed ids.
 func wakeReadyIDs(t *testing.T, bd, dir string, args ...string) map[string]bool {
 	t.Helper()
+	ids, _ := wakeReadyIDsStderr(t, bd, dir, args...)
+	return ids
+}
+
+// wakeReadyIDsStderr is wakeReadyIDs plus the run's stderr, where the wake
+// sweep reports the rows its owner scope declined.
+func wakeReadyIDsStderr(t *testing.T, bd, dir string, args ...string) (map[string]bool, string) {
+	t.Helper()
 	fullArgs := append([]string{"ready", "--json"}, args...)
 	cmd := exec.Command(bd, fullArgs...)
 	cmd.Dir = dir
@@ -58,7 +67,7 @@ func wakeReadyIDs(t *testing.T, bd, dir string, args ...string) map[string]bool 
 	s := strings.TrimSpace(stdout.String())
 	start := strings.Index(s, "[")
 	if start < 0 {
-		return map[string]bool{}
+		return map[string]bool{}, stderr.String()
 	}
 	var arr []map[string]interface{}
 	if err := json.Unmarshal([]byte(s[start:]), &arr); err != nil {
@@ -70,7 +79,7 @@ func wakeReadyIDs(t *testing.T, bd, dir string, args ...string) map[string]bool 
 			ids[id] = true
 		}
 	}
-	return ids
+	return ids, stderr.String()
 }
 
 // TestEmbeddedDeferAutoWake documents the defer contract: a DATED defer is a
@@ -181,4 +190,154 @@ func TestEmbeddedDeferAutoWake(t *testing.T) {
 			t.Errorf("expected status=in_progress after claim, got %q", status)
 		}
 	})
+}
+
+// federatedDeferStores is the topology pc_7778c4ee1b4e was filed against: two
+// stores of the same prefix over one dolt hub, each a different node. The
+// citadel store creates and defers the row, commits and pushes; the jadegate
+// store clones the hub. Both declare the same federation.prefix_home.hw, the
+// way a git-tracked .beads/config.yaml carries one answer to every clone.
+type federatedDeferStores struct {
+	citadelDir, jadegateDir, issueID string
+}
+
+func setupFederatedDeferStores(t *testing.T, bd, prefixHome string, createArgs ...string) federatedDeferStores {
+	t.Helper()
+	hubURL := "file://" + filepath.Join(t.TempDir(), "hub")
+
+	citadelDir, _, _ := bdInit(t, bd, "--prefix", "hw", "--skip-hooks", "--skip-agents")
+	bdCommand(t, bd, citadelDir, "config", "set", "node_id", "citadel")
+	bdCommand(t, bd, citadelDir, "config", "set", "federation.prefix_home.hw", prefixHome)
+	issue := bdCreate(t, bd, citadelDir, append([]string{"Federated snooze", "--type", "task"}, createArgs...)...)
+	bdDefer(t, bd, citadelDir, issue.ID, "--until", "2020-01-01")
+	bdDolt(t, bd, citadelDir, "commit")
+	bdDolt(t, bd, citadelDir, "remote", "add", "origin", hubURL)
+	bdDolt(t, bd, citadelDir, "push", "--force")
+
+	jadegateDir := t.TempDir()
+	initGitRepoAt(t, jadegateDir)
+	cmd := exec.Command(bd, "init", "--quiet", "--prefix", "hw", "--remote", hubURL, "--skip-hooks", "--skip-agents")
+	cmd.Dir = jadegateDir
+	cmd.Env = bdEnv(jadegateDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd init --remote %s failed: %v\n%s", hubURL, err, out)
+	}
+	bdCommand(t, bd, jadegateDir, "config", "set", "node_id", "jadegate")
+	bdCommand(t, bd, jadegateDir, "config", "set", "federation.prefix_home.hw", prefixHome)
+
+	for _, dir := range []string{citadelDir, jadegateDir} {
+		if status, _ := showDeferState(t, bd, dir, issue.ID); status != "deferred" {
+			t.Fatalf("precondition: %s in %s: status=%q, want deferred", issue.ID, dir, status)
+		}
+	}
+	return federatedDeferStores{citadelDir: citadelDir, jadegateDir: jadegateDir, issueID: issue.ID}
+}
+
+// TestEmbeddedDeferAutoWakeOwnerScoped is the 9/28 sighting of pc_7778c4ee1b4e
+// as a test: both stores hold the same citadel-owned dated defer past its date.
+// Only the node the owner:<node> label names wakes it; the peer reports the row
+// skipped and writes nothing, so its next pull is a fast-forward, not the
+// 25-conflict rollback the incident ended in.
+func TestEmbeddedDeferAutoWakeOwnerScoped(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	f := setupFederatedDeferStores(t, bd, "citadel", "--labels", "owner:citadel")
+
+	// The peer sweeps first. The row is citadel's: untouched, and said so.
+	ids, stderr := wakeReadyIDsStderr(t, bd, f.jadegateDir)
+	if ids[f.issueID] {
+		t.Errorf("jadegate store woke %s, which owner:citadel reserves for the citadel node", f.issueID)
+	}
+	if !strings.Contains(stderr, "defer-wake: skipped 1 ") || !strings.Contains(stderr, `"citadel"`) {
+		t.Errorf("jadegate store did not report the skipped row on stderr:\n%s", stderr)
+	}
+	status, deferUntil := showDeferState(t, bd, f.jadegateDir, f.issueID)
+	if status != "deferred" || deferUntil == nil {
+		t.Errorf("jadegate store changed the row: status=%q defer_until=%v, want deferred with its date", status, deferUntil)
+	}
+
+	// The owner sweeps: the row wakes, nothing is reported skipped.
+	ids, stderr = wakeReadyIDsStderr(t, bd, f.citadelDir)
+	if !ids[f.issueID] {
+		t.Errorf("citadel store did not list %s in bd ready after its defer date passed", f.issueID)
+	}
+	if strings.Contains(stderr, "defer-wake: skipped") {
+		t.Errorf("citadel store reported a skip on its own row:\n%s", stderr)
+	}
+	status, deferUntil = showDeferState(t, bd, f.citadelDir, f.issueID)
+	if status != "open" || deferUntil != nil {
+		t.Errorf("citadel store after wake: status=%q defer_until=%v, want open with defer_until cleared", status, deferUntil)
+	}
+
+	// One node wrote the wake, so the hub round-trip is a clean fast-forward.
+	bdDolt(t, bd, f.citadelDir, "push")
+	bdDolt(t, bd, f.jadegateDir, "pull")
+	status, deferUntil = showDeferState(t, bd, f.jadegateDir, f.issueID)
+	if status != "open" || deferUntil != nil {
+		t.Errorf("jadegate store after pull: status=%q defer_until=%v, want the owner's wake", status, deferUntil)
+	}
+}
+
+// TestEmbeddedDeferAutoWakeUnownedRowHomePrefix covers the row with no
+// owner:<node> label: it belongs to the prefix's declared home, here the PEER
+// (federation.prefix_home.hw = jadegate). The creating store skips it and the
+// home node wakes it.
+func TestEmbeddedDeferAutoWakeUnownedRowHomePrefix(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+	t.Parallel()
+
+	bd := buildEmbeddedBD(t)
+	f := setupFederatedDeferStores(t, bd, "jadegate")
+
+	// citadel created the row but is not hw's home: skipped, untouched.
+	ids, stderr := wakeReadyIDsStderr(t, bd, f.citadelDir)
+	if ids[f.issueID] {
+		t.Errorf("citadel store woke unlabelled %s, whose prefix home is jadegate", f.issueID)
+	}
+	if !strings.Contains(stderr, "defer-wake: skipped 1 ") || !strings.Contains(stderr, `"jadegate"`) {
+		t.Errorf("citadel store did not report the skipped row on stderr:\n%s", stderr)
+	}
+	status, deferUntil := showDeferState(t, bd, f.citadelDir, f.issueID)
+	if status != "deferred" || deferUntil == nil {
+		t.Errorf("citadel store changed the row: status=%q defer_until=%v, want deferred with its date", status, deferUntil)
+	}
+
+	// jadegate is hw's declared home: it wakes the row.
+	ids, stderr = wakeReadyIDsStderr(t, bd, f.jadegateDir)
+	if !ids[f.issueID] {
+		t.Errorf("jadegate store did not list %s in bd ready after its defer date passed", f.issueID)
+	}
+	if strings.Contains(stderr, "defer-wake: skipped") {
+		t.Errorf("jadegate store reported a skip on a row it is home for:\n%s", stderr)
+	}
+	status, deferUntil = showDeferState(t, bd, f.jadegateDir, f.issueID)
+	if status != "open" || deferUntil != nil {
+		t.Errorf("jadegate store after wake: status=%q defer_until=%v, want open with defer_until cleared", status, deferUntil)
+	}
+
+	bdDolt(t, bd, f.jadegateDir, "push")
+	bdDolt(t, bd, f.citadelDir, "pull")
+	status, deferUntil = showDeferState(t, bd, f.citadelDir, f.issueID)
+	if status != "open" || deferUntil != nil {
+		t.Errorf("citadel store after pull: status=%q defer_until=%v, want the home node's wake", status, deferUntil)
+	}
+
+	// A wisp never federates (dolt_ignored), so the owner scope must leave it
+	// alone: citadel is not hw's home, yet its own expired wisp still wakes.
+	wisp := bdCreate(t, bd, f.citadelDir, "Local wisp snooze", "--type", "task", "--ephemeral", "--wisp-type", "heartbeat")
+	bdDefer(t, bd, f.citadelDir, wisp.ID, "--until", "2020-01-01")
+	_, stderr = wakeReadyIDsStderr(t, bd, f.citadelDir)
+	if strings.Contains(stderr, "defer-wake: skipped") {
+		t.Errorf("citadel store reported its own wisp skipped:\n%s", stderr)
+	}
+	status, deferUntil = showDeferState(t, bd, f.citadelDir, wisp.ID)
+	if status != "open" || deferUntil != nil {
+		t.Errorf("citadel store left its local wisp %s deferred: status=%q defer_until=%v, want open", wisp.ID, status, deferUntil)
+	}
 }

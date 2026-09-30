@@ -30,6 +30,8 @@ A defer WITH a date is a snooze: once --until passes, the next ready-front
 read returns the issue to open automatically (same shape as 'bd undefer').
 A defer WITHOUT a date is the indefinite icebox: it stays deferred until
 someone runs 'bd undefer'.
+In a federated store (node_id set), only the owning node wakes it: the node its
+owner:<node> label names, else federation.prefix_home.<prefix>; peers skip it.
 
 Examples:
   bd defer bd-abc                  # Icebox indefinitely (until bd undefer)
