@@ -293,6 +293,8 @@ func TestNotifyingProviderBuildsRolesOnItself(t *testing.T) {
 		"RunNonTx":      true,
 		"SetPoolLimits": true,
 		"Unwrap":        true,
+		// Names the store for the defer-wake owner scope; builds no role.
+		"WorkspaceDir": true,
 		// Events-journal capability plumbing: activation binds on the inner
 		// provider's transactions, and a retention pass writes no bead. Neither
 		// builds a role, so neither can build one "on itself".

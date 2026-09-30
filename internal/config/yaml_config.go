@@ -348,26 +348,6 @@ func readUserGlobalYamlValue(key string) (string, bool) {
 	return readYamlValueAtPath(configPath, key)
 }
 
-// readUserGlobalYamlValueMerged reads one dotted key across every user-level
-// config file Initialize merges, with Initialize's precedence — documented
-// <home>/.config/bd/config.yaml over native os.UserConfigDir()/bd/config.yaml
-// over legacy <home>/.beads/config.yaml — so a process that never called
-// Initialize resolves a per-machine key exactly as bd's own process does.
-func readUserGlobalYamlValueMerged(key string) (string, bool) {
-	candidates := currentUserConfigYamlCandidates()
-	seen := map[string]bool{}
-	for _, path := range []string{candidates.documented, candidates.native, candidates.legacy} {
-		if path == "" || seen[path] {
-			continue
-		}
-		seen[path] = true
-		if value, ok := readYamlValueAtPath(path, key); ok {
-			return value, true
-		}
-	}
-	return "", false
-}
-
 // WorkspaceYamlValue reads a single dotted key out of ONE workspace's
 // config.yaml, named by its .beads directory, returning ("", false) when the
 // file or the key is absent.
@@ -382,80 +362,6 @@ func WorkspaceYamlValue(beadsDir, key string) (string, bool) {
 		return "", false
 	}
 	return readYamlValueAtPath(filepath.Join(beadsDir, "config.yaml"), key)
-}
-
-// workspaceEffectiveYamlPaths lists ONE workspace's config files highest
-// priority first, the way Initialize merges them for the launched workspace:
-// config.local.yaml (untracked local overrides) over config.yaml.
-func workspaceEffectiveYamlPaths(beadsDir string) []string {
-	return []string{
-		filepath.Join(beadsDir, "config.local.yaml"),
-		filepath.Join(beadsDir, "config.yaml"),
-	}
-}
-
-// WorkspaceEffectiveYamlValue reads a single dotted key out of ONE
-// workspace's config, named by its .beads directory, with the precedence
-// Initialize gives that workspace: config.local.yaml over config.yaml. Like
-// WorkspaceYamlValue it never touches the process-wide viper state, so a
-// library consumer that never called Initialize gets the same answer bd's
-// own process does. Returns ("", false) when neither file has the key.
-func WorkspaceEffectiveYamlValue(beadsDir, key string) (string, bool) {
-	if beadsDir == "" {
-		return "", false
-	}
-	for _, path := range workspaceEffectiveYamlPaths(beadsDir) {
-		if value, ok := readYamlValueAtPath(path, key); ok {
-			return value, true
-		}
-	}
-	return "", false
-}
-
-// WorkspaceEffectiveYamlHasPrefix reports whether ONE workspace's config —
-// config.local.yaml or config.yaml, the pair Initialize merges — declares any
-// key under the dotted prefix (for example "federation.prefix_home."), in the
-// flat form ("federation.prefix_home.hw: citadel") or the nested one. A key
-// in either file is a key in the merged view, since a merge only adds and
-// overrides.
-func WorkspaceEffectiveYamlHasPrefix(beadsDir, prefix string) bool {
-	if beadsDir == "" {
-		return false
-	}
-	for _, path := range workspaceEffectiveYamlPaths(beadsDir) {
-		data, err := os.ReadFile(path) //nolint:gosec // beadsDir is caller-resolved workspace state
-		if err != nil {
-			continue
-		}
-		var root map[string]interface{}
-		if err := yaml.Unmarshal(data, &root); err != nil {
-			continue
-		}
-		if yamlHasKeyWithPrefix(root, "", prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-// yamlHasKeyWithPrefix walks a decoded yaml map, joining nested keys with
-// dots, and reports whether any full key starts with prefix.
-func yamlHasKeyWithPrefix(node map[string]interface{}, path, prefix string) bool {
-	for key, val := range node {
-		full := key
-		if path != "" {
-			full = path + "." + key
-		}
-		if strings.HasPrefix(full, prefix) {
-			return true
-		}
-		if child, ok := val.(map[string]interface{}); ok && strings.HasPrefix(prefix, full+".") {
-			if yamlHasKeyWithPrefix(child, full, prefix) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // WorkspaceYamlValueStrict reads one dotted key from a workspace config.yaml

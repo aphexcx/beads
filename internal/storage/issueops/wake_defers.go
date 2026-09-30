@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/steveyegge/beads/internal/config"
@@ -25,16 +26,6 @@ const DeferWakeActor = "bd-defer-wake"
 // its [federation] identity; the wake sweep reads it to find the one node
 // allowed to wake the row.
 const OwnerLabelPrefix = "owner:"
-
-// PrefixHomeConfigKey is the config.yaml namespace that names the home node
-// of a bead prefix: federation.prefix_home.hw: citadel. An expired defer with
-// no owner label wakes only on that node. The key is set on every clone of
-// the store by hand (a store's .beads directory is typically gitignored, so
-// nothing carries it between clones); the same value goes everywhere, and
-// only the node whose node_id matches acts on it. Declaring it for any
-// prefix is also what arms the owner scope in that store, and it is read
-// from that store's own .beads/config.yaml: see deferWakeScopeFromConfig.
-const PrefixHomeConfigKey = "federation.prefix_home."
 
 // DeferWakeSkip is one expired dated defer the owner scope left alone on this
 // node: another node's row, reported and never written.
@@ -67,6 +58,10 @@ func WakeDefersCommitMessage(n int) string {
 	return fmt.Sprintf("bd: wake %d expired defer(s)", n)
 }
 
+// deferWakeConfigErrorOnce keeps the unreadable-config advisory to one line
+// per process: the sweep runs on every ready read.
+var deferWakeConfigErrorOnce sync.Once
+
 // WakeExpiredDefersInTx returns every DATED defer whose date has passed to
 // open: status='deferred' AND defer_until <= now flips to status='open',
 // defer_until=NULL — byte-identical to what `bd undefer` writes, so a later
@@ -84,29 +79,29 @@ func WakeDefersCommitMessage(n int) string {
 // OWNER SCOPE. In a federated store every replica runs this sweep over the
 // same issues rows, and a wake is a write: two replicas waking the same row
 // mint divergent commits on the same cells and the next pull conflicts. So
-// in a store whose own config declares federation.prefix_home.<prefix> (see
-// deferWakeScopeFromConfig: that key, not node_id, is what marks a store as
-// federated) an issue wakes only where it belongs: on the node its
-// owner:<node> label names, else on the node the prefix's declared home
-// names. A row with neither wakes nowhere until one of them is set, and every
-// other node reports it skipped and writes nothing. Who this node is comes
-// from config.NodeID, the identity the lease guard already uses; a scoped
-// store whose node has no node_id can own nothing and skips every row, and
-// says so. A store with no federation.prefix_home key runs the legacy sweep
-// byte for byte, node_id or not: node_id is user-global and sits under every
-// store on the machine, and a plain project must keep waking its defers. The
-// scope is applied to the snapshot SELECT only, like the reclaim scope; the
-// per-row UPDATE re-checks by id. It governs the permanent issues table
-// alone: wisps are clone-local (dolt_ignored) and never federate, so the
-// node that made a wisp is the only node that has it, and the only one that
-// can wake it.
+// in a store whose own config declares federation.prefix_home.<prefix>
+// (deferWakeScopeFor) an issue wakes only on the node its owner:<node> label
+// names, else on its prefix's declared home; a row with neither wakes nowhere
+// until one is set, and every other node reports it skipped and writes
+// nothing. A store that declares no prefix home runs the legacy sweep byte
+// for byte, whatever node_id says. A store whose config cannot be read may be
+// federated, so its sweep is skipped whole, with one advisory, rather than
+// run unscoped. The scope is applied to the snapshot SELECT only, like the
+// reclaim scope, and to the permanent issues table alone: wisps are
+// clone-local (dolt_ignored), so only the node that made a wisp can wake it.
 //
 // The caller owns Dolt versioning (commit iff len(result.Issues) > 0) and must
 // treat sweep failure as advisory — a ready listing never fails because the
 // wake could not run.
 func WakeExpiredDefersInTx(ctx context.Context, tx DBTX) (WakeDefersResult, error) {
 	var result WakeDefersResult
-	scope := deferWakeScopeFromConfig(ctx)
+	scope, err := deferWakeScopeFor(ctx)
+	if err != nil {
+		deferWakeConfigErrorOnce.Do(func() {
+			warnReplica("warning: defer-wake sweep skipped, this store's federation config is unusable: %v\n", err)
+		})
+		return result, nil
+	}
 	issues, skipped, err := wakeExpiredDefersInTable(ctx, tx, sqlbuild.IssuesFilterTables, "events", scope)
 	if err != nil {
 		return result, err
@@ -141,19 +136,18 @@ func WakeExpiredDefersInTx(ctx context.Context, tx DBTX) (WakeDefersResult, erro
 // the legacy sweep.
 type deferWakeScope struct {
 	localNode string
-	homeOf    func(prefix string) string
+	homes     map[string]string
 }
 
 // deferWakeWorkspaceKey carries the .beads directory of the store a sweep
-// runs against, so the owner scope is read from THAT store's config.yaml.
+// runs against, so the owner scope is read from THAT store's config.
 type deferWakeWorkspaceKey struct{}
 
 // WithDeferWakeWorkspace names the store's .beads directory for the owner
-// scope of the defer-wake sweep. The store wrappers attach it, so a library
-// consumer that opened the workspace without config.Initialize (the public
-// beads.OpenBestAvailable / OpenFromConfig) resolves the same scope bd's own
-// process does, and a cross-workspace open reads the target workspace, not
-// the one bd was launched from.
+// scope of the defer-wake sweep, so a library consumer that opened the
+// workspace without config.Initialize (the public beads.OpenBestAvailable /
+// OpenFromConfig) resolves the same scope bd's own process does, and a
+// cross-workspace open reads the target store, not the launch workspace.
 func WithDeferWakeWorkspace(ctx context.Context, beadsDir string) context.Context {
 	return context.WithValue(ctx, deferWakeWorkspaceKey{}, beadsDir)
 }
@@ -165,30 +159,36 @@ func DeferWakeWorkspace(ctx context.Context) (string, bool) {
 	return dir, ok && dir != ""
 }
 
-// deferWakeScopeFromConfig arms the owner scope only where the store's own
-// config says it is federated: at least one federation.prefix_home.<prefix>
-// key in its .beads/config.yaml or config.local.yaml, the pair Initialize
-// merges for a workspace, read with the same precedence (local over main)
-// so a local override of a prefix's home, or a local declaration, decides
-// here exactly as it does in bd's own process. node_id alone never arms it:
-// it is user-global (~/.config/bd), so it sits under every store on the
-// machine, federated or not, and a plain project must keep waking its
-// defers. Those two files are the only source: the scope is a property of
-// one store, and neither the process environment nor the user-level config
-// — where a stray federation.prefix_home key would otherwise arm every
-// store on the machine — takes part. A sweep that names no store (no
-// workspace on the context) is therefore the legacy sweep; every entry
-// point that has a store attaches it (the dolt and embedded wrappers, and
-// the unit-of-work path through uow.WithWorkspaceDir).
-func deferWakeScopeFromConfig(ctx context.Context) *deferWakeScope {
+// deferWakeScopeFor resolves the owner scope of the store the sweep runs
+// against from that store's own files alone (config.ReadWorkspaceFederation),
+// read once per sweep. Three outcomes: no federation.prefix_home key, a nil
+// scope and the legacy sweep; keys present and usable, a scope; a file that
+// cannot be read or parsed, or a key with no usable value, an error. Neither
+// the process environment nor the user-level config can arm or steer it, and
+// node_id alone never arms it: it is per machine and sits under every store
+// there. The node is resolved for the wake only, leaving config.NodeID and
+// the lease guard untouched; WithNodeID still overrides it for tests.
+//
+// A sweep whose context names no store is the unscoped primitive. The entry
+// layers that own a store keep it from running by accident: the dolt and
+// embedded wrappers always attach theirs, and uow.WakeExpiredDefers refuses
+// to sweep for a provider that names none. beads.Open(dbPath) with a dbPath
+// outside a .beads directory names that directory, where no config lives, so
+// such a store reads as not federated.
+func deferWakeScopeFor(ctx context.Context) (*deferWakeScope, error) {
 	dir, ok := DeferWakeWorkspace(ctx)
-	if !ok || !config.WorkspaceEffectiveYamlHasPrefix(dir, PrefixHomeConfigKey) {
-		return nil
+	if !ok {
+		return nil, nil
 	}
-	return &deferWakeScope{localNode: NodeID(ctx), homeOf: func(prefix string) string {
-		home, _ := config.WorkspaceEffectiveYamlValue(dir, PrefixHomeConfigKey+prefix)
-		return home
-	}}
+	fed, err := config.ReadWorkspaceFederation(dir)
+	if err != nil || len(fed.PrefixHomes) == 0 {
+		return nil, err
+	}
+	scope := &deferWakeScope{localNode: fed.NodeID, homes: fed.PrefixHomes}
+	if node, ok := ctx.Value(nodeIDContextKey{}).(string); ok {
+		scope.localNode = node
+	}
+	return scope, nil
 }
 
 func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.FilterTables, eventsTable string, scope *deferWakeScope) (woken []string, skipped []DeferWakeSkip, err error) {
@@ -223,7 +223,7 @@ func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.Filt
 			return nil, nil, fmt.Errorf("wake expired defers: scan %s row: %w", tables.Main, err)
 		}
 		if scope != nil {
-			owner := deferWakeOwner(id, ownerLabel, scope.homeOf)
+			owner := deferWakeOwner(id, ownerLabel, scope.homes)
 			if owner == "" || owner != scope.localNode {
 				skipped = append(skipped, DeferWakeSkip{ID: id, Owner: owner})
 				continue
@@ -283,15 +283,14 @@ func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.Filt
 // owner:<node> label names, else the declared home of its prefix — the
 // longest declared prefix wins, so beads-vscode-1 asks for beads-vscode
 // before beads — else "". An owner label with an empty value ("owner:") is
-// no label, so the prefix home still applies. homeOf answers
-// federation.prefix_home.<prefix>.
-func deferWakeOwner(id, ownerLabel string, homeOf func(prefix string) string) string {
+// no label, so the prefix home still applies.
+func deferWakeOwner(id, ownerLabel string, homes map[string]string) string {
 	if owner := strings.TrimSpace(strings.TrimPrefix(ownerLabel, OwnerLabelPrefix)); owner != "" {
 		return owner
 	}
 	parts := strings.Split(id, "-")
 	for n := len(parts) - 1; n >= 1; n-- {
-		if home := strings.TrimSpace(homeOf(strings.Join(parts[:n], "-"))); home != "" {
+		if home := homes[strings.Join(parts[:n], "-")]; home != "" {
 			return home
 		}
 	}
@@ -301,30 +300,35 @@ func deferWakeOwner(id, ownerLabel string, homeOf func(prefix string) string) st
 // deferWakeSkipDetailRows caps the bd -v per-row listing of skipped defers.
 const deferWakeSkipDetailRows = 20
 
+// deferWakeSkipReportOnce keeps the skip audit to one report per process: a
+// skipped row stays deferred here until its owner's wake syncs over, and a
+// long-lived reader would otherwise repeat the line on every ready read.
+var deferWakeSkipReportOnce sync.Once
+
 // reportDeferWakeSkips audits the expired defers the owner scope declined:
-// ONE stderr line per sweep (never stdout — bd ready --json owns it), the
-// per-row detail behind bd -v / BD_DEBUG, nothing under --quiet. It repeats
-// on every ready read while the rows stay deferred, by design: the line is
-// the only trace of a defer this node will never wake.
+// one stderr line (never stdout — bd ready --json owns it), the per-row
+// detail behind bd -v / BD_DEBUG, nothing under --quiet, once per process.
 func reportDeferWakeSkips(skipped []DeferWakeSkip, localNode string) {
 	if len(skipped) == 0 || debug.IsQuiet() {
 		return
 	}
-	warnReplica("%s", formatDeferWakeSkipSummary(skipped, localNode))
-	if !debug.Enabled() {
-		return
-	}
-	for i, s := range skipped {
-		if i == deferWakeSkipDetailRows {
-			warnReplica("  ... and %d more\n", len(skipped)-i)
-			break
+	deferWakeSkipReportOnce.Do(func() {
+		warnReplica("%s", formatDeferWakeSkipSummary(skipped, localNode))
+		if !debug.Enabled() {
+			return
 		}
-		owner := s.Owner
-		if owner == "" {
-			owner = "no owner label, no prefix home"
+		for i, s := range skipped {
+			if i == deferWakeSkipDetailRows {
+				warnReplica("  ... and %d more\n", len(skipped)-i)
+				break
+			}
+			owner := s.Owner
+			if owner == "" {
+				owner = "no owner label, no prefix home"
+			}
+			warnReplica("  %s (%s)\n", s.ID, owner)
 		}
-		warnReplica("  %s (%s)\n", s.ID, owner)
-	}
+	})
 }
 
 // formatDeferWakeSkipSummary renders the one-line audit: a count per owning
@@ -351,7 +355,7 @@ func formatDeferWakeSkipSummary(skipped []DeferWakeSkip, localNode string) strin
 			b.WriteString(", ")
 		}
 		if owner == "" {
-			fmt.Fprintf(&b, "no owner label and no %s<prefix> (%d)", PrefixHomeConfigKey, counts[owner])
+			fmt.Fprintf(&b, "no owner label and no %s<prefix> (%d)", config.FederationPrefixHomeKey, counts[owner])
 			continue
 		}
 		fmt.Fprintf(&b, "%q (%d)", owner, counts[owner])
@@ -363,5 +367,5 @@ func formatDeferWakeSkipSummary(skipped []DeferWakeSkip, localNode string) strin
 	return fmt.Sprintf("defer-wake: skipped %d expired dated %s not owned by this node (%s): %s. "+
 		"Only the owning node wakes them; label the row %s<node> or set %s<prefix> on every clone. (bd -v lists up to %d.)\n",
 		len(skipped), pluralWord(len(skipped), "defer", "defers"), node, b.String(),
-		OwnerLabelPrefix, PrefixHomeConfigKey, deferWakeSkipDetailRows)
+		OwnerLabelPrefix, config.FederationPrefixHomeKey, deferWakeSkipDetailRows)
 }

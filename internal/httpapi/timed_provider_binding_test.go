@@ -44,9 +44,10 @@ func TestEveryTimedProviderAccessorBindsToTheWrapper(t *testing.T) {
 		if !ok || ident.Name != "timedProvider" {
 			continue
 		}
-		// NewUOW is the layer itself and Close is lifecycle; neither constructs
-		// a role. Everything else on this type is an accessor.
-		if fn.Name.Name == "NewUOW" || fn.Name.Name == "Close" {
+		// NewUOW is the layer itself, Close is lifecycle and WorkspaceDir names
+		// the served store; none constructs a role. Everything else on this
+		// type is an accessor.
+		if fn.Name.Name == "NewUOW" || fn.Name.Name == "Close" || fn.Name.Name == "WorkspaceDir" {
 			continue
 		}
 		recv := "p"

@@ -35,11 +35,17 @@ import (
 func WakeExpiredDefers(ctx context.Context, p UnitOfWorkProvider) (int, error) {
 	// The owner scope of the sweep is a property of the store, read from its
 	// own .beads config files (issueops.WakeExpiredDefersInTx), so the
-	// provider names the workspace it was opened for; a provider that names
-	// none runs the legacy sweep.
-	if dir := workspaceDirOf(p); dir != "" {
-		ctx = storageissueops.WithDeferWakeWorkspace(ctx, dir)
+	// provider names the workspace it was opened for. A provider that cannot
+	// say where its store lives does not sweep at all: the store's files may
+	// declare a scope, and waking its rows unread is the conflicting write.
+	dir := WorkspaceDirOf(p)
+	if dir == "" {
+		unnamedWorkspaceOnce.Do(func() {
+			fmt.Fprintln(os.Stderr, "warning: defer-wake sweep skipped: the provider does not name its store's .beads directory (uow.WithWorkspaceDir), so the store's owner scope cannot be read")
+		})
+		return 0, nil
 	}
+	ctx = storageissueops.WithDeferWakeWorkspace(ctx, dir)
 	return RunTxResult(ctx, p, func(ctx context.Context, uw UnitOfWork) (int, string, error) {
 		issues, wisps, err := uw.IssueUseCase().WakeExpiredDefers(ctx)
 		if err != nil {
@@ -59,28 +65,25 @@ func WakeExpiredDefers(ctx context.Context, p UnitOfWorkProvider) (int, error) {
 
 // WorkspaceProvider is implemented by a provider that was opened for one
 // workspace and can name its .beads directory (WithWorkspaceDir). The
-// defer-wake sweep reads that store's config files for its owner scope.
+// defer-wake sweep reads that store's config files for its owner scope, so
+// every provider wrapper forwards it (notifyingProvider here, the HTTP
+// server's timedProvider): a wrapper that hid it would stop the sweep.
 type WorkspaceProvider interface {
 	WorkspaceDir() string
 }
 
-// workspaceDirOf peels provider decorators (ProviderUnwrapper) until one
-// names its workspace, or returns "" when none does.
-func workspaceDirOf(p UnitOfWorkProvider) string {
-	for p != nil {
-		if wp, ok := p.(WorkspaceProvider); ok {
-			if dir := wp.WorkspaceDir(); dir != "" {
-				return dir
-			}
-		}
-		unwrapper, ok := p.(ProviderUnwrapper)
-		if !ok {
-			return ""
-		}
-		p = unwrapper.Unwrap()
+// WorkspaceDirOf returns the .beads directory a provider names, or "" when
+// it names none.
+func WorkspaceDirOf(p UnitOfWorkProvider) string {
+	if wp, ok := p.(WorkspaceProvider); ok {
+		return wp.WorkspaceDir()
 	}
 	return ""
 }
+
+// unnamedWorkspaceOnce keeps the unnamed-provider advisory to one line per
+// process.
+var unnamedWorkspaceOnce sync.Once
 
 // advisoryAccessDeniedOnce rate-limits the access-denied advisory to one
 // warning per process: a read-only-privileged SQL user hits it on every

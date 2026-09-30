@@ -458,15 +458,17 @@ func openEmbeddedSDK(t *testing.T, ctx context.Context, beadsDir string) beads.S
 	return store
 }
 
-// TestEmbeddedDeferAutoWakeOwnerScopedSDKRead is the round-3 finding: a
-// library client opens the workspace through the public
-// beads.OpenBestAvailable, which never initializes bd's process config, and
-// reads ready work. The owner scope must come from the store's own config
-// files, so a non-owning node's SDK read skips the row and only the owner's
-// wakes it. The prefix home is declared in .beads/config.local.yaml, the
-// untracked override file bd merges over config.yaml (round 4), so the
-// local file is what both the CLI defer and the SDK reads honor here. Not
-// parallel: it sets this process's environment.
+// TestEmbeddedDeferAutoWakeOwnerScopedSDKRead covers a library client: it
+// opens the workspace through the public beads.OpenBestAvailable and reads
+// ready work. The wake resolves both its scope and its node from the store's
+// own files, the user files and the environment, never from bd's process
+// config, so this holds whether or not another test in this binary left that
+// config initialized: a non-owning node's SDK read skips the row and only
+// the owner's wakes it. The prefix home is declared in
+// .beads/config.local.yaml, the untracked override file bd merges over
+// config.yaml. Not parallel: it sets this process's environment, and points
+// HOME at an empty directory so the runner's own user config cannot name a
+// node.
 func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
 	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
 		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
@@ -481,6 +483,7 @@ func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
 	bdDefer(t, bd, dir, issue.ID, "--until", "2020-01-01")
 
 	isolateProcessEnv(t)
+	t.Setenv("HOME", t.TempDir())
 	ctx := context.Background()
 
 	// jadegate reads through the SDK: the row is citadel's, so it stays put.

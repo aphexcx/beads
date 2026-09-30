@@ -136,6 +136,10 @@ type fakeProvider struct {
 	issues     *fakeIssues
 	readIssues domain.IssueUseCase
 	readConfig domain.ConfigUseCase
+	// workspaceDir is the store this provider names (uow.WorkspaceProvider).
+	// Unset, the fake names a store with no config, as every real provider
+	// names one: the defer-wake sweep does not run for an unnamed provider.
+	workspaceDir string
 }
 
 func (p *fakeProvider) NewUOW(ctx context.Context) (uow.UnitOfWork, error) {
@@ -165,6 +169,13 @@ func (p *fakeProvider) openedUOWs() []*fakeUOW {
 }
 
 func (p *fakeProvider) Close(context.Context) error { return nil }
+
+func (p *fakeProvider) WorkspaceDir() string {
+	if p.workspaceDir == "" {
+		return "/nonexistent/beads-fake-store/.beads"
+	}
+	return p.workspaceDir
+}
 
 // tunableProvider is the provider shape serve expects: one that can be told
 // how many connections it may open.

@@ -1,13 +1,33 @@
 package issueops
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
+// TestWakeExpiredDefersSkipsTheSweepOnUnusableConfig pins the fail-closed
+// rule: a store whose federation config cannot be parsed may be federated, so
+// the sweep is skipped whole. The nil transaction proves it — any query
+// would panic.
+func TestWakeExpiredDefersSkipsTheSweepOnUnusableConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("federation.prefix_home.hw: [citadel\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := WakeExpiredDefersInTx(WithDeferWakeWorkspace(context.Background(), dir), nil)
+	if err != nil {
+		t.Fatalf("WakeExpiredDefersInTx: %v, want the sweep skipped without an error", err)
+	}
+	if len(got.Issues)+len(got.Wisps)+len(got.Skipped) != 0 {
+		t.Fatalf("result = %+v, want an untouched store", got)
+	}
+}
+
 func TestDeferWakeOwner(t *testing.T) {
 	homes := map[string]string{"hw": "citadel", "beads-vscode": "laptop"}
-	homeOf := func(prefix string) string { return homes[prefix] }
 	cases := []struct{ name, id, label, want string }{
 		{"owner label wins over the prefix home", "hw-abc", "owner:jadegate", "jadegate"},
 		{"owner label is trimmed", "hw-abc", "owner: citadel ", "citadel"},
@@ -21,7 +41,7 @@ func TestDeferWakeOwner(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := deferWakeOwner(tc.id, tc.label, homeOf); got != tc.want {
+			if got := deferWakeOwner(tc.id, tc.label, homes); got != tc.want {
 				t.Fatalf("deferWakeOwner(%q, %q) = %q, want %q", tc.id, tc.label, got, tc.want)
 			}
 		})

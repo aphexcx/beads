@@ -327,6 +327,7 @@ type timedProvider struct {
 // provider it holds for the role — the same two-step a CLI command performs on
 // a store — instead of reaching past it to a constructor.
 var (
+	_ uow.WorkspaceProvider         = timedProvider{}
 	_ uow.IssueReaderSource         = timedProvider{}
 	_ uow.IssueClaimerSource        = timedProvider{}
 	_ uow.BatchCloserSource         = timedProvider{}
@@ -549,6 +550,11 @@ func (p timedProvider) Memories() (memoryops.Memories, error) {
 func (p timedProvider) EventsJournalCursor() (storage.EventsJournalCursor, error) {
 	return uow.NewEventsJournalCursor(p)
 }
+
+// WorkspaceDir forwards the served provider's workspace, so the defer-wake
+// sweep behind Ready, List --ready and ClaimNext reads the served store's own
+// config for its owner scope. Not Unwrap: hook detection peels unwrappers.
+func (p timedProvider) WorkspaceDir() string { return uow.WorkspaceDirOf(p.inner) }
 
 func (p timedProvider) NewUOW(ctx context.Context) (uow.UnitOfWork, error) {
 	start := time.Now()

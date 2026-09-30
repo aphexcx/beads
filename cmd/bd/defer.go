@@ -32,7 +32,10 @@ A defer WITHOUT a date is the indefinite icebox: it stays deferred until
 someone runs 'bd undefer'.
 In a store that declares federation.prefix_home.<prefix> (a federated store),
 only the owning node (node_id) wakes it: the node its owner:<node> label names,
-else the prefix's declared home; every other node reports it skipped.
+else the prefix's declared home; every other node reports it skipped. The wake
+reads that key from the store's own .beads/config.yaml and config.local.yaml
+only: 'bd config get' can show a user-level, environment or case-variant value
+it ignores.
 
 Examples:
   bd defer bd-abc                  # Icebox indefinitely (until bd undefer)
