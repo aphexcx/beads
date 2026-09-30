@@ -69,6 +69,11 @@ func TestReadWorkspaceFederationFailsClosed(t *testing.T) {
 		{"null home", "federation.prefix_home.hw:\n", "-"},
 		{"list home", "federation.prefix_home.hw: [citadel, jadegate]\n", "-"},
 		{"scalar parent", "federation.prefix_home: citadel\n", "-"},
+		{"empty mapping home", "federation.prefix_home.hw: {}\n", "-"},
+		{"empty mapping parent", "federation.prefix_home: {}\n", "-"},
+		{"mapping where a node belongs", "federation.prefix_home.hw:\n  node: citadel\n", "-"},
+		{"one prefix declared by two yaml paths of one file",
+			"federation.prefix_home:\n  hw: citadel\nfederation:\n  prefix_home:\n    hw: jadegate\n", "-"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
