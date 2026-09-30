@@ -32,8 +32,8 @@ const OwnerLabelPrefix = "owner:"
 // the store by hand (a store's .beads directory is typically gitignored, so
 // nothing carries it between clones); the same value goes everywhere, and
 // only the node whose node_id matches acts on it. Declaring it for any
-// prefix is also what arms the owner scope in that store: see
-// deferWakeScopeFromConfig.
+// prefix is also what arms the owner scope in that store, and it is read
+// from that store's own .beads/config.yaml: see deferWakeScopeFromConfig.
 const PrefixHomeConfigKey = "federation.prefix_home."
 
 // DeferWakeSkip is one expired dated defer the owner scope left alone on this
@@ -144,15 +144,42 @@ type deferWakeScope struct {
 	homeOf    func(prefix string) string
 }
 
+// deferWakeWorkspaceKey carries the .beads directory of the store a sweep
+// runs against, so the owner scope is read from THAT store's config.yaml.
+type deferWakeWorkspaceKey struct{}
+
+// WithDeferWakeWorkspace names the store's .beads directory for the owner
+// scope of the defer-wake sweep. The store wrappers attach it, so a library
+// consumer that opened the workspace without config.Initialize (the public
+// beads.OpenBestAvailable / OpenFromConfig) resolves the same scope bd's own
+// process does, and a cross-workspace open reads the target workspace, not
+// the one bd was launched from.
+func WithDeferWakeWorkspace(ctx context.Context, beadsDir string) context.Context {
+	return context.WithValue(ctx, deferWakeWorkspaceKey{}, beadsDir)
+}
+
 // deferWakeScopeFromConfig arms the owner scope only where the store's own
 // config says it is federated: at least one federation.prefix_home.<prefix>
-// key. node_id alone never arms it: it is user-global (~/.config/bd), so it
-// sits under every store on the machine, federated or not, and a plain
-// project must keep waking its defers. config.AllKeys enumerates the config
-// files, not AutomaticEnv, so an environment variable alone cannot arm the
-// scope either — though BD_FEDERATION_PREFIX_HOME_<PREFIX> overrides a
-// declared prefix's home the way every bd key can be overridden.
+// key in its .beads/config.yaml. node_id alone never arms it: it is
+// user-global (~/.config/bd), so it sits under every store on the machine,
+// federated or not, and a plain project must keep waking its defers. With
+// the workspace on the context the file is the only source, never the
+// process environment; a caller that carries no workspace (the uow path
+// inside bd's own process) falls back to the process config, the launched
+// workspace's config.yaml merged with the environment, where
+// BD_FEDERATION_PREFIX_HOME_<PREFIX> overrides a declared prefix's home the
+// way every bd key can be overridden but, config.AllKeys not enumerating
+// AutomaticEnv, still cannot arm the scope on its own.
 func deferWakeScopeFromConfig(ctx context.Context) *deferWakeScope {
+	if dir, ok := ctx.Value(deferWakeWorkspaceKey{}).(string); ok && dir != "" {
+		if !config.WorkspaceYamlHasPrefix(dir, PrefixHomeConfigKey) {
+			return nil
+		}
+		return &deferWakeScope{localNode: NodeID(ctx), homeOf: func(prefix string) string {
+			home, _ := config.WorkspaceYamlValue(dir, PrefixHomeConfigKey+prefix)
+			return home
+		}}
+	}
 	for _, key := range config.AllKeys() {
 		if strings.HasPrefix(key, PrefixHomeConfigKey) {
 			return &deferWakeScope{localNode: NodeID(ctx), homeOf: prefixHomeFromConfig}

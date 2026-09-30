@@ -364,6 +364,47 @@ func WorkspaceYamlValue(beadsDir, key string) (string, bool) {
 	return readYamlValueAtPath(filepath.Join(beadsDir, "config.yaml"), key)
 }
 
+// WorkspaceYamlHasPrefix reports whether ONE workspace's config.yaml, named by
+// its .beads directory, declares any key under the dotted prefix (for example
+// "federation.prefix_home."), in the flat form ("federation.prefix_home.hw:
+// citadel") or the nested one. Like WorkspaceYamlValue it never touches the
+// process-wide viper state, so a library consumer that never called
+// Initialize gets the same answer bd's own process does.
+func WorkspaceYamlHasPrefix(beadsDir, prefix string) bool {
+	if beadsDir == "" {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml")) //nolint:gosec // beadsDir is caller-resolved workspace state
+	if err != nil {
+		return false
+	}
+	var root map[string]interface{}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return false
+	}
+	return yamlHasKeyWithPrefix(root, "", prefix)
+}
+
+// yamlHasKeyWithPrefix walks a decoded yaml map, joining nested keys with
+// dots, and reports whether any full key starts with prefix.
+func yamlHasKeyWithPrefix(node map[string]interface{}, path, prefix string) bool {
+	for key, val := range node {
+		full := key
+		if path != "" {
+			full = path + "." + key
+		}
+		if strings.HasPrefix(full, prefix) {
+			return true
+		}
+		if child, ok := val.(map[string]interface{}); ok && strings.HasPrefix(prefix, full+".") {
+			if yamlHasKeyWithPrefix(child, full, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // WorkspaceYamlValueStrict reads one dotted key from a workspace config.yaml
 // without conflating a malformed or unreadable file with an absent key. A
 // missing file or key returns present=false and no error; all other I/O and

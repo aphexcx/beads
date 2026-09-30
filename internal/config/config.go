@@ -1060,6 +1060,19 @@ func GetIdentity(flagValue string) string {
 // default: every consumer degrades to the pre-replica-aware behavior rather
 // than fail closed.
 func NodeID() string {
+	if v == nil {
+		// A library consumer that never called Initialize (the public
+		// beads.OpenBestAvailable / OpenFromConfig): the same sources, read
+		// directly, so the reclaim guard and the defer-wake owner scope see
+		// the node the operator named there too.
+		for _, name := range []string{"BEADS_NODE_ID", "BD_NODE_ID"} {
+			if val := strings.TrimSpace(os.Getenv(name)); val != "" {
+				return val
+			}
+		}
+		val, _ := readUserGlobalYamlValue("node_id")
+		return strings.TrimSpace(val)
+	}
 	return strings.TrimSpace(GetString("node_id"))
 }
 

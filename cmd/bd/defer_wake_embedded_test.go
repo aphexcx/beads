@@ -3,12 +3,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 // showDeferState returns (status, defer_until) for an issue via bd show --json.
@@ -417,5 +422,93 @@ func TestEmbeddedDeferAutoWakeScopeIsPerStore(t *testing.T) {
 	ids, _ = wakeReadyIDsStderr(t, bd, f.citadelDir)
 	if !ids[f.issueID] {
 		t.Errorf("citadel store did not wake its own %s", f.issueID)
+	}
+}
+
+// isolateProcessEnv strips every BEADS_* and BD_* variable from THIS
+// process's environment for the rest of the test (bdEnv does the same for
+// subprocesses), so an in-process store open reads only the workspace it is
+// given and can never be steered at a live dolt server by the shell it runs
+// in. Restored on cleanup; the caller must not be parallel.
+func isolateProcessEnv(t *testing.T) {
+	t.Helper()
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "BEADS_") && !strings.HasPrefix(entry, "BD_") {
+			continue
+		}
+		name, value, _ := strings.Cut(entry, "=")
+		os.Unsetenv(name)
+		t.Cleanup(func() { os.Setenv(name, value) })
+	}
+}
+
+// openEmbeddedSDK opens the workspace through the public SDK entry point,
+// the way a library client does, without bd's process config, and refuses to
+// go on unless the store it got is the embedded one.
+func openEmbeddedSDK(t *testing.T, ctx context.Context, beadsDir string) beads.Storage {
+	t.Helper()
+	store, err := beads.OpenBestAvailable(ctx, beadsDir)
+	if err != nil {
+		t.Fatalf("beads.OpenBestAvailable(%s): %v", beadsDir, err)
+	}
+	if kind := fmt.Sprintf("%T", store); !strings.Contains(kind, "EmbeddedDoltStore") {
+		_ = store.Close()
+		t.Fatalf("SDK open returned %s, want the embedded store (refusing to touch a server)", kind)
+	}
+	return store
+}
+
+// TestEmbeddedDeferAutoWakeOwnerScopedSDKRead is the round-3 finding: a
+// library client opens the workspace through the public
+// beads.OpenBestAvailable, which never initializes bd's process config, and
+// reads ready work. The owner scope must come from the store's own
+// .beads/config.yaml, so a non-owning node's SDK read skips the row and only
+// the owner's wakes it. Not parallel: it sets this process's environment.
+func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt integration tests")
+	}
+
+	bd := buildEmbeddedBD(t)
+	dir, beadsDir, _ := bdInit(t, bd, "--prefix", "hw", "--skip-hooks", "--skip-agents")
+	bdCommand(t, bd, dir, "config", "set", "federation.prefix_home.hw", "citadel")
+	issue := bdCreate(t, bd, dir, "SDK snooze", "--type", "task", "--labels", "owner:citadel")
+	bdDefer(t, bd, dir, issue.ID, "--until", "2020-01-01")
+
+	isolateProcessEnv(t)
+	ctx := context.Background()
+
+	// jadegate reads through the SDK: the row is citadel's, so it stays put.
+	t.Setenv("BEADS_NODE_ID", "jadegate")
+	store := openEmbeddedSDK(t, ctx, beadsDir)
+	if _, err := store.GetReadyWork(ctx, types.WorkFilter{}); err != nil {
+		t.Fatalf("GetReadyWork as jadegate: %v", err)
+	}
+	got, err := store.GetIssue(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue as jadegate: %v", err)
+	}
+	if got == nil || got.Status != types.StatusDeferred || got.DeferUntil == nil {
+		t.Errorf("SDK read on the jadegate node woke %s: got %+v, want deferred with its date", issue.ID, got)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close as jadegate: %v", err)
+	}
+
+	// citadel reads through the SDK: the owner, so the row wakes.
+	t.Setenv("BEADS_NODE_ID", "citadel")
+	store = openEmbeddedSDK(t, ctx, beadsDir)
+	if _, err := store.GetReadyWork(ctx, types.WorkFilter{}); err != nil {
+		t.Fatalf("GetReadyWork as citadel: %v", err)
+	}
+	got, err = store.GetIssue(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("GetIssue as citadel: %v", err)
+	}
+	if got == nil || got.Status != types.StatusOpen || got.DeferUntil != nil {
+		t.Errorf("SDK read on the citadel node did not wake %s: got %+v, want open with defer_until cleared", issue.ID, got)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close as citadel: %v", err)
 	}
 }
