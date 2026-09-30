@@ -481,6 +481,10 @@ func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
 	}
 	issue := bdCreate(t, bd, dir, "SDK snooze", "--type", "task", "--labels", "owner:citadel")
 	bdDefer(t, bd, dir, issue.ID, "--until", "2020-01-01")
+	// A jadegate-owned row that will also carry a whitespace-only owner label,
+	// which the SDK accepts: the blank one must not outrank the real owner.
+	blank := bdCreate(t, bd, dir, "SDK snooze, blank owner label too", "--type", "task", "--labels", "owner:jadegate")
+	bdDefer(t, bd, dir, blank.ID, "--until", "2020-01-01")
 
 	isolateProcessEnv(t)
 	t.Setenv("HOME", t.TempDir())
@@ -489,6 +493,9 @@ func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
 	// jadegate reads through the SDK: the row is citadel's, so it stays put.
 	t.Setenv("BEADS_NODE_ID", "jadegate")
 	store := openEmbeddedSDK(t, ctx, beadsDir)
+	if err := store.AddLabel(ctx, blank.ID, "owner: ", "test"); err != nil {
+		t.Fatalf("AddLabel: %v", err)
+	}
 	if _, err := store.GetReadyWork(ctx, types.WorkFilter{}); err != nil {
 		t.Fatalf("GetReadyWork as jadegate: %v", err)
 	}
@@ -498,6 +505,15 @@ func TestEmbeddedDeferAutoWakeOwnerScopedSDKRead(t *testing.T) {
 	}
 	if got == nil || got.Status != types.StatusDeferred || got.DeferUntil == nil {
 		t.Errorf("SDK read on the jadegate node woke %s: got %+v, want deferred with its date", issue.ID, got)
+	}
+	// Its own row wakes: owner:jadegate decides, not the blank label beside
+	// it (which would hand the row to the prefix home, citadel).
+	gotBlank, err := store.GetIssue(ctx, blank.ID)
+	if err != nil {
+		t.Fatalf("GetIssue %s as jadegate: %v", blank.ID, err)
+	}
+	if gotBlank == nil || gotBlank.Status != types.StatusOpen {
+		t.Errorf("SDK read on the jadegate node left its own %s deferred: labels %q, status %q", blank.ID, gotBlank.Labels, gotBlank.Status)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close as jadegate: %v", err)

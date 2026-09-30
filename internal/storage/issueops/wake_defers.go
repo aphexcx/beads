@@ -197,13 +197,13 @@ func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.Filt
 	// SELECT and its UPDATE (re-deferred further out, claimed, closed) matches
 	// nothing and is skipped rather than clobbered. In a scoped store the
 	// owner label rides along so the scope decides per row before any UPDATE
-	// is issued; unscoped, the snapshot names no labels table at all. A label
-	// that is literally "owner:" (empty value) is left out of the pick so
-	// MIN() lands on a real owner when both exist.
+	// is issued; unscoped, the snapshot names no labels table at all. An owner
+	// label with an empty or blank value ("owner:", "owner: ") is left out of
+	// the pick so MIN() lands on a real owner when both exist.
 	ownerCol, args := "''", []any(nil)
 	if scope != nil {
-		ownerCol = fmt.Sprintf("COALESCE((SELECT MIN(l.label) FROM %s l WHERE l.issue_id = t.id AND l.label LIKE ? AND l.label <> ?), '')", tables.Labels)
-		args = []any{OwnerLabelPrefix + "%", OwnerLabelPrefix}
+		ownerCol = fmt.Sprintf("COALESCE((SELECT MIN(l.label) FROM %s l WHERE l.issue_id = t.id AND l.label LIKE ? AND TRIM(SUBSTRING(l.label, ?)) <> ''), '')", tables.Labels)
+		args = []any{OwnerLabelPrefix + "%", len(OwnerLabelPrefix) + 1}
 	}
 	//nolint:gosec // G201: table names are the hardcoded sqlbuild constants from the caller above.
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
