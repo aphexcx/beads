@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/workapi"
 )
@@ -24,6 +25,8 @@ type recordingIssues struct {
 	ready  []types.WorkFilter
 	search []types.IssueFilter
 	items  []*types.IssueWithCounts
+	// wakeWorkspace is the store the defer-wake sweep's context named.
+	wakeWorkspace string
 }
 
 func (f *recordingIssues) GetReadyWorkWithCounts(_ context.Context, filter types.WorkFilter) (domain.SearchCountsPage, error) {
@@ -41,9 +44,34 @@ func (f *recordingIssues) SearchIssuesWithCounts(_ context.Context, _ string, fi
 }
 
 // The ready surface's defer-wake sweep reaches this before the read; nothing
-// is deferred in the fixture, so it reports a no-op sweep.
-func (f *recordingIssues) WakeExpiredDefers(context.Context) (issues, wisps int, err error) {
+// is deferred in the fixture, so it reports a no-op sweep and records the
+// store the sweep's context named.
+func (f *recordingIssues) WakeExpiredDefers(ctx context.Context) (issues, wisps int, err error) {
+	f.mu.Lock()
+	f.wakeWorkspace, _ = issueops.DeferWakeWorkspace(ctx)
+	f.mu.Unlock()
 	return 0, 0, nil
+}
+
+// TestTheReadyRouteSweepsWithTheServedStoresWorkspace pins that bd serve's
+// ready surface runs the defer-wake sweep scoped to the served store: the
+// reader is built over timedProvider, which must forward the provider's
+// workspace, or the sweep would not run (an unnamed provider) and a federated
+// store's owner scope would never be read.
+func TestTheReadyRouteSweepsWithTheServedStoresWorkspace(t *testing.T) {
+	rec := &recordingIssues{}
+	provider := &fakeProvider{issues: &fakeIssues{}, readIssues: rec, readConfig: emptyConfig{}, workspaceDir: "/stores/hw/.beads"}
+	ts := newTestServer(t, Config{Provider: provider})
+
+	if resp := ts.get(t, "/v0/beads/ready"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	rec.mu.Lock()
+	got := rec.wakeWorkspace
+	rec.mu.Unlock()
+	if got != "/stores/hw/.beads" {
+		t.Fatalf("the ready route's defer-wake sweep ran with workspace %q, want the served store's", got)
+	}
 }
 
 func (f *recordingIssues) readyFilters() []types.WorkFilter {

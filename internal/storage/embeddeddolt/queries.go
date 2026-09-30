@@ -21,6 +21,9 @@ import (
 // OUTSIDE the read connections below because withConn(ctx, false, …) always
 // rolls back.
 func (s *EmbeddedDoltStore) wakeExpiredDefers(ctx context.Context) {
+	// The owner scope reads THIS store's .beads/config.yaml, so a library
+	// consumer that never initialized the process config scopes the same.
+	ctx = issueops.WithDeferWakeWorkspace(ctx, s.beadsDir)
 	err := s.runIssueOperationTxWithMessage(ctx, func(tx *sql.Tx) (issueops.ChangedTables, string, error) {
 		woke, err := issueops.WakeExpiredDefersInTx(ctx, tx)
 		if err != nil {
