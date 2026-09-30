@@ -470,7 +470,7 @@ func newExternalProxiedServerUOWProvider(ctx context.Context, beadsDir string, t
 		topology.proxyIdle,
 		topology.teamServer,
 		topology.expectedProjectID,
-		opts...,
+		append(opts, uow.WithWorkspaceDir(beadsDir))...,
 	)
 }
 
@@ -530,6 +530,6 @@ func newManagedProxiedServerUOWProvider(ctx context.Context, beadsDir string, to
 		topology.proxyIdle,
 		topology.teamServer,
 		topology.expectedProjectID,
-		opts...,
+		append(opts, uow.WithWorkspaceDir(beadsDir))...,
 	)
 }

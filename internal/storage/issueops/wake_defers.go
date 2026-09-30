@@ -158,38 +158,37 @@ func WithDeferWakeWorkspace(ctx context.Context, beadsDir string) context.Contex
 	return context.WithValue(ctx, deferWakeWorkspaceKey{}, beadsDir)
 }
 
+// DeferWakeWorkspace returns the store directory WithDeferWakeWorkspace put
+// on the context, if any.
+func DeferWakeWorkspace(ctx context.Context) (string, bool) {
+	dir, ok := ctx.Value(deferWakeWorkspaceKey{}).(string)
+	return dir, ok && dir != ""
+}
+
 // deferWakeScopeFromConfig arms the owner scope only where the store's own
 // config says it is federated: at least one federation.prefix_home.<prefix>
-// key in its .beads/config.yaml or config.local.yaml. node_id alone never arms it: it is
-// user-global (~/.config/bd), so it sits under every store on the machine,
-// federated or not, and a plain project must keep waking its defers. With
-// the workspace on the context the file is the only source, never the
-// process environment; a caller that carries no workspace (the uow path
-// inside bd's own process) falls back to the process config, the launched
-// workspace's config.yaml merged with the environment, where
-// BD_FEDERATION_PREFIX_HOME_<PREFIX> overrides a declared prefix's home the
-// way every bd key can be overridden but, config.AllKeys not enumerating
-// AutomaticEnv, still cannot arm the scope on its own.
+// key in its .beads/config.yaml or config.local.yaml, the pair Initialize
+// merges for a workspace, read with the same precedence (local over main)
+// so a local override of a prefix's home, or a local declaration, decides
+// here exactly as it does in bd's own process. node_id alone never arms it:
+// it is user-global (~/.config/bd), so it sits under every store on the
+// machine, federated or not, and a plain project must keep waking its
+// defers. Those two files are the only source: the scope is a property of
+// one store, and neither the process environment nor the user-level config
+// — where a stray federation.prefix_home key would otherwise arm every
+// store on the machine — takes part. A sweep that names no store (no
+// workspace on the context) is therefore the legacy sweep; every entry
+// point that has a store attaches it (the dolt and embedded wrappers, and
+// the unit-of-work path through uow.WithWorkspaceDir).
 func deferWakeScopeFromConfig(ctx context.Context) *deferWakeScope {
-	if dir, ok := ctx.Value(deferWakeWorkspaceKey{}).(string); ok && dir != "" {
-		// Both files Initialize merges for a workspace, config.local.yaml
-		// over config.yaml, so a local override of a prefix's home (or a
-		// local declaration) decides here exactly as it does in bd's own
-		// process.
-		if !config.WorkspaceEffectiveYamlHasPrefix(dir, PrefixHomeConfigKey) {
-			return nil
-		}
-		return &deferWakeScope{localNode: NodeID(ctx), homeOf: func(prefix string) string {
-			home, _ := config.WorkspaceEffectiveYamlValue(dir, PrefixHomeConfigKey+prefix)
-			return home
-		}}
+	dir, ok := DeferWakeWorkspace(ctx)
+	if !ok || !config.WorkspaceEffectiveYamlHasPrefix(dir, PrefixHomeConfigKey) {
+		return nil
 	}
-	for _, key := range config.AllKeys() {
-		if strings.HasPrefix(key, PrefixHomeConfigKey) {
-			return &deferWakeScope{localNode: NodeID(ctx), homeOf: prefixHomeFromConfig}
-		}
-	}
-	return nil
+	return &deferWakeScope{localNode: NodeID(ctx), homeOf: func(prefix string) string {
+		home, _ := config.WorkspaceEffectiveYamlValue(dir, PrefixHomeConfigKey+prefix)
+		return home
+	}}
 }
 
 func wakeExpiredDefersInTable(ctx context.Context, tx DBTX, tables sqlbuild.FilterTables, eventsTable string, scope *deferWakeScope) (woken []string, skipped []DeferWakeSkip, err error) {
@@ -297,10 +296,6 @@ func deferWakeOwner(id, ownerLabel string, homeOf func(prefix string) string) st
 		}
 	}
 	return ""
-}
-
-func prefixHomeFromConfig(prefix string) string {
-	return config.GetString(PrefixHomeConfigKey + prefix)
 }
 
 // deferWakeSkipDetailRows caps the bd -v per-row listing of skipped defers.
