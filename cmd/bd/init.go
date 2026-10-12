@@ -1747,9 +1747,18 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 
 			}
 
-			if err := cfg.Save(beadsDir); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
-				// Non-fatal - continue anyway
+			saveMetadata := cfg.Save
+			if reinitLocal {
+				// --reinit-local / --force explicitly sanctions rewriting
+				// local state, including a server→embedded mode flip that
+				// plain Save refuses (bd-9oh).
+				saveMetadata = cfg.SaveAllowingModeFlip
+			}
+			if err := saveMetadata(beadsDir); err != nil {
+				// Fatal: metadata.json is the store pointer. Continuing with a
+				// stale or missing one leaves the workspace resolving to the
+				// wrong store — the bd-9oh outage mode.
+				return fmt.Errorf("failed to write metadata.json: %w", err)
 			}
 
 			// The write itself happens once, below this block, through
@@ -2583,11 +2592,42 @@ Aborting.`, ui.RenderWarn("⚠"), location, ui.RenderAccent("bd list"), prefix)
 				if result.Reachable && result.Exists {
 					// Server up and DB exists — fall through to "already initialized" error.
 				} else {
-					// Server unreachable or error during check: this is a fresh clone
-					// with committed metadata.json but no local dolt/ directory.
-					// Allow init to proceed so the user can bootstrap the database
-					// (e.g. via --from-jsonl). (GH#2433)
-					return nil
+					// Server unreachable (or the existence probe errored). An
+					// unreachable server does NOT mean this workspace is
+					// uninitialized: it is just as likely a live server-mode
+					// workspace whose server is down or whose port env is not
+					// set in this shell. Treating this as "fresh clone, safe
+					// to init" let bd init silently rewrite server-mode
+					// metadata.json to embedded mode and hide the real store
+					// from every client of the checkout (bd-9oh). Refuse;
+					// recovery paths are explicit.
+					//
+					// Deliberately NOT the errWorkspaceAlreadyInitialized
+					// sentinel: the workspace state is UNVERIFIED, so
+					// --init-if-missing must abort loudly rather than skip
+					// with success over a possibly-uninitialized clone.
+					probeDetail := ""
+					if result.Err != nil {
+						probeDetail = fmt.Sprintf(" (%v)", result.Err)
+					}
+					return fmt.Errorf(`
+%s metadata.json is server mode, but the Dolt server at %s:%d is unreachable%s
+
+Refusing to re-initialize: an unreachable server does not mean this
+workspace is uninitialized (bd-9oh).
+
+If the server should be running:
+  bd dolt start              # Start the project Dolt server
+  bd doctor                  # Diagnose server/config health
+
+If this is a fresh clone that needs its database created:
+  bd bootstrap               # Safe recovery/initialization entry point (stops
+                             # with diagnostics if it cannot verify the server)
+
+To force local re-initialization anyway (destroys local Dolt state):
+  bd init --reinit-local --prefix %s
+
+Aborting.`, ui.RenderWarn("⚠"), host, port, probeDetail, prefix)
 				}
 			}
 

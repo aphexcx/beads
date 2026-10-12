@@ -1694,8 +1694,12 @@ func TestResolveServerMode_EnvHostBeatsEmbeddedMetadata(t *testing.T) {
 	// An EMPTY env host behaves as unset (matching GetDoltServerHost,
 	// cross-vendor review round 6): the remote metadata host stays
 	// effective, so inference still fires. Suppression requires an
-	// explicit localhost value.
+	// explicit localhost value. A fresh dir: Save's bd-9oh guard rightly
+	// refuses to rewrite the proxied-server metadata.json above to an
+	// (implicitly embedded) mode, and this scenario is about resolution,
+	// not about mode downgrades.
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	dir = t.TempDir()
 	metaCfg = &configfile.Config{
 		DoltServerHost: "10.0.0.5",
 	}

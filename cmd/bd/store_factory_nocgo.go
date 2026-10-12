@@ -70,7 +70,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (s storage.Dol
 	if err != nil {
 		// Name the real cause: without this, a present-but-unloadable
 		// metadata.json surfaces as the misleading "embedded requires CGO"
-		// message below.
+		// message below (bd-9oh).
 		return nil, fmt.Errorf("load %s: %w", configfile.ConfigPath(beadsDir), err)
 	}
 	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
@@ -96,6 +96,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (s storage.Dol
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
+		// See newDoltStoreFromConfig (bd-9oh).
 		return nil, fmt.Errorf("load %s: %w", configfile.ConfigPath(beadsDir), err)
 	}
 	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {

@@ -41,17 +41,7 @@ var versionCmd = &cobra.Command{
 		branch := resolveBranch()
 
 		if jsonOutput {
-			result := map[string]interface{}{
-				"version": Version,
-				"build":   Build,
-			}
-			if commit != "" {
-				result["commit"] = commit
-			}
-			if branch != "" {
-				result["branch"] = branch
-			}
-			if err := outputJSON(result); err != nil {
+			if err := outputJSON(versionJSONPayload(commit, branch)); err != nil {
 				return err
 			}
 		} else {
@@ -80,6 +70,22 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 }
 
+// versionJSONPayload builds the `bd version --json` object. The commit key
+// is always present, "" when unknown: machine consumers (e.g. the Gas Town
+// host comparing its linked beads module pseudo-version suffix) rely on the
+// key existing.
+func versionJSONPayload(commit, branch string) map[string]interface{} {
+	result := map[string]interface{}{
+		"version": Version,
+		"build":   Build,
+		"commit":  commit,
+	}
+	if branch != "" {
+		result["branch"] = branch
+	}
+	return result
+}
+
 func resolveCommitHash() string {
 	if Commit != "" {
 		return Commit
@@ -91,9 +97,66 @@ func resolveCommitHash() string {
 				return setting.Value
 			}
 		}
+		// `go install module@version` builds carry no vcs.revision, but a
+		// module pseudo-version pins the commit in its suffix.
+		if commit := commitFromModuleVersion(info.Main.Version); commit != "" {
+			return commit
+		}
 	}
 
 	return ""
+}
+
+// commitFromModuleVersion extracts the 12-char commit hash from a Go module
+// pseudo-version (e.g. v1.1.0-rc.2.0.20260702201530-193a87707245). Returns ""
+// for release tags, plain pre-releases, "(devel)", and anything else that is
+// not a pseudo-version.
+func commitFromModuleVersion(version string) string {
+	// Strip build metadata such as +incompatible.
+	if i := strings.IndexByte(version, '+'); i >= 0 {
+		version = version[:i]
+	}
+
+	parts := strings.Split(version, "-")
+	if len(parts) < 3 || !strings.HasPrefix(parts[0], "v") {
+		return ""
+	}
+
+	rev := parts[len(parts)-1]
+	if len(rev) != 12 || !isLowerHex(rev) {
+		return ""
+	}
+
+	// The segment before the revision must end in the 14-digit UTC
+	// timestamp (yyyymmddhhmmss) that pseudo-versions carry; otherwise this
+	// is an ordinary pre-release that happens to end in 12 hex chars.
+	timestamp := parts[len(parts)-2]
+	if i := strings.LastIndexByte(timestamp, '.'); i >= 0 {
+		timestamp = timestamp[i+1:]
+	}
+	if len(timestamp) != 14 || !isDigits(timestamp) {
+		return ""
+	}
+
+	return rev
+}
+
+func isLowerHex(s string) bool {
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func shortCommit(hash string) string {

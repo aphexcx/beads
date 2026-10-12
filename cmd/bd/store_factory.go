@@ -158,8 +158,8 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (s storage.Dol
 		// A present-but-unloadable metadata.json must not degrade to the
 		// embedded default: on server-mode deployments the embedded
 		// directory is an empty relic, and opening it silently turns every
-		// query into an empty result set with exit 0 (false-empty). Absent
-		// metadata.json (cfg == nil, err == nil) keeps the embedded default.
+		// query into an empty result set with exit 0 (false-empty) (bd-9oh).
+		// Absent metadata.json (cfg == nil, err == nil) keeps the embedded default.
 		return nil, fmt.Errorf("load %s: %w (refusing to fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
 	}
 	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
@@ -261,7 +261,7 @@ func openNonMutatingStoreFromConfig(ctx context.Context, beadsDir string, previe
 		// Same contract as newDoltStoreFromConfig: a present-but-unloadable
 		// metadata.json is a hard error, not a silent embedded fallback —
 		// and the error must name the real cause rather than the downstream
-		// "database not found" the embedded open would produce.
+		// "database not found" the embedded open would produce (bd-9oh).
 		return nil, fmt.Errorf("load %s: %w (refusing to fall back to the embedded store)", configfile.ConfigPath(beadsDir), err)
 	}
 	if err := validateConfiguredBackend(cfg, beadsDir); err != nil {
