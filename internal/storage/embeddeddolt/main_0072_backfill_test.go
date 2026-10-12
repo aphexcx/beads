@@ -35,7 +35,11 @@ func TestMain0072BackfillsUpdatedAtFromCreatedAtDeterministically(t *testing.T) 
 	}
 	ctx := context.Background()
 
-	apply := func(t *testing.T, dbName string) map[string][2]string {
+	// interrupted plays a migration that stopped after the nullable ADD
+	// (Dolt DDL commits per statement): the column is present and nullable
+	// when the clone's pass runs, and the backfill and the default must still
+	// happen.
+	apply := func(t *testing.T, dbName string, interrupted bool) map[string][2]string {
 		t.Helper()
 		dataDir := filepath.Join(t.TempDir(), ".beads", "embeddeddolt")
 		if err := os.MkdirAll(dataDir, 0o755); err != nil {
@@ -84,11 +88,18 @@ func TestMain0072BackfillsUpdatedAtFromCreatedAtDeterministically(t *testing.T) 
 		exec("INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('bf-1', 'i', '', '', '', '', 'open', 2, 'task')")
 		exec("INSERT INTO comments (id, issue_id, author, text, created_at) VALUES ('c-1', 'bf-1', 'a', 'first', '2025-01-01 10:00:00'), ('c-2', 'bf-1', 'b', 'second', '2025-06-01 12:30:00')")
 		exec("DELETE FROM schema_migrations WHERE version >= 72")
+		if interrupted {
+			exec("ALTER TABLE comments ADD COLUMN updated_at DATETIME NULL")
+		}
 		exec("CALL DOLT_ADD('-A')")
 		exec("CALL DOLT_COMMIT('-m', 'test: regress the comments tables and the main cursor to the pre-0072 base')")
 		assertScalar(t, ctx, conn, "SELECT COALESCE(MAX(version),0) FROM schema_migrations", 71)
+		wantNullable := 0
+		if interrupted {
+			wantNullable = 1
+		}
 		assertScalar(t, ctx, conn,
-			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'comments' AND COLUMN_NAME = 'updated_at'", 0)
+			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'comments' AND COLUMN_NAME = 'updated_at' AND IS_NULLABLE = 'YES'", wantNullable)
 
 		// The clone's pass: 0072 adds the columns and backfills updated_at.
 		if _, err := schema.MigrateUp(ctx, conn); err != nil {
@@ -114,10 +125,14 @@ func TestMain0072BackfillsUpdatedAtFromCreatedAtDeterministically(t *testing.T) 
 		return got
 	}
 
-	first := apply(t, "backfilla")
-	second := apply(t, "backfillb")
+	first := apply(t, "backfilla", false)
+	second := apply(t, "backfillb", false)
 	if !reflect.DeepEqual(first, second) {
 		t.Fatalf("two independent applies of 0072 disagree on identical comment rows:\n%v\n%v", first, second)
+	}
+	resumed := apply(t, "backfillc", true)
+	if !reflect.DeepEqual(first, resumed) {
+		t.Fatalf("a replay interrupted after the nullable ADD disagrees with a clean apply:\n%v\n%v", first, resumed)
 	}
 }
 

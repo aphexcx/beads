@@ -1437,7 +1437,6 @@ func TestIgnoredMigration0027MirrorsMain0072WispCommentDDL(t *testing.T) {
 		"INFORMATION_SCHEMA.STATISTICS",
 		// The prepared DDL itself.
 		"'ALTER TABLE wisp_comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '''''",
-		"'ALTER TABLE wisp_comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'",
 		"'CREATE INDEX idx_wisp_comments_external_ref ON wisp_comments (external_ref)'",
 	} {
 		if !strings.Contains(string(ignoredSQL), want) {
@@ -1446,6 +1445,29 @@ func TestIgnoredMigration0027MirrorsMain0072WispCommentDDL(t *testing.T) {
 		if !strings.Contains(string(mainSQL), want) {
 			t.Errorf("main 0072 missing wisp_comments marker %q (companion files drifted)", want)
 		}
+	}
+	// Both companions end with the same updated_at column — NOT NULL, the
+	// CURRENT_TIMESTAMP default and the ON UPDATE — but reach it differently
+	// (gf-pu2 finding 2d): 0072 adds the column nullable, backfills it from
+	// created_at and then MODIFYs it, because its table can hold rows whose
+	// updated_at would otherwise be stamped with each clone's migration time;
+	// 0027 adds it in one step, because it runs on a clone whose wisp_comments
+	// was just created empty, so there is nothing to stamp.
+	const column = "wisp_comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+	if !strings.Contains(string(ignoredSQL), "'ALTER TABLE "+column+"'") {
+		t.Errorf("ignored 0027 missing the one-step updated_at ADD %q", column)
+	}
+	for _, want := range []string{
+		"'ALTER TABLE wisp_comments ADD COLUMN updated_at DATETIME NULL'",
+		"'UPDATE wisp_comments SET updated_at = COALESCE(created_at, ''1970-01-01 00:00:00'') WHERE updated_at IS NULL'",
+		"'ALTER TABLE wisp_comments MODIFY COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'",
+	} {
+		if !strings.Contains(string(mainSQL), want) {
+			t.Errorf("main 0072 missing the three-step updated_at marker %q", want)
+		}
+	}
+	if strings.Contains(string(mainSQL), "'ALTER TABLE "+column+"'") {
+		t.Errorf("main 0072 still carries the one-step updated_at ADD, which stamps existing rows with the migration time")
 	}
 }
 

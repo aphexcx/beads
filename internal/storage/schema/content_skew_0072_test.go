@@ -122,5 +122,12 @@ func TestMigration0072BackfillsUpdatedAtDeterministically(t *testing.T) {
 		if !strings.Contains(text[fill:def], "created_at") {
 			t.Fatalf("%s.updated_at backfill does not read created_at", table)
 		}
+		// The backfill and the default are guarded on the column being
+		// nullable, re-read after the ADD, so a migration interrupted between
+		// the ADD and the MODIFY resumes (Dolt DDL commits per statement).
+		guard := strings.LastIndex(text[:fill], "IS_NULLABLE = 'YES'")
+		if guard < 0 || guard < add {
+			t.Fatalf("%s.updated_at backfill and default are not guarded on the column being nullable after the ADD (guard %d, add %d, fill %d)", table, guard, add, fill)
+		}
 	}
 }

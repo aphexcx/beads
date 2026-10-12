@@ -55,11 +55,24 @@ SET @sql = IF(@needs_add = 1,
     'ALTER TABLE comments ADD COLUMN updated_at DATETIME NULL',
     'SELECT 1');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-SET @sql = IF(@needs_add = 1,
+-- The backfill and the default have their own guard, re-read after the ADD:
+-- Dolt DDL commits per statement (migrations/README.md), so a migration
+-- interrupted after the ADD replays with the column present and nullable,
+-- and the two remaining steps must still run then. A column that is already
+-- NOT NULL (every store that ran an earlier text of this file) skips both.
+SET @needs_default = (
+    SELECT IF(COUNT(*) = 1, 1, 0)
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = 'comments'
+      AND COLUMN_NAME = 'updated_at'
+      AND IS_NULLABLE = 'YES'
+);
+SET @sql = IF(@needs_default = 1,
     'UPDATE comments SET updated_at = created_at WHERE updated_at IS NULL',
     'SELECT 1');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-SET @sql = IF(@needs_add = 1,
+SET @sql = IF(@needs_default = 1,
     'ALTER TABLE comments MODIFY COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
     'SELECT 1');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
@@ -106,14 +119,27 @@ SET @sql = IF(@needs_add = 1,
     'ALTER TABLE wisp_comments ADD COLUMN updated_at DATETIME NULL',
     'SELECT 1');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
--- The same three-step shape as comments.updated_at. wisp_comments.created_at
--- is nullable (0021), so a row without one takes the epoch: deterministic,
--- and the table is clone-local (dolt-ignored) in any case.
-SET @sql = IF(@needs_add = 1,
+-- The same three-step shape as comments.updated_at, with the same resumable
+-- guard on the backfill and the default. wisp_comments.created_at is nullable
+-- (0021), so a row without one takes the epoch: deterministic, and the table
+-- is clone-local (dolt-ignored) in any case. ignored/0027, this file's
+-- companion on the ignored chain, keeps its one-step ADD: it runs on a clone
+-- whose wisp_comments was just created empty, so there is nothing to stamp.
+SET @needs_default = IF(
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisp_comments') > 0
+    AND
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'wisp_comments'
+          AND COLUMN_NAME = 'updated_at'
+          AND IS_NULLABLE = 'YES') = 1,
+    1, 0);
+SET @sql = IF(@needs_default = 1,
     'UPDATE wisp_comments SET updated_at = COALESCE(created_at, ''1970-01-01 00:00:00'') WHERE updated_at IS NULL',
     'SELECT 1');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
-SET @sql = IF(@needs_add = 1,
+SET @sql = IF(@needs_default = 1,
     'ALTER TABLE wisp_comments MODIFY COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
     'SELECT 1');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
