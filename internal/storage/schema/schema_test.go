@@ -77,6 +77,7 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
 	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+	expectNoUpstreamIgnoredBase(mock)
 
 	// MigrateUp re-asserts the canonical dolt_ignore patterns as the first
 	// write of the pass (GH#4378); the rows changed, so a scoped commit lands
@@ -113,12 +114,6 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	}
-
-	// failed0053DirtyTablesAreRecoverable (dolt#11131 recovery gate) reads the
-	// current version first; at 42 (!= 52) the exemption declines and the
-	// dirty-table error path continues unchanged.
-	expectCursorProbe(mock, "schema_migrations", true)
-	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
 	// pendingMigrationDirtyTables re-reads the current version and finds
 	// migration 0043 touches the dirty `dependencies` table.

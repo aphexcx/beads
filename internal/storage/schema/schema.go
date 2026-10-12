@@ -792,25 +792,22 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, needed, seedChanged
 	// Exempt only tables with recorded crash/drift recovery state that the
 	// upcoming rekey will actually rewrite. First-time rewrites must refuse
 	// dirty aux tables here, before any migrations or rekey markers advance.
-	auxRekeyExempt, auxRekeyErr := auxRekeyExemptTables(ctx, db, mainVersionBefore, dirtyBefore)
-	var auxDirtyErr *DirtyTablesError
-	if auxRekeyErr != nil && (mainVersionBefore != 52 || !errors.As(auxRekeyErr, &auxDirtyErr)) {
-		return 0, auxRekeyErr
+	//
+	// There is deliberately NO failed-v53 recovery exemption here any more
+	// (gf-4c9 row 2; upstream dropped its own in #4611). The old predicate
+	// cleared the whole dirty-table set when the cursor read 52, every dirty
+	// table was in an allowed list and wisp_dependencies lacked a 0053 split
+	// column — conditions an operator's ordinary uncommitted edits to issues
+	// or comments on such a store satisfy too, so the final migration commit
+	// could sweep them in. A store stranded by an old binary's failed v49-v53
+	// batch takes the documented manual path (#4567: commit or revert the
+	// working set, then rerun), the same as upstream.
+	auxRekeyExempt, err := auxRekeyExemptTables(ctx, db, mainVersionBefore, dirtyBefore)
+	if err != nil {
+		return 0, err
 	}
 	for name := range auxRekeyExempt {
 		delete(dirtyBefore, name)
-	}
-	if recoverable, err := failed0053DirtyTablesAreRecoverable(ctx, db, dirtyBefore); err != nil {
-		return 0, fmt.Errorf("checking failed v53 migration recovery: %w", err)
-	} else if recoverable {
-		log.Printf("schema migration recovering known failed v53 dirty tables: %s", strings.Join(sortedDirtyTableNames(dirtyBefore), ", "))
-		for table := range dirtyBefore {
-			delete(dirtyBefore, table)
-		}
-	} else if auxRekeyErr != nil {
-		// Only validated historical v53 debris can bypass the first-time
-		// rekey refusal without an aux sentinel; ordinary user edits cannot.
-		return 0, auxRekeyErr
 	}
 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
 	if err != nil {
@@ -1996,65 +1993,4 @@ func commitMigrationStep(ctx context.Context, db DBConn, cursorTable, migrationN
 		}
 	}
 	return nil
-}
-
-func failed0053DirtyTablesAreRecoverable(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState) (bool, error) {
-	if len(dirtyBefore) == 0 {
-		return false, nil
-	}
-	current, err := mainSource.currentVersion(ctx, db)
-	if err != nil {
-		return false, err
-	}
-	if current != 52 {
-		return false, nil
-	}
-
-	allowed := map[string]struct{}{
-		"child_counters": {},
-		"comments":       {},
-		"dependencies":   {},
-		"events":         {},
-		"issues":         {},
-		"labels":         {},
-		// 0051 drops the legacy DEFAULT (UUID()) on these aux tables. In a
-		// single-pass v49->v53 batch (MigrateUp commits once at the end),
-		// that DROP DEFAULT is still uncommitted when 0053 fails, so a
-		// legacy-default DB trips this gate with these tables dirty too.
-		// The change is an idempotent, schema-only DROP DEFAULT, so it is
-		// safe to fold into the recovery commit (#4555).
-		"issue_snapshots":      {},
-		"compaction_snapshots": {},
-	}
-	for table := range dirtyBefore {
-		if _, ok := allowed[table]; !ok {
-			return false, nil
-		}
-	}
-
-	needsRepair, err := wispDependenciesNeed0053Repair(ctx, db)
-	if err != nil {
-		return false, err
-	}
-	return needsRepair, nil
-}
-
-func wispDependenciesNeed0053Repair(ctx context.Context, db DBConn) (bool, error) {
-	table, err := schemaTableExists(ctx, db, "wisp_dependencies")
-	if err != nil {
-		return false, err
-	}
-	if !table {
-		return false, nil
-	}
-	for _, column := range []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
-		present, err := schemaColumnExists(ctx, db, "wisp_dependencies", column)
-		if err != nil {
-			return false, err
-		}
-		if !present {
-			return true, nil
-		}
-	}
-	return false, nil
 }

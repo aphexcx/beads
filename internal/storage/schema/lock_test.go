@@ -387,6 +387,7 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
 	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
+	expectNoUpstreamIgnoredBase(mock)
 	// The seed is the first write of the pass.
 	expectIgnorePatternSeed(mock, latest-1)
 	expectIgnoredCursorHealNoop(mock)
@@ -572,6 +573,7 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
 	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
+	expectNoUpstreamIgnoredBase(mock)
 	expectIgnorePatternSeedNoop(mock, cursor)
 	expectIgnoredCursorHealNoop(mock)
 	// dirtyBeforeAll: `events` dirty (working set only, not staged).
@@ -594,9 +596,6 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	}
-	// The fork's failed-v53 recovery checks the cursor before refusing dirty tables.
-	expectCursorProbe(mock, "schema_migrations", true)
-	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", cursor)
 	// pendingMigrationDirtyTables: cursor read, then pending 0062's SQL
 	// touches `events` -> DirtyTablesError.
 	expectCursorProbe(mock, "schema_migrations", true)
@@ -901,6 +900,7 @@ func TestMigrateUpWithLockFreshBootstrapHealCapabilityIsOneShot(t *testing.T) {
 	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
 	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
+	expectNoUpstreamIgnoredBase(mock)
 	expectIgnorePatternSeedNoop(mock, LatestVersion()-2)
 	expectIgnoredCursorHealNoop(mock)
 	mock.ExpectQuery("(?s)SELECT s\\.table_name, s\\.staged\\s+FROM dolt_status s").

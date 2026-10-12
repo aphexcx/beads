@@ -236,8 +236,10 @@ func auxRekeyExemptTables(ctx context.Context, db DBConn, mainVersionBefore int,
 	}
 	if len(refused) > 0 {
 		sort.Strings(refused)
-		// Preserve the proven recovery subset for callers that also validate
-		// historical main-migration debris before enforcing this refusal.
+		// The exempt set rides along with the refusal so a caller can still
+		// name what WOULD have been exempted; MigrateUp enforces the refusal
+		// as-is (the failed-v53 recovery that once bypassed it is gone,
+		// gf-4c9 row 2).
 		return exempt, &DirtyTablesError{Tables: refused}
 	}
 	return exempt, nil

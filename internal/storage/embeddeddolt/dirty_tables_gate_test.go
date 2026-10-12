@@ -61,16 +61,14 @@ func TestEmbeddedDirtyTablesGate_BlocksReopenThenWorkingSetReconcileRecovers(t *
 
 	// Regress to schema v51, pinned as an absolute version rather than
 	// relative to schema.LatestVersion():
-	//   - not 52: mainSource.currentVersion()==52 routes into the
-	//     failed-v53-migration recovery path (failed0053DirtyTablesAreRecoverable,
-	//     internal/storage/schema/schema.go), which treats a dirty `issues`
-	//     table as expected fallout of a crashed 0053 pass and would swallow
-	//     the guard this test asserts on.
+	//   - not 52: a main cursor of 52 used to route into a failed-v53
+	//     recovery path that treated a dirty `issues` table as fallout of a
+	//     crashed 0053 pass and swallowed this guard; that path is gone
+	//     (gf-4c9 row 2), and 51 keeps this test independent of it either way.
 	//   - absolute (51), not schema.LatestVersion()-2: that expression only
 	//     equals 51 by coincidence of the migration count today. A future
-	//     migration landing would shift it to 52, silently routing this test
-	//     into the recovery path above instead of the guard it means to
-	//     exercise. 51 also still leaves migration 0053 (which alters
+	//     migration landing would shift it, silently changing which pending
+	//     migration this test exercises. 51 also still leaves migration 0053 (which alters
 	//     `issues` via a rig-wisp repair INSERT/UPDATE) pending, so the dirty
 	//     `issues` table is still touched by a pending migration.
 	db, cleanup, err := embeddeddolt.OpenSQL(ctx, dataDir, "testdb", "main")

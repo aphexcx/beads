@@ -89,12 +89,18 @@ func TestAuxRekeyExemptionsRequireRecoveryForTheTable(t *testing.T) {
 	}
 }
 
-func TestFirstTimeAuxRekeyPreservesFailed0053Recovery(t *testing.T) {
-	for _, interrupted := range []bool{true, false} {
-		name := "user_edits_without_recovery_evidence"
-		if interrupted {
-			name = "known_failed_v53"
-		}
+// TestFirstTimeAuxRekeyRefusesDirtyTablesAtMain52 pins gf-4c9 row 2 (gf-9x2
+// codex gate Major at schema.go:803): a main cursor of 52 no longer buys a
+// dirty working set a way past the first-time rekey refusal. The old
+// failed-v53 recovery cleared the whole dirty set when every dirty table was
+// in an allowed list and wisp_dependencies lacked a 0053 split column —
+// conditions an operator's ordinary uncommitted edits to issues or comments
+// on such a store satisfy too — so the final migration commit could sweep
+// them in. Both shapes (a wisp_dependencies that lacks the split column, and
+// one that has it) are refused with *DirtyTablesError, before any migration
+// SQL and without the recovery's extra cursor and column probes.
+func TestFirstTimeAuxRekeyRefusesDirtyTablesAtMain52(t *testing.T) {
+	for _, name := range []string{"user_edits", "historical_failed_v53_shape"} {
 		t.Run(name, func(t *testing.T) {
 			db, mock := newMockDB(t)
 			for range 2 {
@@ -108,24 +114,14 @@ func TestFirstTimeAuxRekeyPreservesFailed0053Recovery(t *testing.T) {
 			for _, pass := range auxRekeyPasses {
 				expectAuxRekeyStateForPass(mock, pass, false)
 			}
-			// Historical main-migration debris predates any aux-rekey sentinel.
-			expectCursorProbe(mock, "schema_migrations", true)
-			expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 52)
-			expectSchemaTableExists(mock, "wisp_dependencies", true)
-			expectColumnProbe(mock, "wisp_dependencies", "depends_on_issue_id", !interrupted)
-			reachedMigration := errors.New("reached migration after validated v53 recovery")
-			if interrupted {
-				mock.ExpectExec(regexp.QuoteMeta(mainSource.bootstrapSQL())).WillReturnError(reachedMigration)
-			} else {
-				expectColumnProbe(mock, "wisp_dependencies", "depends_on_wisp_id", true)
-				expectColumnProbe(mock, "wisp_dependencies", "depends_on_external", true)
-			}
-			_, err := migrateUpAfterReconcile(context.Background(), db, true, false, nil)
+			// No further reads: the refusal is the next thing that happens.
+			applied, err := migrateUpAfterReconcile(context.Background(), db, true, false, nil)
 			var dirtyErr *DirtyTablesError
-			if interrupted && !errors.Is(err, reachedMigration) {
-				t.Fatalf("failed-v53 migration debris was refused before recovery: %v", err)
-			} else if !interrupted && !errors.As(err, &dirtyErr) {
-				t.Fatalf("v52 user edits without recovery evidence must be refused: %v", err)
+			if applied != 0 || !errors.As(err, &dirtyErr) {
+				t.Fatalf("migrateUpAfterReconcile = %d, %v; want *DirtyTablesError at main 52", applied, err)
+			}
+			if len(dirtyErr.Tables) != 1 || dirtyErr.Tables[0] != "comments" {
+				t.Fatalf("dirty tables = %v, want [comments]", dirtyErr.Tables)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatal(err)
