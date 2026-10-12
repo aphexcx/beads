@@ -32,12 +32,34 @@ func ContentHashSkew(local, remote map[int]string) []int {
 		if !ok || localHash == "" || remoteHash == "" {
 			continue
 		}
-		if localHash != remoteHash && !(sanctioned[version][localHash] && sanctioned[version][remoteHash]) {
+		if !contentHashesEquivalent(sanctioned, version, localHash, remoteHash) {
 			skewed = append(skewed, version)
 		}
 	}
 	sort.Ints(skewed)
 	return skewed
+}
+
+// ContentHashesEquivalent reports whether two recorded content hashes for the
+// same main-chain migration version are the SAME lineage: equal, or both
+// sanctioned contents of that version's file (its current bytes and a prior
+// content registered in migrationPriorContentHashes). It is the one
+// equivalence every reader of a recorded hash pair must share — the skew check
+// above, the smart migrate gate behind it, and the merge resolver
+// (versioncontrolops.schemaMigrationsConflictsAreVintageOnly, gf-4c9 codex
+// round 2): two clones that applied 0072 with the old and the new binary
+// carry different row-72 hashes and must still merge. An empty hash on either
+// side is unknown, not skew, and reads as equivalent here as it does in
+// ContentHashSkew.
+func ContentHashesEquivalent(version int, a, b string) bool {
+	if a == "" || b == "" {
+		return true
+	}
+	return contentHashesEquivalent(sanctionedMainContentHashes(), version, a, b)
+}
+
+func contentHashesEquivalent(sanctioned map[int]map[string]bool, version int, a, b string) bool {
+	return a == b || (sanctioned[version][a] && sanctioned[version][b])
 }
 
 // sanctionedMainContentHashes maps each main-chain version that has a

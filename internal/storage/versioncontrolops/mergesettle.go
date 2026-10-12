@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/kvkeys"
+	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 // memoryConfigKeyPrefix is the config-table key prefix under which `bd remember`
@@ -711,11 +712,15 @@ func resolvedConfigConflictKeys(ctx context.Context, db DBConn) ([]string, error
 
 // schemaMigrationsConflictsAreVintageOnly reports whether every conflicted
 // schema_migrations row is the same migration version present on BOTH sides
-// whose content hashes are compatible: equal, or NULL/empty on exactly one side
-// (a pre-#4270 binary recorded the version without a hash, bd-6dnrw.29). Two
-// different non-empty hashes mean the clones applied different content for the
-// same version — the #4259 schema fork — and are never auto-resolved. A row
-// deleted on one side is not a vintage artifact either.
+// whose content hashes are compatible: equal, NULL/empty on exactly one side
+// (a pre-#4270 binary recorded the version without a hash, bd-6dnrw.29), or
+// two sanctioned contents of the same migration file (schema's
+// ContentHashesEquivalent: the pre-gf-4c9 and the guarded 0072 bytes, applied
+// by the old and the new binary from a common pre-0072 ancestor). Two
+// different non-empty hashes outside that equivalence mean the clones applied
+// different content for the same version — the #4259 schema fork — and are
+// never auto-resolved. A row deleted on one side is not a vintage artifact
+// either.
 func schemaMigrationsConflictsAreVintageOnly(ctx context.Context, db DBConn) (bool, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT our_version, their_version, our_content_hash, their_content_hash
@@ -735,7 +740,7 @@ func schemaMigrationsConflictsAreVintageOnly(ctx context.Context, db DBConn) (bo
 			return false, nil
 		}
 		ours, theirs := ourHash.String, theirHash.String
-		if ours != "" && theirs != "" && ours != theirs {
+		if !schema.ContentHashesEquivalent(int(ourVersion.Int64), ours, theirs) {
 			return false, nil // real content skew (#4259) — operator decides
 		}
 	}
