@@ -722,6 +722,245 @@ func TestFrozenEditAllowlistMatchesPriorContentHashes(t *testing.T) {
 	}
 }
 
+// expectNoUpstreamIgnoredBase is the upstream-base fingerprint probe (gf-4c9
+// row 3) answering "cannot fingerprint": the mocked cursor has no content_hash
+// column, so planForkLineageRewrites and classifyUpstreamIgnoredBase stop at
+// the SHOW COLUMNS probe.
+func expectNoUpstreamIgnoredBase(mock sqlmock.Sqlmock) {
+	expectHasContentHashColumn(mock, "ignored_schema_migrations", false)
+}
+
+// expectUpstreamIgnoredBaseFingerprint answers the fingerprint probe from a
+// cursor whose row 25 was recorded by upstream v1.3.1 (its content hash is this
+// lineage's 0028 bytes), so the probe matches on the first row.
+func expectUpstreamIgnoredBaseFingerprint(t *testing.T, mock sqlmock.Sqlmock, table string) {
+	t.Helper()
+	expectHasContentHashColumn(mock, table, true)
+	expectRecordedHash(mock, table, 25, forkFileHash(t, ignoredSource, upstreamIgnoredBaseFiles[25]))
+}
+
+// expectForkIgnoredRows25And26 answers the fingerprint probe from a cursor whose
+// rows 25/26 are the fork's own snapshot migrations: no match on either row.
+func expectForkIgnoredRows25And26(t *testing.T, mock sqlmock.Sqlmock, table string) {
+	t.Helper()
+	expectHasContentHashColumn(mock, table, true)
+	expectRecordedHash(mock, table, 25, forkFileHash(t, ignoredSource, "0025_create_linear_issue_snapshots.up.sql"))
+	expectRecordedHash(mock, table, 26, forkFileHash(t, ignoredSource, "0026_create_linear_project_snapshots.up.sql"))
+}
+
+// TestUpstreamIgnoredBaseFilesAreByteIdenticalToUpstreamsNumbers pins the
+// premise of the fingerprint: this lineage's 0028/0029 ARE upstream v1.3.1's
+// 0025/0026 (the 2026-08 upmerge renumbered them without touching a byte), so
+// a hash recorded by upstream under 25/26 equals the hash of 0028/0029 here.
+func TestUpstreamIgnoredBaseFilesAreByteIdenticalToUpstreamsNumbers(t *testing.T) {
+	for version, file := range upstreamIgnoredBaseFiles {
+		if _, err := ignoredSource.files.ReadFile(ignoredSource.dir + "/" + file); err != nil {
+			t.Fatalf("upstreamIgnoredBaseFiles[%d] = %q is not embedded: %v", version, file, err)
+		}
+		forkFile := map[int]string{25: "0025_create_linear_issue_snapshots.up.sql", 26: "0026_create_linear_project_snapshots.up.sql"}[version]
+		if forkFileHash(t, ignoredSource, file) == forkFileHash(t, ignoredSource, forkFile) {
+			t.Fatalf("version %d: %s and %s hash the same; the fingerprint could not tell upstream's row from the fork's", version, file, forkFile)
+		}
+	}
+}
+
+// TestPlanUpstreamIgnoredBaseCursor_UpstreamHashes_RewritesRows25ToMax is the
+// gf-4c9 row-3 planner: upstream v1.3.1's rows 25/26 (upstream's hashes), the
+// fork's snapshot tables absent, MAX 26 -> delete rows 25-26 so the pass
+// re-runs the fork's 0025-0029.
+func TestPlanUpstreamIgnoredBaseCursor_UpstreamHashes_RewritesRows25ToMax(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectUpstreamIgnoredBaseFingerprint(t, mock, "ignored_schema_migrations")
+	expectMaxVersion(mock, "ignored_schema_migrations", 26)
+	expectTableProbe(mock, "linear_issue_snapshots", false)
+	expectTableProbe(mock, "linear_project_snapshots", false)
+
+	rewrite, err := planUpstreamIgnoredBaseCursor(context.Background(), db)
+	if err != nil {
+		t.Fatalf("planUpstreamIgnoredBaseCursor: %v", err)
+	}
+	if rewrite == nil || rewrite.table != "ignored_schema_migrations" || rewrite.lo != 25 || rewrite.hi != 26 {
+		t.Fatalf("rewrite = %+v, want ignored_schema_migrations rows 25-26", rewrite)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// The fork's own rows 25/26 are not a fingerprint: nothing is planned.
+func TestPlanUpstreamIgnoredBaseCursor_ForkHashes_NoOp(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectForkIgnoredRows25And26(t, mock, "ignored_schema_migrations")
+
+	rewrite, err := planUpstreamIgnoredBaseCursor(context.Background(), db)
+	if err != nil {
+		t.Fatalf("planUpstreamIgnoredBaseCursor: %v", err)
+	}
+	if rewrite != nil {
+		t.Fatalf("rewrite = %+v, want nil on the fork's own rows", rewrite)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// A snapshot table present beside upstream's hashes is a state this binary
+// declines to rewrite.
+func TestPlanUpstreamIgnoredBaseCursor_TablePresent_Refuses(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectUpstreamIgnoredBaseFingerprint(t, mock, "ignored_schema_migrations")
+	expectMaxVersion(mock, "ignored_schema_migrations", 26)
+	expectTableProbe(mock, "linear_issue_snapshots", true)
+
+	_, err = planUpstreamIgnoredBaseCursor(context.Background(), db)
+	if err == nil || !errors.Is(err, errRefusedRewrite) || !strings.Contains(err.Error(), "linear_issue_snapshots") {
+		t.Fatalf("err = %v, want the refusal naming the present table", err)
+	}
+}
+
+// TestPlanForkLineageRewrites_UpstreamIgnoredBase_PlansAfterTheOtherChains
+// drives the whole planner on an upstream-base store: a reconciled main
+// (rows 56 and 73 present, no bd-dn6 fingerprint), an ignored cursor with
+// upstream's 25/26 (row 22 and row 14 present, so no pre-upmerge
+// fingerprint), and the fingerprint read last.
+func TestPlanForkLineageRewrites_UpstreamIgnoredBase_PlansAfterTheOtherChains(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+	expectCursorRowProbe(mock, "schema_migrations", 56, 1)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 1)
+	expectUpstreamIgnoredBaseFingerprint(t, mock, "ignored_schema_migrations")
+	expectMaxVersion(mock, "ignored_schema_migrations", 26)
+	expectTableProbe(mock, "linear_issue_snapshots", false)
+	expectTableProbe(mock, "linear_project_snapshots", false)
+	expectCursorRewrite(mock, "ignored_schema_migrations", 25, 26)
+
+	rewrites, err := planForkLineageCursors(context.Background(), db)
+	if err != nil {
+		t.Fatalf("planForkLineageCursors: %v", err)
+	}
+	if len(rewrites) != 1 || rewrites[0].desc != "upstream-base ignored cursor" {
+		t.Fatalf("rewrites = %+v, want exactly the upstream-base ignored rewrite", rewrites)
+	}
+	changed, err := applyForkLineageRewrites(context.Background(), db, rewrites)
+	if err != nil || !changed {
+		t.Fatalf("applyForkLineageRewrites = %v, %v; want the DELETE of rows 25-26", changed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestVerifyForkLineageState_UpstreamIgnoredBase is the doctor's reading of
+// the same store (fails at 4f3842a0b: the reconciled-range probes find the
+// snapshot tables and row 27 missing and report Inconsistent). At MAX 26 the
+// next pass reconciles it, so it is PreMerge under the upstream-base scheme;
+// at MAX 29 (an older fork binary already advanced it) no pass is pending, so
+// it stays Inconsistent with the clone-local manual step named.
+func TestVerifyForkLineageState_UpstreamIgnoredBase(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		ignoredMax int
+		want       ForkLineageStatus
+	}{
+		{"at upstream's MAX 26: the next pass reconciles", 26, ForkLineagePreMerge},
+		{"already advanced to 29: manual step", 29, ForkLineageInconsistent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			expectCursorProbe(mock, "schema_migrations", true)
+			expectMaxVersion(mock, "schema_migrations", 73)
+			expectCursorProbe(mock, "ignored_schema_migrations", true)
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+			expectTableProbe(mock, "wisps", true)
+			expectTableProbe(mock, "wisp_dependencies", true)
+			expectTableProbe(mock, "events", true)
+			expectTableProbe(mock, "bd_events_journal", true)
+			expectTableProbe(mock, "bd_events_seq", true)
+			expectColumnProbe(mock, "leases", "granted_node", true)
+			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
+			// Upstream's own 0054 row with the lease columns dropped by 0055:
+			// row 55 says upstream lineage, not bd-dn6.
+			expectCursorRowProbe(mock, "schema_migrations", 54, 1)
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 11, 1)
+			expectColumnProbe(mock, "issues", "lease_expires_at", false)
+			expectCursorRowProbe(mock, "schema_migrations", 55, 1)
+			// Merged main (73 with 56) and upstream's ignored 22 with 14.
+			expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+			expectCursorRowProbe(mock, "schema_migrations", 56, 1)
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 1)
+			// Reconciled-range probes: the main chain verifies; the ignored
+			// chain is missing the fork's two tables and (MAX 26) row 27.
+			expectMainReconciledLineageProbes(mock, true)
+			for _, v := range []int{20, 21} {
+				expectCursorRowProbe(mock, "ignored_schema_migrations", v, 1)
+			}
+			expectTableProbe(mock, "linear_issue_snapshots", false)
+			expectTableProbe(mock, "linear_project_snapshots", false)
+			expectLineageDefaultProbe(mock, "wisp_events")
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 25, 1)
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 26, 1)
+			row27 := 0
+			if tc.ignoredMax >= 27 {
+				row27 = 1
+			}
+			expectCursorRowProbe(mock, "ignored_schema_migrations", 27, row27)
+			// The classification probe: upstream's hash on row 25.
+			expectUpstreamIgnoredBaseFingerprint(t, mock, "ignored_schema_migrations")
+
+			report, err := VerifyForkLineageState(context.Background(), db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.Status != tc.want {
+				t.Fatalf("Status = %q, want %q; report: %+v", report.Status, tc.want, report)
+			}
+			if !reflect.DeepEqual(report.PreMergeSchemes, []string{upstreamIgnoredBaseScheme}) {
+				t.Fatalf("PreMergeSchemes = %v, want [%s]", report.PreMergeSchemes, upstreamIgnoredBaseScheme)
+			}
+			if tc.want == ForkLineagePreMerge && len(report.Problems) != 0 {
+				t.Fatalf("Problems = %v, want none for the reconcilable shape", report.Problems)
+			}
+			if tc.want == ForkLineageInconsistent {
+				last := report.Problems[len(report.Problems)-1]
+				if !strings.Contains(last, "DELETE FROM ignored_schema_migrations WHERE version >= 25") {
+					t.Fatalf("Problems = %v, want the clone-local manual step named last", report.Problems)
+				}
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 // TestPlanUpmergeIgnoredCursor_PreUpmergeShape_ComparesRecordedMax is
 // boomtown's 2026-09-11 refusal at the unit level. The pre-upmerge ignored
 // chain (1-13, 20-22) has row 22 without row 14 and a recorded MAX of 22, but
@@ -1173,6 +1412,12 @@ func TestVerifyForkLineageState_PreMergeEffects(t *testing.T) {
 						}
 						expectPreUpmergeIgnoredTailProbes(mock, missingTable)
 					}
+					// A missing snapshot table is also the upstream-1.3.1
+					// ignored-base shape (gf-4c9 row 3): the classifier
+					// reads the fingerprint before settling on Inconsistent.
+					if missing >= 0 && strings.Contains(tc.effects[missing].table, "linear_") && tc.effects[missing].table != "linear_label_snapshots" {
+						expectNoUpstreamIgnoredBase(mock)
+					}
 					report, err := VerifyForkLineageState(context.Background(), db)
 					if err != nil {
 						t.Fatal(err)
@@ -1302,6 +1547,12 @@ func TestVerifyForkLineageState_MixedChains(t *testing.T) {
 				expectColumnProbe(mock, "wisp_comments", "external_ref", true)
 				expectPreUpmergeIgnoredTailProbes(mock, "")
 				expectMainReconciledLineageProbes(mock, tc.missing == "")
+			}
+			// A missing snapshot table is also the upstream-1.3.1 ignored-base
+			// shape (gf-4c9 row 3): the classifier reads the fingerprint
+			// before settling on Inconsistent.
+			if strings.Contains(tc.missing, "linear_issue_snapshots") || strings.Contains(tc.missing, "linear_project_snapshots") {
+				expectNoUpstreamIgnoredBase(mock)
 			}
 			report, err := VerifyForkLineageState(context.Background(), db)
 			if err != nil {

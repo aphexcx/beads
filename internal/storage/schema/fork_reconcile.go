@@ -144,6 +144,124 @@ func migrationContentHashMatches(file, current, recorded string) bool {
 	return false
 }
 
+// ---- upstream v1.3.1 ignored-base reconciliation (gf-4c9 row 3) ----
+//
+// Upstream v1.3.1 records ignored versions 25 (add_events_journal_actor) and
+// 26 (dep_rekey_dedup_marker) — byte-identical to the files this lineage
+// ships as 0028/0029 — while this lineage records 25/26 as the fork's
+// create_linear_issue_snapshots / create_linear_project_snapshots. A database
+// that migrated under upstream v1.3.1 FIRST and then opens under this binary
+// carries rows 25/26 with upstream's content hashes: the MAX-based cursor runs
+// only 27-29, the two snapshot tables are never created, migrate reports
+// current and the doctor reports them missing (gf-9x2 codex gate Medium at
+// ignored/0025:13). Never a renumbering: the fingerprint is the recorded
+// content hash of row 25 or 26 equalling the sha256 of this binary's 0028/0029
+// bytes, and the cure is the same as the other chains — delete rows
+// 25..MAX(version) so the same pass re-runs 25-29: the fork's 25/26 create the
+// tables (CREATE TABLE IF NOT EXISTS), 27 and 28 are INFORMATION_SCHEMA-guarded
+// no-ops on this shape, 29 is a marker. Rows recorded before the content_hash
+// column shipped carry NULL and cannot fingerprint; upstream v1.3.x has
+// recorded hashes since #4259, before its 0025 existed, so that shape does not
+// arise from a v1.3.1 base.
+//
+// The planner only runs on a pass that has migration work (MigrateUp gates it
+// on migrationWorkNeeded), which an upstream-base store at 25/26 always has
+// (27-29 pending). A store that an older fork binary already advanced to 29 on
+// top of upstream's rows has no pending work; VerifyForkLineageState names
+// that shape and its clone-local manual step instead of promising a rewrite.
+const upstreamIgnoredBaseScheme = "upstream-1.3.1 ignored base"
+
+// upstreamIgnoredBaseMax is upstream v1.3.1's ignored MAX(version): a store at
+// or below it still has fork rows pending, so the next pass reconciles it.
+const upstreamIgnoredBaseMax = 26
+
+// upstreamIgnoredBaseFiles maps upstream v1.3.1's ignored cursor rows to the
+// files of this lineage that carry the byte-identical content.
+var upstreamIgnoredBaseFiles = map[int]string{
+	25: "0028_add_events_journal_actor.up.sql",
+	26: "0029_dep_rekey_dedup_marker.up.sql",
+}
+
+// hasUpstreamIgnoredBaseCursorFrom reports whether src's row 25 or 26 was
+// recorded by upstream v1.3.1: its content_hash equals the hash of the file
+// this lineage ships as 0028/0029. A cursor without the content_hash column,
+// or rows with NULL hashes, cannot fingerprint and read as false.
+func hasUpstreamIgnoredBaseCursorFrom(ctx context.Context, db DBConn, src migrationSource) (bool, error) {
+	hasHash, err := src.hasContentHashColumn(ctx, db)
+	if err != nil || !hasHash {
+		return false, err
+	}
+	versions := make([]int, 0, len(upstreamIgnoredBaseFiles))
+	for v := range upstreamIgnoredBaseFiles {
+		versions = append(versions, v)
+	}
+	sort.Ints(versions)
+	for _, version := range versions {
+		var recorded sql.NullString
+		//nolint:gosec // G202: src.cursorTable is one of the hardcoded cursor table names.
+		err := db.QueryRowContext(ctx,
+			"SELECT content_hash FROM "+src.cursorTable+" WHERE version = ?", version).Scan(&recorded)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			if dberrors.IsTableNotExist(err) {
+				return false, nil
+			}
+			return false, fmt.Errorf("reading %s content hash for version %d: %w", src.cursorTable, version, err)
+		}
+		if !recorded.Valid || recorded.String == "" {
+			continue
+		}
+		data, err := src.files.ReadFile(src.dir + "/" + upstreamIgnoredBaseFiles[version])
+		if err != nil {
+			return false, fmt.Errorf("reading embedded %s: %w", upstreamIgnoredBaseFiles[version], err)
+		}
+		sum := sha256.Sum256(data)
+		if recorded.String == hex.EncodeToString(sum[:]) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func upstreamIgnoredBaseAbsentProbes(ctx context.Context, db DBConn) []lineageEffectProbe {
+	// The fork's 25/26 never ran on this shape, so their tables must be
+	// ABSENT; a present table beside upstream's hashes is a state this
+	// binary declines to rewrite.
+	return []lineageEffectProbe{
+		{"table linear_issue_snapshots (fork ignored 0025)", func() (bool, error) { return tableExists(ctx, db, "linear_issue_snapshots") }},
+		{"table linear_project_snapshots (fork ignored 0026)", func() (bool, error) { return tableExists(ctx, db, "linear_project_snapshots") }},
+	}
+}
+
+func planUpstreamIgnoredBaseCursor(ctx context.Context, db DBConn) (*cursorRewrite, error) {
+	return planUpstreamIgnoredBaseCursorFrom(ctx, db, ignoredSource)
+}
+
+func planUpstreamIgnoredBaseCursorFrom(ctx context.Context, db DBConn, src migrationSource) (*cursorRewrite, error) {
+	base, err := hasUpstreamIgnoredBaseCursorFrom(ctx, db, src)
+	if err != nil || !base {
+		return nil, err
+	}
+	current, err := cursorMaxVersion(ctx, db, src.cursorTable)
+	if err != nil {
+		return nil, err
+	}
+	for _, probe := range upstreamIgnoredBaseAbsentProbes(ctx, db) {
+		present, err := probe.ok()
+		if err != nil {
+			return nil, fmt.Errorf("verifying upstream-base lineage (%s): %w", probe.desc, err)
+		}
+		if present {
+			return nil, fmt.Errorf(
+				"ignored_schema_migrations rows 25-26 carry upstream v1.3.1 content hashes but %s is present; schema does not match the recorded cursor — %w",
+				probe.desc, errRefusedRewrite)
+		}
+	}
+	return &cursorRewrite{desc: "upstream-base ignored cursor", table: ignoredSource.cursorTable, lo: 25, hi: current}, nil
+}
+
 // cursorRewrite is one verified fork-cursor rewrite. The reconcile pass is
 // split into a planning half that only READS (every fingerprint probe, every
 // schema probe and every content-hash cross-check, for every chain) and an
@@ -430,6 +548,7 @@ func forkIgnoredCursorSource(ctx context.Context, db DBConn) (migrationSource, e
 // cursor rewrites to apply, in apply order. It issues no writes.
 func planForkLineageRewrites(ctx context.Context, db DBConn) ([]cursorRewrite, error) {
 	var rewrites []cursorRewrite
+	ignoredPlanned := false
 
 	preMain, err := planForkMainCursor(ctx, db)
 	if err != nil {
@@ -452,6 +571,7 @@ func planForkLineageRewrites(ctx context.Context, db DBConn) ([]cursorRewrite, e
 		}
 		if preIgnored != nil {
 			rewrites = append(rewrites, *preIgnored)
+			ignoredPlanned = true
 		}
 	}
 
@@ -473,6 +593,20 @@ func planForkLineageRewrites(ctx context.Context, db DBConn) ([]cursorRewrite, e
 	}
 	if upIgnored != nil {
 		rewrites = append(rewrites, *upIgnored)
+	}
+	// The upstream v1.3.1 ignored base (gf-4c9 row 3) is probed only when no
+	// other ignored rewrite was planned: the shapes are mutually exclusive
+	// (bd-dn6 MAX 11, pre-upmerge MAX 22, upstream base rows 25/26 with
+	// upstream's hashes), and a chain already being rewritten needs no second
+	// fingerprint read.
+	if !ignoredPlanned && upIgnored == nil {
+		upBase, err := planUpstreamIgnoredBaseCursorFrom(ctx, db, ignoredCursor)
+		if err != nil {
+			return nil, err
+		}
+		if upBase != nil {
+			rewrites = append(rewrites, *upBase)
+		}
 	}
 	return rewrites, nil
 }
@@ -1033,6 +1167,9 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 		}
 	}
 	if len(report.Problems) > 0 {
+		if classified, err := classifyUpstreamIgnoredBase(ctx, db, &report); err != nil || classified {
+			return report, err
+		}
 		report.Status = ForkLineageInconsistent
 		return report, nil
 	}
@@ -1058,11 +1195,52 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 		}
 	}
 	if len(report.Problems) > 0 {
+		if classified, err := classifyUpstreamIgnoredBase(ctx, db, &report); err != nil || classified {
+			return report, err
+		}
 		report.Status = ForkLineageInconsistent
 		return report, nil
 	}
 	report.Status = ForkLineageReconciled
 	return report, nil
+}
+
+// classifyUpstreamIgnoredBase re-reads a report whose reconciled-range probes
+// found the fork's snapshot tables (or the cursor rows after them) missing and
+// asks whether the ignored cursor was recorded by upstream v1.3.1
+// (hasUpstreamIgnoredBaseCursorFrom). It only fires when EVERY problem is one
+// of that shape's, so an unrelated drift is never relabeled. A fingerprinted
+// cursor at or below upstreamIgnoredBaseMax becomes PreMerge — the next
+// migration pass reconciles it (planUpstreamIgnoredBaseCursor). One already
+// advanced past it by an older fork binary has no pending work, so the
+// reconciler never runs: it stays Inconsistent with the clone-local manual
+// step named. Returns whether the report was classified.
+func classifyUpstreamIgnoredBase(ctx context.Context, db DBConn, report *ForkLineageReport) (bool, error) {
+	if len(report.Problems) == 0 {
+		return false, nil
+	}
+	for _, problem := range report.Problems {
+		if !strings.Contains(problem, "linear_issue_snapshots") &&
+			!strings.Contains(problem, "linear_project_snapshots") &&
+			!strings.Contains(problem, "cursor row 0027") {
+			return false, nil
+		}
+	}
+	base, err := hasUpstreamIgnoredBaseCursorFrom(ctx, db, ignoredSource)
+	if err != nil || !base {
+		return false, err
+	}
+	report.PreMergeSchemes = append(report.PreMergeSchemes, upstreamIgnoredBaseScheme)
+	if report.IgnoredCursorMax <= upstreamIgnoredBaseMax {
+		report.Problems = nil
+		report.Status = ForkLineagePreMerge
+		return true, nil
+	}
+	report.Problems = append(report.Problems, fmt.Sprintf(
+		"ignored_schema_migrations rows 25-26 carry upstream v1.3.1 content hashes (this lineage's 0028/0029) but the cursor is already at %d, so no migration pass is pending and the reconciler cannot re-run the fork's 0025-0029; on this clone (the ignored cursor is clone-local) run DELETE FROM ignored_schema_migrations WHERE version >= 25, then any bd write command",
+		report.IgnoredCursorMax))
+	report.Status = ForkLineageInconsistent
+	return true, nil
 }
 
 // indexExists reports whether the named index is present on table.

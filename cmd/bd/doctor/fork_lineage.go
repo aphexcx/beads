@@ -157,7 +157,7 @@ func classifyForkMigrationLineage(ctx context.Context, db schema.DBConn) (schema
 				"Pre-merge fork migration cursor detected (main=v%d, ignored=v%d)",
 				report.MainVersion, report.IgnoredVersion),
 			Detail: fmt.Sprintf(
-				"This database shows the %s %s. The next bd write command will reconcile the cursor and apply pending upstream migrations. Supported renumberings: bd-dn6 (fork 0051-0054 → 0070-0073, ignored 0010-0011 → 0020-0021 before the upmerge, now 0025-0026); 2026-08 upmerge (main 0070-0073 re-recorded after upstream 0056-0066, ignored 0020-0022 → 0025-0027).",
+				"This database shows the %s %s. The next bd write command will reconcile the cursor and apply pending upstream migrations. Supported renumberings: bd-dn6 (fork 0051-0054 → 0070-0073, ignored 0010-0011 → 0020-0021 before the upmerge, now 0025-0026); 2026-08 upmerge (main 0070-0073 re-recorded after upstream 0056-0066, ignored 0020-0022 → 0025-0027); upstream-1.3.1 ignored base (rows 25-26 recorded by upstream v1.3.1 with the bytes this lineage ships as 0028-0029: rows 25 onward re-run as the fork's 0025-0029, no renumbering).",
 				strings.Join(report.PreMergeSchemes, " and "), schemeWord),
 			Fix:      "Run any bd write command (e.g. `bd migrate`) with the new binary to reconcile.",
 			Category: CategoryData,
