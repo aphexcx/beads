@@ -148,6 +148,11 @@ func TestCheckForkMigrationLineage_CursorSchemes(t *testing.T) {
 			query("SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", tc.ignoredMax)
 			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "wisps")
 			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "wisp_dependencies")
+			// upstream #6547 (v1.3.1) added events/bd_events_journal/bd_events_seq to the
+			// cursorRealityFloor sentinel set; the floor probes them before the columns.
+			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "events")
+			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "bd_events_journal")
+			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "bd_events_seq")
 			query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 0, "leases", "granted_node")
 			query("SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", tc.ignoredMax)
 			row("schema_migrations", 54, 1)
@@ -267,6 +272,10 @@ func TestCheckForkMigrationLineage_MixedChainMissingMainEffect(t *testing.T) {
 	query("SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", 22)
 	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "wisps")
 	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "wisp_dependencies")
+	// upstream #6547 (v1.3.1): the three event tables join the sentinel floor set.
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "events")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "bd_events_journal")
+	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES", 1, "bd_events_seq")
 	query("SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS", 0, "leases", "granted_node")
 	query("SELECT COALESCE(MAX(version), 0) FROM ignored_schema_migrations", 22)
 	row("schema_migrations", 54, 1)
