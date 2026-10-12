@@ -518,6 +518,9 @@ func UnsetUserYamlConfig(key string) error {
 	}
 
 	newContent := commentOutYamlKey(string(content), key)
+	if err := validateUnsetResult(newContent, key); err != nil {
+		return err
+	}
 
 	// Preserve the owner-private 0600 posture every other user-global writer
 	// uses (SetUserYamlConfig, setYamlConfigAtPath, the metrics bootstrap);
@@ -594,6 +597,9 @@ func UnsetYamlConfig(key string) error {
 	}
 
 	newContent := commentOutYamlKey(string(content), key)
+	if err := validateUnsetResult(newContent, key); err != nil {
+		return err
+	}
 
 	if err := os.WriteFile(configPath, []byte(newContent), 0600); err != nil { //nolint:gosec // configPath is validated
 		return fmt.Errorf("failed to write config.yaml: %w", err)
@@ -889,6 +895,66 @@ func scalarStyleFor(value string) yaml.Style {
 	return 0
 }
 
+// validateUnsetResult parses what an unset is about to write. A key whose
+// value is a block (a nested mapping or a list) used to be commented out on
+// its key line alone, leaving its contents indented under a comment: the
+// command reported success and the next bd command failed to read its config
+// (gf-pu2 finding 2e; upstream fixed the same matcher in 29aba4f8b, #5760).
+// commentOutYamlKey now takes the whole value with the key, and this check is
+// the fence behind it: a result that does not parse is an error and nothing
+// is written.
+func validateUnsetResult(content, key string) error {
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &node); err != nil {
+		return fmt.Errorf("unsetting %s would leave config.yaml unparseable; nothing written: %w", key, err)
+	}
+	return nil
+}
+
+// yamlValueContinuesBelow reports whether a key line's value is the block
+// beneath it rather than a scalar on the line: nothing after the colon, or
+// only a comment, an anchor, a tag, or a block scalar indicator. Such a key is
+// unset together with every line of that block.
+func yamlValueContinuesBelow(line string) bool {
+	_, rest, found := strings.Cut(strings.TrimLeft(line, " \t"), ":")
+	if !found {
+		return false
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return true
+	}
+	switch rest[0] {
+	case '#', '&', '!', '|', '>':
+		return true
+	}
+	return false
+}
+
+// commentOutYamlValueBlock appends to result, commented out, every line of the
+// block value that belongs to the key at keyIndent — lines indented deeper,
+// and list items at the key's own indentation — and returns the index of the
+// first line that does not. The comment marker sits at the key's indentation
+// and the line keeps its own indentation past it, so the commented block
+// still reads as the key's value. Blank lines inside the block are kept as
+// they are.
+func commentOutYamlValueBlock(result *[]string, lines []string, from, keyIndent int) int {
+	i := from
+	for ; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimLeft(line, " \t")
+		switch {
+		case strings.TrimSpace(line) == "":
+			*result = append(*result, line)
+		case lineIndent(line) > keyIndent, lineIndent(line) == keyIndent && (strings.HasPrefix(trimmed, "- ") || trimmed == "-"):
+			*result = append(*result, strings.Repeat(" ", keyIndent)+"# "+line[keyIndent:])
+		default:
+			return i
+		}
+	}
+	return i
+}
+
 func commentOutYamlKey(content, key string) string {
 	// The flat spelling first — a key literally named "sync.remote", which
 	// older files carry and which this function has always handled.
@@ -913,9 +979,13 @@ func commentOutYamlKey(content, key string) string {
 	// `remote: keep-this` inside it is prose, and commenting it out edits their
 	// data. Matching by line has to skip those lines to stay honest.
 	blockIndent := -1
+	var lines []string
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	for scanner.Scan() {
-		line := scanner.Text()
+		lines = append(lines, scanner.Text())
+	}
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
 
 		if blockIndent >= 0 {
 			if strings.TrimSpace(line) == "" || lineIndent(line) > blockIndent {
@@ -928,6 +998,13 @@ func commentOutYamlKey(content, key string) string {
 
 		if matches := flatPattern.FindStringSubmatch(line); matches != nil {
 			result = append(result, matches[1]+"# "+strings.TrimLeft(line, " \t"))
+			// A value that is the block beneath the key goes with it: a
+			// nested mapping or a list left indented under a comment does
+			// not parse (gf-pu2 finding 2e).
+			if yamlValueContinuesBelow(line) {
+				i = commentOutYamlValueBlock(&result, lines, i+1, lineIndent(line)) - 1
+				blockIndent = -1
+			}
 			continue
 		}
 
@@ -943,6 +1020,10 @@ func commentOutYamlKey(content, key string) string {
 					if depth == len(segments)-1 {
 						result = append(result, strings.Repeat(" ", indent)+"# "+strings.TrimLeft(line, " \t"))
 						depth, indents = 0, nil
+						if yamlValueContinuesBelow(line) {
+							i = commentOutYamlValueBlock(&result, lines, i+1, indent) - 1
+							blockIndent = -1
+						}
 						continue
 					}
 					indents = append(indents, indent)
