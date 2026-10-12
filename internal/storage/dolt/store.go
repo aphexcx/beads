@@ -1257,6 +1257,17 @@ func (s *DoltStore) commitWriteTx(ctx context.Context, fn func(tx *sql.Tx) error
 // the corrected flag reaches history the way the close's own rows did rather
 // than sitting dirty in the working set.
 //
+// The Dolt commit is minted AFTER the recheck's SQL transaction has
+// committed (doltAddAndCommitPostTx), never inside it: DOLT_ADD stages the
+// whole issues table from the session's BEGIN-time root, so a dolt commit
+// built inside the open transaction wrote every row a concurrent writer
+// committed during the recheck back to its BEGIN-time value — the
+// lost-update ordering runIssueOperationTxWithMessage documents and
+// TestIssueOperationDoltCommitRunsAfterTxCommit pins (gf-jr0 finding 2b;
+// upstream e352b96d6, #6719, carried here as a patch). A failed post-tx
+// commit leaves the corrected rows in the working set for the next commit
+// on the branch, exactly as the mutation path's does.
+//
 // It runs on issueops.BlockedRecheckContext: the write it follows is durable,
 // so the repair must outlive that write's cancellation, and a recheck must
 // never start another recheck. The returned failure is for the caller to log,
@@ -1267,14 +1278,19 @@ func (s *DoltStore) recheckBlockedAfterCommit(ctx context.Context, pending issue
 	}
 	ctx, cancel := issueops.BlockedRecheckContext(ctx)
 	defer cancel()
+	var changed bool
 	err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		result, err := issueops.RecomputeIsBlockedInTxWithResult(ctx, tx, pending.IssueIDs, pending.WispIDs)
-		if err != nil || !result.IssueRowsChanged {
-			return err
-		}
-		return s.doltAddAndCommitInTx(ctx, tx, []string{"issues"}, pending.CommitMessage())
+		changed = err == nil && result.IssueRowsChanged
+		return err
 	})
 	if err != nil {
+		return issueops.BlockedRecheckFailed(err)
+	}
+	if !changed {
+		return nil
+	}
+	if err := s.doltAddAndCommitPostTx(ctx, []string{"issues"}, pending.CommitMessage()); err != nil {
 		return issueops.BlockedRecheckFailed(err)
 	}
 	return nil

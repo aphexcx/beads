@@ -74,6 +74,9 @@ type seqConnector struct {
 	// commitErr, when set, can fail the driver-level tx COMMIT after it is
 	// recorded (for exercising the ambiguous commit-phase path).
 	commitErr func() error
+	// execResult, when set, serves the result of a matching ExecContext
+	// (its rows-affected count) instead of the default one row.
+	execResult func(query string) (driver.Result, bool)
 }
 
 func (c *seqConnector) Connect(context.Context) (driver.Conn, error) {
@@ -106,6 +109,11 @@ func (c *seqConn) ExecContext(_ context.Context, query string, _ []driver.NamedV
 	if c.parent.queryErr != nil {
 		if err := c.parent.queryErr(query); err != nil {
 			return nil, err
+		}
+	}
+	if c.parent.execResult != nil {
+		if result, ok := c.parent.execResult(query); ok {
+			return result, nil
 		}
 	}
 	return driver.RowsAffected(1), nil
