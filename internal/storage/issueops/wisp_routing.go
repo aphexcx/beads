@@ -248,5 +248,9 @@ func DeleteCascadeTables(isWisp bool) []string {
 		// issues(id) ON DELETE CASCADE, so deleting an ordinary issue also
 		// drops the wisp edges that depended on it.
 		"wisp_dependencies",
+		// Fork (0070): linear_label_snapshots.issue_id points at issues(id)
+		// ON DELETE CASCADE. The migration stays on the lineage (the stores
+		// recorded it) although the Linear tracker itself is no longer carried.
+		"linear_label_snapshots",
 	}
 }

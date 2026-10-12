@@ -671,6 +671,11 @@ func TestMigrateUpForkLineageRefusalPrecedesOpenTimeRepairs(t *testing.T) {
 	expectMaxVersion(mock, "ignored_schema_migrations", 22)
 	expectTableProbe(mock, "wisps", true)
 	expectTableProbe(mock, "wisp_dependencies", true)
+	// upstream #6547 (v1.3.1): the three event tables join the ignored
+	// plane's sentinel floor; the floor probes them before the columns.
+	expectTableProbe(mock, "events", true)
+	expectTableProbe(mock, "bd_events_journal", true)
+	expectTableProbe(mock, "bd_events_seq", true)
 	expectColumnProbe(mock, "leases", "granted_node", false)
 
 	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
@@ -806,6 +811,11 @@ func TestVerifyForkLineageState_Upmerge(t *testing.T) {
 			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
 			expectTableProbe(mock, "wisps", true)
 			expectTableProbe(mock, "wisp_dependencies", true)
+			// upstream #6547 (v1.3.1): the three event tables join the ignored
+			// plane's sentinel floor; the floor probes them before the columns.
+			expectTableProbe(mock, "events", true)
+			expectTableProbe(mock, "bd_events_journal", true)
+			expectTableProbe(mock, "bd_events_seq", true)
 			expectColumnProbe(mock, "leases", "granted_node", !tc.healedIgnored)
 			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredMax)
 			expectCursorRowProbe(mock, "schema_migrations", 54, 1)
@@ -1111,6 +1121,11 @@ func TestVerifyForkLineageState_MixedChains(t *testing.T) {
 			if tc.ignoredVersion > 0 {
 				expectTableProbe(mock, "wisps", true)
 				expectTableProbe(mock, "wisp_dependencies", true)
+				// upstream #6547 (v1.3.1): the three event tables join the ignored
+				// plane's sentinel floor; the floor probes them before the columns.
+				expectTableProbe(mock, "events", true)
+				expectTableProbe(mock, "bd_events_journal", true)
+				expectTableProbe(mock, "bd_events_seq", true)
 				expectColumnProbe(mock, "leases", "granted_node", true)
 			}
 			expectMaxVersion(mock, "ignored_schema_migrations", tc.ignoredVersion)
@@ -1237,6 +1252,11 @@ func TestVerifyForkLineageState_PreUpmergeTailEffects(t *testing.T) {
 			if !tc.main {
 				expectTableProbe(mock, "wisps", true)
 				expectTableProbe(mock, "wisp_dependencies", true)
+				// upstream #6547 (v1.3.1): the three event tables join the ignored
+				// plane's sentinel floor; the floor probes them before the columns.
+				expectTableProbe(mock, "events", true)
+				expectTableProbe(mock, "bd_events_journal", true)
+				expectTableProbe(mock, "bd_events_seq", true)
 				expectColumnProbe(mock, "leases", "granted_node", false)
 			}
 			expectMaxVersion(mock, "ignored_schema_migrations", ignoredMax)

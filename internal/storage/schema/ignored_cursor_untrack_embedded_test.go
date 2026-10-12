@@ -93,6 +93,11 @@ func testInterruptedCursorRestore(t *testing.T, after string, tracked bool) {
 		"INSERT INTO dolt_ignore VALUES ('ignored_schema_migrations', true), ('local_metadata', true), ('wisp_%', true)",
 		"CREATE TABLE wisps (id INT PRIMARY KEY)",
 		"CREATE TABLE wisp_dependencies (id INT PRIMARY KEY)",
+		// upstream #6547 (v1.3.1): the three event tables are sentinel-floored
+		// on the ignored plane; a fixture without them replays from 0019.
+		"CREATE TABLE events (id INT PRIMARY KEY)",
+		"CREATE TABLE bd_events_journal (id INT PRIMARY KEY)",
+		"CREATE TABLE bd_events_seq (id INT PRIMARY KEY)",
 		"CREATE TABLE leases (id INT PRIMARY KEY, granted_node TEXT)",
 	} {
 		if _, err := db.ExecContext(ctx, query); err != nil {

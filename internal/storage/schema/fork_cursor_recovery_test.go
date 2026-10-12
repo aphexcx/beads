@@ -136,6 +136,11 @@ func TestForkCursorRecoveryPlansRestoredRows(t *testing.T) {
 				expectMaxVersion(mock, ignoredSource.cursorTable, remaining)
 				expectTableProbe(mock, "wisps", true)
 				expectTableProbe(mock, "wisp_dependencies", true)
+				// upstream #6547 (v1.3.1): the three event tables join the ignored
+				// plane's sentinel floor; the floor probes them before the columns.
+				expectTableProbe(mock, "events", true)
+				expectTableProbe(mock, "bd_events_journal", true)
+				expectTableProbe(mock, "bd_events_seq", true)
 				expectColumnProbe(mock, "leases", "granted_node", false)
 				pending, err := PendingIgnoredVersions(ctx, db)
 				if err != nil {
