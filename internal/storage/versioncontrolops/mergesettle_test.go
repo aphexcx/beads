@@ -114,3 +114,40 @@ func TestSchemaMigrationsConflictsAreVintageOnly_EqualOrEmptyHashes(t *testing.T
 		t.Fatalf("equal hashes and NULL-on-one-side rows are vintage-only, got false")
 	}
 }
+
+// The two sanctioned contents of migration 0066 (gf-jr0, finding 2a): the
+// bytes upstream v1.3.1 ships and the bytes this lineage ships, which differ
+// by one comment line. An upstream-origin store meeting one of ours carries
+// different row-66 hashes and must still merge.
+const (
+	hash0066Upstream = "a524d42ba0eced9350edbf6402dc2952957ff8f75a896bc8339c4cbc8596c793"
+	hash0066Current  = "4fcb31077205ecb9c6e6fa2890aa2b4cf9dabf96cd0498ecac1c7a6d97a651c7"
+)
+
+// TestSchemaMigrationsConflictsAreVintageOnly_SanctionedHashPairMerges0066
+// pins the gf-4c9 round-2 gate's Major on 0066: the sanctioned-pair
+// equivalence covered 0072 only, so a schema_migrations conflict between
+// upstream's row 66 and ours stayed an operator decision.
+func TestSchemaMigrationsConflictsAreVintageOnly_SanctionedHashPairMerges0066(t *testing.T) {
+	if !schema.ContentHashesEquivalent(66, hash0066Upstream, hash0066Current) {
+		t.Fatalf("schema does not sanction the 0066 hash pair (%s, %s)", hash0066Upstream, hash0066Current)
+	}
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(regexp.QuoteMeta(schemaMigrationsConflictsSQL)).
+		WillReturnRows(schemaMigrationsConflictRows([]driver.Value{66, 66, hash0066Upstream, hash0066Current}))
+
+	ok, err := schemaMigrationsConflictsAreVintageOnly(context.Background(), db)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("a conflict between the two sanctioned 0066 contents must be vintage-only (auto-resolvable), got false")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}

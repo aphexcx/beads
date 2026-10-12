@@ -123,6 +123,16 @@ var upmergeMainFiles = map[int]string{
 // pair for the hygiene check. TestFrozenEditAllowlistMatchesPriorContentHashes
 // keeps the two in step.
 var migrationPriorContentHashes = map[string][]string{
+	// Upstream v1.3.1's bytes: this lineage's file differs by one comment
+	// line naming the renumbered ignored-series twin (ignored/0028 here,
+	// ignored/0025 upstream; the fork's edit of 2026-08-30). Every
+	// upstream-origin store, and every store that ran 0066 before that edit,
+	// recorded this hash as row 66; the registry covered 0072 only, so such a
+	// store read as a schema fork against ours (gf-jr0, finding 2a). The
+	// audit of every migration file against upstream v1.3.1 found 0066 the
+	// only comment-only edit (the other differences are the fork's own added
+	// files and the byte-identical ignored renames 0025->0028, 0026->0029).
+	"0066_add_events_journal_actor.up.sql": {"a524d42ba0eced9350edbf6402dc2952957ff8f75a896bc8339c4cbc8596c793"},
 	// The pre-gf-4c9 bytes (COLUMNS-only probes on the three wisp statements),
 	// recorded as row 72 by every store that migrated through the fork
 	// lineage before 2026-10-12.

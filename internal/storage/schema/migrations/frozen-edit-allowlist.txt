@@ -11,5 +11,9 @@
 # An in-place edit is sanctioned ONLY for a statement that fails before any
 # later migration could fix it forward (the migration itself cannot complete,
 # so a new version number never gets a chance to run). Everything else is
-# fix-forward with a new migration, as check C says.
+# fix-forward with a new migration, as check C says. The one exception on
+# record is 0066, a comment-only edit that predates this list (2026-08-30):
+# registered so an upstream-origin store's row 66 reads as this lineage, not
+# as a fork; no further comment edits of shipped files are sanctioned.
+0066_add_events_journal_actor.up.sql a524d42ba0eced9350edbf6402dc2952957ff8f75a896bc8339c4cbc8596c793 gf-jr0 finding 2a: upstream v1.3.1's bytes; this lineage's file differs by one comment line naming the renumbered ignored twin (ignored/0028 here, ignored/0025 upstream), an edit of 2026-08-30 that predates the registry
 0072_add_comment_external_ref.up.sql ef072196333301e0fa50a0d6eac9f23f529da8e04b5586d96c753a37da0d78c2 gf-4c9 row 1: the three wisp_comments statements gain a table-existence guard; a clone of an upstream-shaped base has no clone-local wisp_comments when main 0072 runs (the ignored chain runs after), so the prepared ALTER failed the first open and no fix-forward migration could ever run
