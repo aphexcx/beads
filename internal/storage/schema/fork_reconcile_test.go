@@ -881,12 +881,15 @@ func TestPlanForkLineageRewrites_UpstreamIgnoredBase_PlansAfterTheOtherChains(t 
 // it stays Inconsistent with the clone-local manual step named.
 func TestVerifyForkLineageState_UpstreamIgnoredBase(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		ignoredMax int
-		want       ForkLineageStatus
+		name         string
+		ignoredMax   int
+		projectTable bool // the fork's second snapshot table present: the planner refuses
+		want         ForkLineageStatus
 	}{
-		{"at upstream's MAX 26: the next pass reconciles", 26, ForkLineagePreMerge},
-		{"already advanced to 29: manual step", 29, ForkLineageInconsistent},
+		{"at upstream's MAX 26: the next pass reconciles", 26, false, ForkLineagePreMerge},
+		{"an older fork pass stopped at 28: 29 still pending, the next pass reconciles", 28, false, ForkLineagePreMerge},
+		{"already advanced to the latest 29: manual step", 29, false, ForkLineageInconsistent},
+		{"one snapshot table present: the planner would refuse, no promise", 26, true, ForkLineageInconsistent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db, mock, err := sqlmock.New()
@@ -923,7 +926,7 @@ func TestVerifyForkLineageState_UpstreamIgnoredBase(t *testing.T) {
 				expectCursorRowProbe(mock, "ignored_schema_migrations", v, 1)
 			}
 			expectTableProbe(mock, "linear_issue_snapshots", false)
-			expectTableProbe(mock, "linear_project_snapshots", false)
+			expectTableProbe(mock, "linear_project_snapshots", tc.projectTable)
 			expectLineageDefaultProbe(mock, "wisp_events")
 			expectCursorRowProbe(mock, "ignored_schema_migrations", 25, 1)
 			expectCursorRowProbe(mock, "ignored_schema_migrations", 26, 1)
@@ -932,8 +935,11 @@ func TestVerifyForkLineageState_UpstreamIgnoredBase(t *testing.T) {
 				row27 = 1
 			}
 			expectCursorRowProbe(mock, "ignored_schema_migrations", 27, row27)
-			// The classification probe: upstream's hash on row 25.
-			expectUpstreamIgnoredBaseFingerprint(t, mock, "ignored_schema_migrations")
+			// The classification probe (upstream's hash on row 25) runs only
+			// when both tables are absent, the planner's own precondition.
+			if !tc.projectTable {
+				expectUpstreamIgnoredBaseFingerprint(t, mock, "ignored_schema_migrations")
+			}
 
 			report, err := VerifyForkLineageState(context.Background(), db)
 			if err != nil {
@@ -942,22 +948,50 @@ func TestVerifyForkLineageState_UpstreamIgnoredBase(t *testing.T) {
 			if report.Status != tc.want {
 				t.Fatalf("Status = %q, want %q; report: %+v", report.Status, tc.want, report)
 			}
-			if !reflect.DeepEqual(report.PreMergeSchemes, []string{upstreamIgnoredBaseScheme}) {
-				t.Fatalf("PreMergeSchemes = %v, want [%s]", report.PreMergeSchemes, upstreamIgnoredBaseScheme)
+			wantSchemes := []string{upstreamIgnoredBaseScheme}
+			if tc.projectTable {
+				wantSchemes = nil
+			}
+			if !reflect.DeepEqual(report.PreMergeSchemes, wantSchemes) {
+				t.Fatalf("PreMergeSchemes = %v, want %v", report.PreMergeSchemes, wantSchemes)
 			}
 			if tc.want == ForkLineagePreMerge && len(report.Problems) != 0 {
 				t.Fatalf("Problems = %v, want none for the reconcilable shape", report.Problems)
 			}
-			if tc.want == ForkLineageInconsistent {
+			if tc.want == ForkLineageInconsistent && !tc.projectTable {
 				last := report.Problems[len(report.Problems)-1]
 				if !strings.Contains(last, "DELETE FROM ignored_schema_migrations WHERE version >= 25") {
 					t.Fatalf("Problems = %v, want the clone-local manual step named last", report.Problems)
 				}
 			}
+			if tc.projectTable && !reflect.DeepEqual(report.Problems, []string{"table linear_issue_snapshots (fork ignored 0020/0025)", "cursor row 0027 (fork ignored add_wisp_comment_external_ref)"}) {
+				t.Fatalf("Problems = %v, want the inconsistency diagnostic kept", report.Problems)
+			}
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// TestContentHashSkewAcceptsSanctionedPriorHash: a clone that recorded 0072's
+// original bytes and a fresh init that applied the guarded file are the same
+// lineage, not a schema fork (gf-4c9 row 1, codex round 1); an unknown hash on
+// either side is still skew.
+func TestContentHashSkewAcceptsSanctionedPriorHash(t *testing.T) {
+	current := forkFileHash(t, mainSource, "0072_add_comment_external_ref.up.sql")
+	prior := migrationPriorContentHashes["0072_add_comment_external_ref.up.sql"][0]
+	if got := ContentHashSkew(map[int]string{72: prior}, map[int]string{72: current}); len(got) != 0 {
+		t.Fatalf("ContentHashSkew(prior, current) = %v, want no skew for the sanctioned pair", got)
+	}
+	if got := ContentHashSkew(map[int]string{72: current}, map[int]string{72: prior}); len(got) != 0 {
+		t.Fatalf("ContentHashSkew(current, prior) = %v, want no skew for the sanctioned pair", got)
+	}
+	if got := ContentHashSkew(map[int]string{72: prior}, map[int]string{72: strings.Repeat("ab", 32)}); !reflect.DeepEqual(got, []int{72}) {
+		t.Fatalf("ContentHashSkew(prior, unknown) = %v, want [72]", got)
+	}
+	if got := ContentHashSkew(map[int]string{71: prior}, map[int]string{71: current}); !reflect.DeepEqual(got, []int{71}) {
+		t.Fatalf("ContentHashSkew on another version = %v, want [71]: the pair is sanctioned for 0072 only", got)
 	}
 }
 
@@ -1412,12 +1446,6 @@ func TestVerifyForkLineageState_PreMergeEffects(t *testing.T) {
 						}
 						expectPreUpmergeIgnoredTailProbes(mock, missingTable)
 					}
-					// A missing snapshot table is also the upstream-1.3.1
-					// ignored-base shape (gf-4c9 row 3): the classifier
-					// reads the fingerprint before settling on Inconsistent.
-					if missing >= 0 && strings.Contains(tc.effects[missing].table, "linear_") && tc.effects[missing].table != "linear_label_snapshots" {
-						expectNoUpstreamIgnoredBase(mock)
-					}
 					report, err := VerifyForkLineageState(context.Background(), db)
 					if err != nil {
 						t.Fatal(err)
@@ -1547,12 +1575,6 @@ func TestVerifyForkLineageState_MixedChains(t *testing.T) {
 				expectColumnProbe(mock, "wisp_comments", "external_ref", true)
 				expectPreUpmergeIgnoredTailProbes(mock, "")
 				expectMainReconciledLineageProbes(mock, tc.missing == "")
-			}
-			// A missing snapshot table is also the upstream-1.3.1 ignored-base
-			// shape (gf-4c9 row 3): the classifier reads the fingerprint
-			// before settling on Inconsistent.
-			if strings.Contains(tc.missing, "linear_issue_snapshots") || strings.Contains(tc.missing, "linear_project_snapshots") {
-				expectNoUpstreamIgnoredBase(mock)
 			}
 			report, err := VerifyForkLineageState(context.Background(), db)
 			if err != nil {

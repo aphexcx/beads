@@ -171,10 +171,6 @@ func migrationContentHashMatches(file, current, recorded string) bool {
 // that shape and its clone-local manual step instead of promising a rewrite.
 const upstreamIgnoredBaseScheme = "upstream-1.3.1 ignored base"
 
-// upstreamIgnoredBaseMax is upstream v1.3.1's ignored MAX(version): a store at
-// or below it still has fork rows pending, so the next pass reconciles it.
-const upstreamIgnoredBaseMax = 26
-
 // upstreamIgnoredBaseFiles maps upstream v1.3.1's ignored cursor rows to the
 // files of this lineage that carry the byte-identical content.
 var upstreamIgnoredBaseFiles = map[int]string{
@@ -1209,29 +1205,49 @@ func VerifyForkLineageState(ctx context.Context, db DBConn) (ForkLineageReport, 
 // found the fork's snapshot tables (or the cursor rows after them) missing and
 // asks whether the ignored cursor was recorded by upstream v1.3.1
 // (hasUpstreamIgnoredBaseCursorFrom). It only fires when EVERY problem is one
-// of that shape's, so an unrelated drift is never relabeled. A fingerprinted
-// cursor at or below upstreamIgnoredBaseMax becomes PreMerge — the next
-// migration pass reconciles it (planUpstreamIgnoredBaseCursor). One already
-// advanced past it by an older fork binary has no pending work, so the
-// reconciler never runs: it stays Inconsistent with the clone-local manual
+// of that shape's and both snapshot tables are absent, so an unrelated drift
+// (or a state the planner would refuse) is never relabeled. A fingerprinted
+// cursor with ignored versions still pending becomes PreMerge — the next
+// migration pass reconciles it (planUpstreamIgnoredBaseCursor). One an older
+// fork binary already carried to the latest version has no pending work, so
+// the reconciler never runs: it stays Inconsistent with the clone-local manual
 // step named. Returns whether the report was classified.
 func classifyUpstreamIgnoredBase(ctx context.Context, db DBConn, report *ForkLineageReport) (bool, error) {
 	if len(report.Problems) == 0 {
 		return false, nil
 	}
+	// The planner's own precondition, read off the probes that already ran:
+	// BOTH snapshot tables absent (planUpstreamIgnoredBaseCursorFrom refuses
+	// when either is present, so a report missing only one of them must keep
+	// its inconsistency diagnostic rather than promise a rewrite that will be
+	// refused), and nothing else wrong.
+	issueMissing, projectMissing := false, false
 	for _, problem := range report.Problems {
-		if !strings.Contains(problem, "linear_issue_snapshots") &&
-			!strings.Contains(problem, "linear_project_snapshots") &&
-			!strings.Contains(problem, "cursor row 0027") {
+		switch {
+		case strings.Contains(problem, "table linear_issue_snapshots"):
+			issueMissing = true
+		case strings.Contains(problem, "table linear_project_snapshots"):
+			projectMissing = true
+		case strings.Contains(problem, "cursor row 0027"):
+		default:
 			return false, nil
 		}
+	}
+	if !issueMissing || !projectMissing {
+		return false, nil
 	}
 	base, err := hasUpstreamIgnoredBaseCursorFrom(ctx, db, ignoredSource)
 	if err != nil || !base {
 		return false, err
 	}
 	report.PreMergeSchemes = append(report.PreMergeSchemes, upstreamIgnoredBaseScheme)
-	if report.IgnoredCursorMax <= upstreamIgnoredBaseMax {
+	// Eligibility is what MigrateUp itself asks (migrationWorkNeeded): any
+	// ignored version still pending — the healed reading, which the pass
+	// uses, below the series' latest — makes the next write run the planner,
+	// which deletes rows 25..MAX and re-runs the fork's 0025-0029. A cursor
+	// an older fork binary already carried to the latest version has no
+	// pending work, so no pass runs and the step is manual.
+	if report.IgnoredVersion < ignoredSource.latest() {
 		report.Problems = nil
 		report.Status = ForkLineagePreMerge
 		return true, nil
