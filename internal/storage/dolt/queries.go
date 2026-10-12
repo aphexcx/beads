@@ -58,6 +58,9 @@ func (s *DoltStore) wakeExpiredDefers(ctx context.Context) {
 	if s.readOnly {
 		return
 	}
+	// The owner scope reads THIS store's .beads/config.yaml, so a library
+	// consumer that never initialized the process config scopes the same.
+	ctx = issueops.WithDeferWakeWorkspace(ctx, s.beadsDir)
 	err := s.withCircuitWrite(ctx, func(ctx context.Context) error {
 		return s.runIssueOperationTxWithMessage(ctx, func(tx *sql.Tx) (issueops.ChangedTables, string, error) {
 			woke, err := issueops.WakeExpiredDefersInTx(ctx, tx)

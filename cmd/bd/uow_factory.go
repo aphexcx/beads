@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -490,7 +491,7 @@ func newExternalProxiedServerUOWProvider(ctx context.Context, beadsDir string, t
 		topology.proxyIdle,
 		topology.teamServer,
 		topology.expectedProjectID,
-		opts...,
+		slices.Concat(opts, []uow.ProviderOption{uow.WithWorkspaceDir(beadsDir)})...,
 	)
 }
 
@@ -550,6 +551,6 @@ func newManagedProxiedServerUOWProvider(ctx context.Context, beadsDir string, to
 		topology.proxyIdle,
 		topology.teamServer,
 		topology.expectedProjectID,
-		opts...,
+		slices.Concat(opts, []uow.ProviderOption{uow.WithWorkspaceDir(beadsDir)})...,
 	)
 }

@@ -141,6 +141,10 @@ func (p *notifyingProvider) Close(ctx context.Context) error {
 	return p.inner.Close(ctx)
 }
 
+// WorkspaceDir forwards the inner provider's workspace (WorkspaceProvider):
+// the defer-wake sweep reads that store's own config for its owner scope.
+func (p *notifyingProvider) WorkspaceDir() string { return WorkspaceDirOf(p.inner) }
+
 // Unwrap returns the provider beneath the hook layer, satisfying
 // ProviderUnwrapper.
 func (p *notifyingProvider) Unwrap() UnitOfWorkProvider { return p.inner }
