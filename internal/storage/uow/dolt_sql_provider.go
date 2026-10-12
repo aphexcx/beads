@@ -45,6 +45,9 @@ type doltSQLProvider struct {
 	// available" (bd init, which adopts; server-wide maintenance; a workspace
 	// predating project identity) and skips the check.
 	expectedProjectID string
+	// workspaceDir is the .beads directory this provider was opened for, so
+	// WorkspaceDir names it for the defer-wake owner scope; "" when unnamed.
+	workspaceDir string
 	// preview: the command that opened this provider is an explicitly
 	// non-mutating preview (--dry-run, --inspect). The open creates no
 	// database and applies no migration; see providerOptions.preview.
@@ -109,6 +112,9 @@ func classifyInitSchemaError(err error) error {
 type ProviderOption func(*providerOptions)
 
 type providerOptions struct {
+	// workspaceDir is the .beads directory the provider serves, "" when the
+	// caller named none (WithWorkspaceDir).
+	workspaceDir string
 	// preview opens for a command that promised not to mutate anything
 	// (--dry-run, --inspect). Such a command must reach its own RunE before
 	// anything writes, so the open may neither CREATE DATABASE nor run
@@ -148,6 +154,14 @@ func WithPreview() ProviderOption {
 // WithReadOnly opens the provider for a command that only reads.
 func WithReadOnly() ProviderOption {
 	return func(o *providerOptions) { o.readOnly = true }
+}
+
+// WithWorkspaceDir names the .beads directory the provider is opened for,
+// so the defer-wake sweep can read that store's own config files for its
+// owner scope (WorkspaceProvider). cmd/bd passes it for every workspace
+// provider it builds.
+func WithWorkspaceDir(beadsDir string) ProviderOption {
+	return func(o *providerOptions) { o.workspaceDir = beadsDir }
 }
 
 // WithProxiedServerMode marks the open as belonging to a proxied-server-mode
@@ -292,6 +306,10 @@ func (p *doltSQLProvider) initSchemaAttempt(ctx context.Context, database string
 		schema.WithMigrationGate(func(ctx context.Context, c *sql.Conn) error {
 			return schema.CheckSharedStoreMigrateGate(ctx, c, "", nil, dataBehindAdopter(p.readOnly))
 		})); err != nil {
+		if p.readOnly && errors.Is(err, schema.ErrIgnoredCursorRestoreDeferred) && !schema.IsMigrationLockError(err) {
+			fmt.Fprintf(os.Stderr, "Warning: %v; continuing on the current schema with the saved cursor.\n", err)
+			return nil
+		}
 		var gateErr *schema.RemoteMigrateGateError
 		if errors.As(err, &gateErr) {
 			// The gate reads the database, never the workspace, so it cannot
@@ -766,6 +784,7 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 		expectedProjectID: expectedProjectID,
 		preview:           opts.preview,
 		readOnly:          opts.readOnly,
+		workspaceDir:      opts.workspaceDir,
 		proxiedServerMode: opts.proxiedServerMode,
 	}
 
@@ -800,6 +819,11 @@ func openAndInitSchema(ctx context.Context, ep proxy.Endpoint, database, rootUse
 		expectedProjectID: expectedProjectID,
 		preview:           opts.preview,
 		readOnly:          opts.readOnly,
+		workspaceDir:      opts.workspaceDir,
 		proxiedServerMode: opts.proxiedServerMode,
 	}, nil
 }
+
+// WorkspaceDir names the .beads directory this provider was opened for
+// (WithWorkspaceDir), or "" when the caller named none.
+func (p *doltSQLProvider) WorkspaceDir() string { return p.workspaceDir }

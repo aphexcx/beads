@@ -1414,6 +1414,7 @@ func TestConvergenceFloorMatchesAllowlist(t *testing.T) {
 	// convergence floor. Keep justifications in sync with the allowlist file.
 	knownSafe := map[int]bool{
 		17: true, // 0017: NOW() inside a VIEW body — query-time, identical per clone
+		73: true, // 0073 (fork): DDL-only DEFAULT (UUID()) in CREATE TABLE attachments — no row backfill, applying it is byte-identical across clones; inserts set explicit ids
 	}
 
 	f, err := os.Open("migrations/nondeterminism-allowlist.txt")

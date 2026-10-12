@@ -36,7 +36,8 @@ const smartGateDefaultRemote = "origin"
 // genuinely non-deterministic across clones (random UUID() primary keys: 0004,
 // 0005, 0009, 0010, 0021, 0037, 0043 — the frozen pre-guard set in
 // migrations/nondeterminism-allowlist.txt, excluding the query-time-safe VIEW in
-// 0017 and the dolt-ignored local-only tables).
+// 0017, the dolt-ignored local-only tables, and the DDL-only fork attachments
+// table 0073 whose application is byte-identical across clones).
 //
 // A database already at or above this version has applied every non-deterministic
 // migration, so its *pending* migrations are all deterministic by construction —

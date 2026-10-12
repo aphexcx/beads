@@ -276,7 +276,7 @@ func TestRekeyDependencyIDsPlansBothTablesBeforeWriting(t *testing.T) {
 
 // TestRekeyDependencyIDsRefusesToWriteIntoDirtyTable covers the marker-vs-guard
 // hazard: MigrateUp's changed-signature guard runs AFTER ignoredSource.migrate
-// has durably recorded the 0026 marker, so a re-key that wrote into a
+// has durably recorded the 0029 marker (upstream 0026), so a re-key that wrote into a
 // pre-existing dirty table would fail the open once and never retry, leaving the
 // heal to ride an unrelated user commit. Refusing at plan time keeps the pass
 // write-free and retryable, and DirtyTablesError is the type whose documented

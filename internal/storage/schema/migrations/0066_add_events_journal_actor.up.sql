@@ -16,7 +16,7 @@
 -- (the ignored/0023 pattern): a COLUMNS count of 0 reads the same for "no
 -- column" and "no table", and ALTERing a missing table would abort the pass.
 --
--- IT SHIPS WITH AN IGNORED-SERIES TWIN (ignored/0025), which is not optional:
+-- IT SHIPS WITH AN IGNORED-SERIES TWIN (ignored/0028 on this fork; upstream ships it as ignored/0025 — renumbered here above the fork's 0025-0027), which is not optional:
 -- bd_events_journal is a clone-local dolt-ignored table, so a fresh clone
 -- materializes it from the ignored series while the main cursor arrives
 -- at-latest and never runs this file. That is check D of

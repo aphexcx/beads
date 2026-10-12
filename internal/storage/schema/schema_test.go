@@ -64,29 +64,38 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 	}
 	defer db.Close()
 
-	// MigrateUp re-asserts the canonical dolt_ignore patterns before anything
-	// else (GH#4378); the rows changed, so a scoped commit lands before the
-	// pass runs (#4566: the seed must not ride the per-step pass commits).
-	expectIgnorePatternSeed(mock, 42)
-	// #4356: the open-time untrack reconcile runs right after the seed and
-	// before the no-work short-circuit. On a healthy database it is two reads
-	// and no writes.
-	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: mainSource.atLatest reads the current cursor; v42
 	// is behind LatestVersion(), so the || short-circuits before checking
 	// ignoredSource.atLatest or the content-hash/backfill probes.
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
+	// planForkLineageCursors runs before the pass writes anything (gp-w0nu
+	// round 2): no fork-lineage fingerprint rows (main 54, ignored 11) and no
+	// pre-upmerge fingerprints (main 73, ignored 22), so nothing is planned.
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+
+	// MigrateUp re-asserts the canonical dolt_ignore patterns as the first
+	// write of the pass (GH#4378); the rows changed, so a scoped commit lands
+	// before the pass runs (#4566: the seed must not ride the per-step pass
+	// commits).
+	expectIgnorePatternSeed(mock, 42)
+	expectIgnoredCursorHealNoop(mock)
+
 	// dirtyTables(ctx, db, false): `dependencies` has an uncommitted, unstaged
 	// change in the working set.
 	expectDirtyDoltStatusRow(mock, "dependencies", false)
 	// The seed changed rows, so it is committed scoped+labeled right after
-	// pre-existing tables are unstaged, before the dirty-table guards run.
+	// pre-existing tables are unstaged, before the planned fork-lineage
+	// rewrites (none here) are applied and before the dirty-table guards run.
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
 		WillReturnRows(sqlmock.NewRows([]string{"hash"}))
+
 	// committableDirtyTables -> dirtyTables(ctx, db, true): same dirty state.
 	expectDirtyDoltStatusRow(mock, "dependencies", false)
 
@@ -104,6 +113,12 @@ func TestMigrateUpReturnsDirtyTablesErrorForPreExistingDirtyTable(t *testing.T) 
 		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	}
+
+	// failed0053DirtyTablesAreRecoverable (dolt#11131 recovery gate) reads the
+	// current version first; at 42 (!= 52) the exemption declines and the
+	// dirty-table error path continues unchanged.
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", 42)
 
 	// pendingMigrationDirtyTables re-reads the current version and finds
 	// migration 0043 touches the dirty `dependencies` table.
@@ -1348,6 +1363,46 @@ INSERT INTO wisp_child_counters (parent_id, last_child) VALUES (%s, 7);
 		`SELECT COUNT(*) AS c FROM wisp_child_counters WHERE parent_id = 'schema-cli-rig'`, "0")
 }
 
+func TestIgnoredMigration0027MirrorsMain0072WispCommentDDL(t *testing.T) {
+	// bd-5rs: wisp tables are clone-local, so main 0072's wisp_comments
+	// ALTERs never run on a fresh clone (the replicated cursor is already
+	// past 0072) and ignored/0001 recreates the table without
+	// external_ref/updated_at. ignored/0027 (0022 before the 2026-08 upmerge
+	// renumbering) is 0072's companion on the ignored chain — the replay
+	// path that actually reaches clones. This pins the two files to
+	// byte-identical wisp_comments DDL so they cannot drift apart.
+	mainSQL, err := os.ReadFile("migrations/0072_add_comment_external_ref.up.sql")
+	if err != nil {
+		t.Fatalf("read 0072 up migration: %v", err)
+	}
+	ignoredSQL, err := os.ReadFile("migrations/ignored/0027_add_wisp_comment_external_ref.up.sql")
+	if err != nil {
+		t.Fatalf("read ignored 0027 up migration: %v", err)
+	}
+
+	for _, want := range []string{
+		// Guards: each statement re-checks INFORMATION_SCHEMA so re-running
+		// on a lineage that already has the columns is a no-op.
+		"TABLE_NAME = 'wisp_comments'",
+		"COLUMN_NAME = 'external_ref'",
+		"COLUMN_NAME = 'updated_at'",
+		"INDEX_NAME = 'idx_wisp_comments_external_ref'",
+		"INFORMATION_SCHEMA.COLUMNS",
+		"INFORMATION_SCHEMA.STATISTICS",
+		// The prepared DDL itself.
+		"'ALTER TABLE wisp_comments ADD COLUMN external_ref VARCHAR(255) DEFAULT '''''",
+		"'ALTER TABLE wisp_comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'",
+		"'CREATE INDEX idx_wisp_comments_external_ref ON wisp_comments (external_ref)'",
+	} {
+		if !strings.Contains(string(ignoredSQL), want) {
+			t.Errorf("ignored 0027 missing wisp_comments marker %q", want)
+		}
+		if !strings.Contains(string(mainSQL), want) {
+			t.Errorf("main 0072 missing wisp_comments marker %q (companion files drifted)", want)
+		}
+	}
+}
+
 func TestMigration0047RepairsMissingWispTablesThroughDoltCLI(t *testing.T) {
 	testutil.RequireDoltBinary(t)
 
@@ -2007,8 +2062,11 @@ FROM schema_migrations`)
 	if got := rows[0]["max_version"]; got != want {
 		t.Fatalf("MAX(version) = %s, want %s", got, want)
 	}
-	if got := rows[0]["version_count"]; got != want {
-		t.Fatalf("COUNT(*) = %s, want %s", got, want)
+	// Version numbers are no longer contiguous (the bd-dn6 renumbering moved
+	// the fork migrations to 0070-0073), so the recorded row count is the
+	// migration file count, not MAX(version).
+	if wantCount := strconv.Itoa(len(mainSource.list())); rows[0]["version_count"] != wantCount {
+		t.Fatalf("COUNT(*) = %s, want %s (one row per migration file)", rows[0]["version_count"], wantCount)
 	}
 
 	requireDoltNoRows(t, dir, `

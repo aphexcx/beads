@@ -81,6 +81,20 @@ func expectDatabaseExistsProbe(mock sqlmock.Sqlmock, database string, exists boo
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(n))
 }
 
+// expectMigrationPlanFailure reaches MigrateUp after work detection and
+// stops at the fork's first lineage probe. A work-detection failure itself
+// is unsuitable as a sentinel: atLatest treats an unreadable cursor as work.
+func expectMigrationPlanFailure(mock sqlmock.Sqlmock, current int, message string) {
+	expectCursorProbe(mock, "schema_migrations", current != 0)
+	if current != 0 {
+		mock.ExpectQuery(regexp.QuoteMeta("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")).
+			WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(current))
+	}
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")).
+		WithArgs(54).
+		WillReturnError(errors.New(message))
+}
+
 // TestInitSchemaAcquiresMigrationLockBeforeBootstrapDDL is the fresh-bootstrap
 // ordering guard: nothing that creates or touches schema may run before
 // GET_LOCK.
@@ -116,14 +130,9 @@ func TestInitSchemaAcquiresMigrationLockBeforeBootstrapDDL(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM dolt_status")).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	// The shared-store migration gate, between preparation and MigrateUp. This
-	// init just created the database, so the cursor table does not exist yet,
-	// the gate reads version 0, and it allows: creating a database is consent
-	// for its schema.
-	expectCursorProbe(mock, "schema_migrations", false)
-	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO dolt_ignore VALUES (?, true)")).
-		WithArgs(sqlmock.AnyArg()).
-		WillReturnError(errors.New("first migration statement failed"))
+	// Captured fresh-bootstrap authority bypasses the shared-store gate:
+	// this init created the database, so creation already consents to migration.
+	expectMigrationPlanFailure(mock, 0, "first migration lineage probe failed")
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
 		WithArgs(lockName).
 		WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(1))
@@ -134,7 +143,7 @@ func TestInitSchemaAcquiresMigrationLockBeforeBootstrapDDL(t *testing.T) {
 		serverEndpoint: "tcp:127.0.0.1:3306",
 	}
 	err = p.initSchema(context.Background(), "beads")
-	if err == nil || !strings.Contains(err.Error(), "first migration statement failed") {
+	if err == nil || !strings.Contains(err.Error(), "first migration lineage probe failed") {
 		t.Fatalf("initSchema() error = %v, want first migration sentinel", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -193,9 +202,7 @@ func TestInitSchemaConvergenceProbeRunsWithNoSessionDatabase(t *testing.T) {
 	// consent below keeps this test about the lock/probe ordering it exists to
 	// pin. See TestInitSchemaSharedStoreGate for the gate's own behavior.
 	expectSharedGateProbe(mock, 1, 0)
-	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO dolt_ignore VALUES (?, true)")).
-		WithArgs(sqlmock.AnyArg()).
-		WillReturnError(errors.New("first migration statement failed"))
+	expectMigrationPlanFailure(mock, 1, "first migration lineage probe failed")
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
 		WithArgs(lockName).
 		WillReturnRows(sqlmock.NewRows([]string{"released"}).AddRow(1))
@@ -206,7 +213,7 @@ func TestInitSchemaConvergenceProbeRunsWithNoSessionDatabase(t *testing.T) {
 		serverEndpoint: "tcp:127.0.0.1:3306",
 	}
 	err = p.initSchema(context.Background(), "beads")
-	if err == nil || !strings.Contains(err.Error(), "first migration statement failed") {
+	if err == nil || !strings.Contains(err.Error(), "first migration lineage probe failed") {
 		t.Fatalf("initSchema() error = %v, want first migration sentinel", err)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

@@ -647,58 +647,66 @@ func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
 	return applied, err
 }
 
+// MigrateUp returns ErrIgnoredCursorRestoreDeferred with zero applied when an
+// interrupted cursor repair cannot finish. Only explicitly lenient open callers
+// may continue on the preserved scratch cursor; migrations have not completed.
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
-	// Re-assert the canonical dolt_ignore patterns before anything else, and
-	// in particular before the migrationWorkNeeded short-circuit: a database
-	// whose migration cursors arrived at-latest without executing the seeding
-	// migrations (out-of-band table copy) reports no work needed and
-	// would otherwise never be healed.
-	seedChanged, err := seedDoltIgnorePatterns(ctx, db)
-	if err != nil {
-		return 0, err
-	}
-
-	// Asserting the pattern is not enough on a lineage old enough to have
-	// COMMITTED the ignored-lane cursor table: dolt_ignore only exempts
-	// tables that were never tracked, so the pattern above is inert there and
-	// the table stays permanently dirty, wedging every pull
-	// (gastownhall/beads#4356). Untracking it is a one-time repair, but it
-	// belongs here rather than in a numbered migration for the same reason
-	// the seed does — the affected databases are at-latest, so the
-	// short-circuit below would skip it — plus one the seed does not have: a
-	// pull from a not-yet-healed peer can re-introduce the tracked table,
-	// which only a probe that runs at EVERY open can catch.
-	healed, err := healTrackedIgnoredCursorTable(ctx, db)
-	if err != nil {
-		return 0, fmt.Errorf("untracking legacy %s: %w", ignoredSource.cursorTable, err)
-	}
-
-	// A heal counts toward the returned total because every caller of this
-	// function asks the same question of it — did this pass change the
-	// database? — and a heal answers yes emphatically: it runs DDL and moves
-	// HEAD. Reporting 0 told DoltStore.Open not to rebuild the pool it had
-	// already pinned to the pre-migration session root (be-itm5: that
-	// connection serves stale reads and does not self-heal on retry), and
-	// told `bd migrate` to print "already at vN" and skip commandDidWrite
-	// immediately after minting a fleet-visible commit. The heal's own log
-	// line, not this counter, is what tells an operator WHAT happened.
-	reconciled := 0
-	if healed {
-		reconciled = 1
-	}
-
-	applied, err := migrateUpAfterReconcile(ctx, db, seedChanged)
-	return applied + reconciled, err
-}
-
-// migrateUpAfterReconcile is MigrateUp's migration pass proper, split out so
-// the open-time reconciles above it have exactly one place to contribute to
-// the reported total.
-func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (int, error) {
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("checking schema migration work: %w", err)
 	}
+
+	// bd-dn6: databases migrated by a pre-merge fork binary recorded the
+	// fork's migrations under numbers upstream now owns (main 51-54, ignored
+	// 10-11), and the 2026-08 upmerge left the same shape at main 70-73 /
+	// ignored 20-22. Those cursor rows are rewritten to the renumbered scheme
+	// before pending versions are computed, so this pass applies upstream's
+	// same-numbered migrations instead of silently skipping them.
+	//
+	// The rewrites are PLANNED here, before the pass writes anything: the
+	// planning half only reads (fingerprint rows, schema probes, content
+	// hashes), and its refuse-to-rewrite guard must leave the working set
+	// exactly as found. Planned any later, a refusal would already have
+	// dirtied dolt_ignore through the seed below, or DOLT_RESET a table the
+	// operator had staged (unstagePreExistingTables), while claiming the
+	// working set was left as found (codex gate r1 on gp-w0nu). The plan
+	// needs nothing the seed writes. The rewrites are applied after the seed
+	// commit, below.
+	var forkRewrites []cursorRewrite
+	if needed {
+		forkRewrites, err = planForkLineageCursors(ctx, db)
+		if err != nil {
+			return 0, fmt.Errorf("reconciling fork-lineage migration cursors: %w", err)
+		}
+	}
+
+	// Re-assert the canonical dolt_ignore patterns whether or not migration
+	// work is needed: a database whose migration cursors arrived at-latest
+	// without executing the seeding migrations (out-of-band table copy)
+	// reports no work needed and would otherwise never be healed. It is the
+	// first write of the pass, after the read-only plan above.
+	seedChanged, err := seedDoltIgnorePatterns(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	// The upstream tracked-cursor repair also mutates the working set and
+	// HEAD, so it must follow the fork's read-only lineage verification.
+	// Run it even at latest: a pull can reintroduce the tracked cursor.
+	healed, err := healTrackedIgnoredCursorTable(ctx, db)
+	if err != nil {
+		return 0, fmt.Errorf("untracking legacy %s: %w", ignoredSource.cursorTable, err)
+	}
+	applied, err := migrateUpAfterReconcile(ctx, db, needed, seedChanged, forkRewrites)
+	if healed {
+		// Callers must refresh sessions and report a write when healing moved HEAD.
+		applied++
+	}
+	return applied, err
+}
+
+// migrateUpAfterReconcile applies the plan verified before either open-time
+// repair wrote anything, leaving the wrapper to account for a cursor heal.
+func migrateUpAfterReconcile(ctx context.Context, db DBConn, needed, seedChanged bool, forkRewrites []cursorRewrite) (int, error) {
 	if !needed {
 		// No migration pass will run, so nothing downstream commits the seed:
 		// it would sit as an uncommitted working-set diff until an unrelated
@@ -732,11 +740,27 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	// retry sees a dirty working set and refuses to converge. Commit the seed
 	// scoped and labeled now, after pre-existing staged tables were unstaged
 	// (so nothing else rides into the commit) and before the first step runs.
+	//
+	// It is also committed BEFORE the fork-lineage rewrites are applied
+	// below, so the seed rows never sit uncommitted beside a cursor DELETE
+	// (boomtown, 2026-09-11, gp-w0nu, read the refused pass's debris as
+	// "dolt_ignore: modified" beside "schema_migrations: modified").
 	if seedChanged {
 		if err := commitSeededDoltIgnore(ctx, db); err != nil {
 			return 0, err
 		}
 	}
+
+	// Apply the fork-lineage cursor rewrites planned above (every chain was
+	// verified before this point, so nothing is deleted unless all of them
+	// verified). The DELETEs only touch the cursor tables (exempt from the
+	// dirty-table guards) and are committed with the rest of the pass; a
+	// crash before the commit is harmless because detection re-probes actual
+	// schema state.
+	if _, err := applyForkLineageRewrites(ctx, db, forkRewrites); err != nil {
+		return 0, fmt.Errorf("reconciling fork-lineage migration cursors: %w", err)
+	}
+
 	dirtyBefore, err := committableDirtyTables(ctx, db)
 	if err != nil {
 		return 0, fmt.Errorf("reading pre-migration status: %w", err)
@@ -765,19 +789,28 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	// dirtyBefore would fail the pass on the read, re-creating the unopenable
 	// database this exemption path exists to rescue.
 	//
-	// auxRekeyExemptTables returns exactly the tables the upcoming
-	// rekeyAuxRowIDsAllPasses will rewrite, computed from the same per-pass
-	// selection the rewrite uses. Scoping the exemption to that set — rather
-	// than blanket-exempting all four aux tables whenever any rewrite is in
-	// flight — keeps a post-marker resume, which touches only the recorded
-	// drifted subset, from dropping a non-drifted aux table's pre-existing user
-	// edits out of dirtyBefore and into the migration commit (#4380).
-	auxRekeyExempt, err := auxRekeyExemptTables(ctx, db, mainVersionBefore)
-	if err != nil {
-		return 0, err
+	// Exempt only tables with recorded crash/drift recovery state that the
+	// upcoming rekey will actually rewrite. First-time rewrites must refuse
+	// dirty aux tables here, before any migrations or rekey markers advance.
+	auxRekeyExempt, auxRekeyErr := auxRekeyExemptTables(ctx, db, mainVersionBefore, dirtyBefore)
+	var auxDirtyErr *DirtyTablesError
+	if auxRekeyErr != nil && (mainVersionBefore != 52 || !errors.As(auxRekeyErr, &auxDirtyErr)) {
+		return 0, auxRekeyErr
 	}
 	for name := range auxRekeyExempt {
 		delete(dirtyBefore, name)
+	}
+	if recoverable, err := failed0053DirtyTablesAreRecoverable(ctx, db, dirtyBefore); err != nil {
+		return 0, fmt.Errorf("checking failed v53 migration recovery: %w", err)
+	} else if recoverable {
+		log.Printf("schema migration recovering known failed v53 dirty tables: %s", strings.Join(sortedDirtyTableNames(dirtyBefore), ", "))
+		for table := range dirtyBefore {
+			delete(dirtyBefore, table)
+		}
+	} else if auxRekeyErr != nil {
+		// Only validated historical v53 debris can bypass the first-time
+		// rekey refusal without an aux sentinel; ordinary user edits cannot.
+		return 0, auxRekeyErr
 	}
 	touchedDirtyTables, err := mainSource.pendingMigrationDirtyTables(ctx, db, dirtyBefore)
 	if err != nil {
@@ -807,8 +840,8 @@ func migrateUpAfterReconcile(ctx context.Context, db DBConn, seedChanged bool) (
 	// here, after the schema migrations (0050 has asserted the canonical schema),
 	// and only on a pass where migration work was needed.
 	//
-	// #5268: ignored migration 0026 is what makes "migration work was needed"
-	// true one more time on every existing clone, so the now merge-aware re-key
+	// #5268: ignored migration 0029 (upstream 0026) makes "migration work was
+	// needed" true once more on every existing clone, so the merge-aware re-key
 	// reaches the databases a pre-1.3.0 binary left half-re-keyed at the latest
 	// main version. It is also why this call sits ABOVE ignoredSource.migrate:
 	// the marker records only if the re-key returned, so an aborted re-key is
@@ -1963,4 +1996,65 @@ func commitMigrationStep(ctx context.Context, db DBConn, cursorTable, migrationN
 		}
 	}
 	return nil
+}
+
+func failed0053DirtyTablesAreRecoverable(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState) (bool, error) {
+	if len(dirtyBefore) == 0 {
+		return false, nil
+	}
+	current, err := mainSource.currentVersion(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	if current != 52 {
+		return false, nil
+	}
+
+	allowed := map[string]struct{}{
+		"child_counters": {},
+		"comments":       {},
+		"dependencies":   {},
+		"events":         {},
+		"issues":         {},
+		"labels":         {},
+		// 0051 drops the legacy DEFAULT (UUID()) on these aux tables. In a
+		// single-pass v49->v53 batch (MigrateUp commits once at the end),
+		// that DROP DEFAULT is still uncommitted when 0053 fails, so a
+		// legacy-default DB trips this gate with these tables dirty too.
+		// The change is an idempotent, schema-only DROP DEFAULT, so it is
+		// safe to fold into the recovery commit (#4555).
+		"issue_snapshots":      {},
+		"compaction_snapshots": {},
+	}
+	for table := range dirtyBefore {
+		if _, ok := allowed[table]; !ok {
+			return false, nil
+		}
+	}
+
+	needsRepair, err := wispDependenciesNeed0053Repair(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	return needsRepair, nil
+}
+
+func wispDependenciesNeed0053Repair(ctx context.Context, db DBConn) (bool, error) {
+	table, err := schemaTableExists(ctx, db, "wisp_dependencies")
+	if err != nil {
+		return false, err
+	}
+	if !table {
+		return false, nil
+	}
+	for _, column := range []string{"depends_on_issue_id", "depends_on_wisp_id", "depends_on_external"} {
+		present, err := schemaColumnExists(ctx, db, "wisp_dependencies", column)
+		if err != nil {
+			return false, err
+		}
+		if !present {
+			return true, nil
+		}
+	}
+	return false, nil
 }

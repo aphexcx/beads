@@ -175,11 +175,14 @@ func TestMigrateUpWithLockMigrationErrorNotMaskedByReleaseFailure(t *testing.T) 
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT GET_LOCK(?, ?)")).
 		WithArgs(lockName, migrationLockAcquireTimeoutSeconds).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(1))
-	// MigrateUp's first statement fails with a structural error, standing in
-	// for a migration hard-failing on a malformed clone.
+	// MigrateUp's first non-degrading statement (the fork-lineage plan's
+	// fingerprint probe; migrationWorkNeeded's cursor reads degrade to "work
+	// needed" on error) fails with a structural error, standing in for a
+	// migration hard-failing on a malformed clone.
 	migrationCause := errors.New("column 'is_blocked' could not be found in any table in scope")
 	releaseCause := errors.New("driver: bad connection")
-	mock.ExpectExec(regexp.QuoteMeta("INSERT IGNORE INTO dolt_ignore VALUES (?, true)")).
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")).
+		WithArgs(54).
 		WillReturnError(migrationCause)
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).
 		WithArgs(lockName).
@@ -227,7 +230,7 @@ func TestMigrateUpWithLockMigrationErrorNotMaskedByReleaseFailure(t *testing.T) 
 // out-of-band-materialized databases: one whose migration cursors arrived
 // at-latest WITHOUT executing the seeding migrations (out-of-band table
 // copy/rename) reports no migration work, but MigrateUp must still re-assert
-// the full canonical dolt_ignore pattern set before the short-circuit, or the
+// the full canonical dolt_ignore pattern set on the no-work path, or the
 // copied database is never healed (1 pattern instead of 5, wisp churn in
 // dolt_status, dirty-gate block on subsequent migrations).
 func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
@@ -238,11 +241,6 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 	}
 	defer db.Close()
 
-	expectIgnorePatternSeed(mock, LatestVersion())
-	// #4356: the open-time untrack reconcile runs right after the seed and
-	// before the no-work short-circuit. On a healthy database it is two reads
-	// and no writes.
-	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: both cursors at latest, both content_hash columns
 	// present, no custom backfill pending -> no work, MigrateUp short-circuits.
 	expectCursorProbe(mock, "schema_migrations", true)
@@ -254,8 +252,12 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 	expectContentHashColumnExists(mock)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
-	// The seed inserted rows and no migration pass follows to commit them, so
-	// MigrateUp must commit the heal itself, scoped and labeled.
+	// No work needed, so the fork-lineage plan is skipped; the seed still
+	// runs (the out-of-band-copy heal). It inserted rows and no migration
+	// pass follows to commit them, so MigrateUp must commit the heal itself,
+	// scoped and labeled.
+	expectIgnorePatternSeed(mock, LatestVersion())
+	expectIgnoredCursorHealNoop(mock)
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
@@ -269,7 +271,7 @@ func TestMigrateUpSeedsIgnorePatternsWhenNoWorkNeeded(t *testing.T) {
 		t.Fatalf("MigrateUp() applied = %d, want 0", applied)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("unmet SQL expectations (ignore-pattern seed must run before the no-work short-circuit and be committed when it changed rows): %v", err)
+		t.Fatalf("unmet SQL expectations (ignore-pattern seed must still run on the no-work path and be committed when it changed rows): %v", err)
 	}
 }
 
@@ -285,11 +287,6 @@ func TestMigrateUpSkipsSeedCommitWhenNothingChanged(t *testing.T) {
 	}
 	defer db.Close()
 
-	expectIgnorePatternSeedNoop(mock, LatestVersion())
-	// #4356: the open-time untrack reconcile runs right after the seed and
-	// before the no-work short-circuit. On a healthy database it is two reads
-	// and no writes.
-	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: no work, MigrateUp short-circuits.
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion())
@@ -300,6 +297,9 @@ func TestMigrateUpSkipsSeedCommitWhenNothingChanged(t *testing.T) {
 	expectContentHashColumnExists(mock)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_types", "count", 1)
 	expectScalar(mock, "SELECT COUNT(*) FROM custom_statuses", "count", 1)
+	// The seed follows the no-work verdict and is a no-op here.
+	expectIgnorePatternSeedNoop(mock, LatestVersion())
+	expectIgnoredCursorHealNoop(mock)
 
 	applied, err := MigrateUp(context.Background(), db)
 	if err != nil {
@@ -346,7 +346,8 @@ func expectIgnoreSeedProbe(mock sqlmock.Sqlmock, mainVersion int, alreadyPresent
 }
 
 // expectIgnorePatternSeed mocks the dolt_ignore pattern seed MigrateUp runs
-// before anything else on an UNDER-SEEDED database: the probe finds nothing,
+// as the first WRITE of the pass (after migrationWorkNeeded and the read-only
+// fork-lineage plan) on an UNDER-SEEDED database: the probe finds nothing,
 // so every pattern is inserted (RowsAffected=1). mainVersion is what the
 // seed's cursor probe reports; version-gated patterns (events, >= 0062) are
 // only expected when it qualifies them.
@@ -373,17 +374,27 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	latest := LatestVersion()
 	latestIgnored := LatestIgnoredVersion()
 
-	expectIgnorePatternSeed(mock, latest-1)
-	// #4356: the open-time untrack reconcile runs right after the seed and
-	// before the no-work short-circuit. On a healthy database it is two reads
-	// and no writes.
-	expectIgnoredCursorHealNoop(mock)
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
+	// Work needed, so the read-only fork-lineage plan runs BEFORE the pass
+	// writes anything (gp-w0nu round 2): it probes both cursor tables for
+	// the pre-merge fork fingerprint (main row 54; no row 54 means the
+	// ignored-chain probe is skipped entirely, post-merge gating — upstream
+	// also owns an ignored 0011 now) and the 2026-08 upmerge fingerprints
+	// (main row 73, ignored row 22) independently. All absent here, so
+	// nothing is planned and no DELETE follows.
+	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
+	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
+	// The seed is the first write of the pass.
+	expectIgnorePatternSeed(mock, latest-1)
+	expectIgnoredCursorHealNoop(mock)
 	expectDoltStatusRows(mock)
 	// The seed changed rows (expectIgnorePatternSeed reports RowsAffected=1),
 	// so MigrateUp commits it scoped+labeled before the pass runs (#4566: the
-	// seed must not ride the per-step pass commits).
+	// seed must not ride the per-step pass commits) and before the planned
+	// fork-lineage rewrites (none here) are applied.
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_ADD('dolt_ignore')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_COMMIT('-m', 'schema: seed dolt_ignore patterns')")).
@@ -551,17 +562,22 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 
 	cursor := eventsFlipVersion - 1
 
-	expectIgnorePatternSeedNoop(mock, cursor)
-	// #4356: the open-time untrack reconcile runs right after the seed and
-	// before the no-work short-circuit. On a healthy database it is two reads
-	// and no writes.
-	expectIgnoredCursorHealNoop(mock)
 	// migrationWorkNeeded: main cursor behind -> work needed (short-circuits).
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", cursor)
+	// Fork-lineage plan (read-only, before any write): no bd-dn6 fingerprint
+	// (main row 54) and no 2026-08 upmerge fingerprints (main row 73, ignored
+	// row 22) in this mocked world, so nothing is planned.
+	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
+	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
+	expectIgnorePatternSeedNoop(mock, cursor)
+	expectIgnoredCursorHealNoop(mock)
 	// dirtyBeforeAll: `events` dirty (working set only, not staged).
 	expectDoltStatusDirtyEvents(mock)
-	// Nothing staged -> no unstage exec; seed was a no-op -> no seed commit.
+	// Nothing staged -> no unstage exec; seed was a no-op -> no seed commit;
+	// nothing planned -> no DELETE.
 	// committableDirtyTables re-reads dolt_status (ignored tables excluded).
 	expectDoltStatusDirtyEvents(mock)
 	// MigrateUp captures the pre-pass main cursor up front now (it drives the
@@ -578,6 +594,9 @@ func expectDirtyGuardRefusal(t *testing.T, mock sqlmock.Sqlmock) {
 		mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.TABLES`).
 			WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	}
+	// The fork's failed-v53 recovery checks the cursor before refusing dirty tables.
+	expectCursorProbe(mock, "schema_migrations", true)
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", cursor)
 	// pendingMigrationDirtyTables: cursor read, then pending 0062's SQL
 	// touches `events` -> DirtyTablesError.
 	expectCursorProbe(mock, "schema_migrations", true)
@@ -872,13 +891,18 @@ func TestMigrateUpWithLockFreshBootstrapHealCapabilityIsOneShot(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta("CALL DOLT_RESET('--hard')")).
 		WillReturnRows(sqlmock.NewRows([]string{"status"}))
 	// The reset returns to the v60 HEAD used by expectDirtyGuardRefusal. The
-	// rerun repeats main's unconditional ignore-pattern seed and the #4356
-	// reconcile gate before reaching migrationWorkNeeded, where the injected
-	// transient failure occurs.
-	expectIgnorePatternSeedNoop(mock, LatestVersion()-2)
-	expectIgnoredCursorHealNoop(mock)
+	// rerun repeats migrationWorkNeeded, the read-only fork-lineage plan
+	// (fingerprints absent) and the no-op ignore-pattern seed before the
+	// pre-migration dolt_status read, where the injected transient failure
+	// occurs.
 	expectCursorProbe(mock, "schema_migrations", true)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", LatestVersion()-2)
+	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectScalar(mock, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?", "count", 0)
+	expectScalar(mock, "SELECT COUNT(*) FROM ignored_schema_migrations WHERE version = ?", "count", 0)
+	expectIgnorePatternSeedNoop(mock, LatestVersion()-2)
+	expectIgnoredCursorHealNoop(mock)
 	mock.ExpectQuery("(?s)SELECT s\\.table_name, s\\.staged\\s+FROM dolt_status s").
 		WillReturnError(errors.New("connection reset"))
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT RELEASE_LOCK(?)")).

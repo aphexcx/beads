@@ -737,6 +737,14 @@ func runDiagnostics(path string) doctorResult {
 	skewCheck := convertWithCategory(doctor.CheckMigrationContentSkew(sharedStore), doctor.CategoryData)
 	result.Checks = append(result.Checks, skewCheck)
 
+	// Check 7g: Fork migration lineage (bd-dn6). Verifies the renumbered fork
+	// cursor state column-by-column; errors indicate silent schema skew.
+	forkLineageCheck := convertWithCategory(doctor.CheckForkMigrationLineage(sharedStore), doctor.CategoryData)
+	result.Checks = append(result.Checks, forkLineageCheck)
+	if forkLineageCheck.Status == statusError {
+		result.OverallOK = false
+	}
+
 	// Dolt health checks (connection, schema, issue count, status).
 	for _, dc := range doctor.RunDoltHealthChecks(path) {
 		result.Checks = append(result.Checks, convertDoctorCheck(dc))
