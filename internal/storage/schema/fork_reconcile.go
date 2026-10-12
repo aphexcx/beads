@@ -111,6 +111,39 @@ var upmergeMainFiles = map[int]string{
 	73: "0073_create_attachments.up.sql",
 }
 
+// migrationPriorContentHashes lists, per migration file, the sha256 of every
+// EARLIER byte content this lineage shipped under the same version. Shipped
+// migrations are frozen (scripts/check-migration-hygiene.sh check C) because a
+// cursor row records the content hash it applied; the one sanctioned reason
+// to edit a shipped file in place is a statement that fails before any later
+// migration could fix it forward — 0072's wisp ALTERs on a clone that has no
+// wisp_comments yet (gf-4c9 row 1). A cursor row recorded against a prior
+// content is still this binary's own lineage: verifyForkCursorHashes accepts
+// it, and migrations/frozen-edit-allowlist.txt names the same (file, hash)
+// pair for the hygiene check. TestFrozenEditAllowlistMatchesPriorContentHashes
+// keeps the two in step.
+var migrationPriorContentHashes = map[string][]string{
+	// The pre-gf-4c9 bytes (COLUMNS-only probes on the three wisp statements),
+	// recorded as row 72 by every store that migrated through the fork
+	// lineage before 2026-10-12.
+	"0072_add_comment_external_ref.up.sql": {"ef072196333301e0fa50a0d6eac9f23f529da8e04b5586d96c753a37da0d78c2"},
+}
+
+// migrationContentHashMatches reports whether recorded is the sha256 of the
+// embedded file's current bytes or of a prior content this lineage shipped
+// under the same name (migrationPriorContentHashes).
+func migrationContentHashMatches(file, current, recorded string) bool {
+	if recorded == current {
+		return true
+	}
+	for _, prior := range migrationPriorContentHashes[file] {
+		if recorded == prior {
+			return true
+		}
+	}
+	return false
+}
+
 // cursorRewrite is one verified fork-cursor rewrite. The reconcile pass is
 // split into a planning half that only READS (every fingerprint probe, every
 // schema probe and every content-hash cross-check, for every chain) and an
@@ -670,11 +703,13 @@ func planForkIgnoredCursorFrom(ctx context.Context, db DBConn, src migrationSour
 }
 
 // verifyForkCursorHashes cross-checks each recorded content hash in the
-// fork's cursor rows against the renumbered (byte-identical) migration file.
-// Rows recorded before the content_hash column shipped carry NULL and are
-// skipped — the INFORMATION_SCHEMA probes above carry the evidence for those.
-// A non-NULL hash that does not match means the row was recorded against
-// content this binary has never seen; refuse to rewrite in that case.
+// fork's cursor rows against the renumbered (byte-identical) migration file,
+// or against a prior content of that file this lineage shipped
+// (migrationPriorContentHashes). Rows recorded before the content_hash column
+// shipped carry NULL and are skipped — the INFORMATION_SCHEMA probes above
+// carry the evidence for those. A non-NULL hash that matches neither means the
+// row was recorded against content this binary has never seen; refuse to
+// rewrite in that case.
 func verifyForkCursorHashes(ctx context.Context, db DBConn, src migrationSource, files map[int]string) error {
 	hasHash, err := src.hasContentHashColumn(ctx, db)
 	if err != nil {
@@ -707,7 +742,7 @@ func verifyForkCursorHashes(ctx context.Context, db DBConn, src migrationSource,
 			return fmt.Errorf("reading embedded %s: %w", file, err)
 		}
 		sum := sha256.Sum256(data)
-		if want := hex.EncodeToString(sum[:]); recorded.String != want {
+		if want := hex.EncodeToString(sum[:]); !migrationContentHashMatches(file, want, recorded.String) {
 			return fmt.Errorf(
 				"%s version %d content hash %s does not match fork migration %s (%s); the recorded migration content is unknown to this binary — %w",
 				src.cursorTable, version, recorded.String, file, want, errRefusedRewrite)

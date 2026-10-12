@@ -1256,6 +1256,57 @@ DELETE FROM schema_migrations WHERE version = %d;
 		`SELECT COUNT(DISTINCT INDEX_NAME) AS c FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'comments' AND INDEX_NAME = 'idx_comments_issue_created_id'`, "1")
 }
 
+// TestMigration0072NoopsWithoutWispCommentsThroughDoltCLI pins the fresh-clone
+// door of the fork's main 0072 (gf-4c9 row 1; gf-9x2 codex gate Major at
+// 0072:49/:55). A clone of an upstream-shaped v66 base opens with main
+// 0070-0073 pending and NO clone-local wisp_comments yet: the ignored chain
+// that materializes the wisp tables runs AFTER the main migrations in the same
+// pass. 0072's three wisp statements used to probe INFORMATION_SCHEMA.COLUMNS
+// alone, so an absent TABLE read as a missing column and the prepared
+// `ALTER TABLE wisp_comments` failed the first writable open. Each wisp
+// statement is now guarded on table existence too; ignored/0027 adds the
+// columns afterward on that door. The durable comments half still runs.
+func TestMigration0072NoopsWithoutWispCommentsThroughDoltCLI(t *testing.T) {
+	testutil.RequireDoltBinary(t)
+
+	dir := filepath.Join(t.TempDir(), "comment-external-ref-no-wisps")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create no-wisps dir: %v", err)
+	}
+	runDoltCommand(t, dir, "init", "--name", "test", "--email", "test@example.com")
+	runDoltSQL(t, dir, AllMigrationsSQL())
+
+	// Stage the fresh-clone shape: the table 0072's wisp half alters is
+	// absent. The durable comments columns stay (the bundle's CLI substitute
+	// added them), so the comments half of the source text is a guarded
+	// no-op here and the wisp half is the statement under test.
+	seedSQL := fmt.Sprintf(`
+DROP TABLE IF EXISTS wisp_comments;
+DELETE FROM schema_migrations WHERE version = %d;
+`, LatestVersion())
+	migrationSQL, err := mainSource.files.ReadFile("migrations/0072_add_comment_external_ref.up.sql")
+	if err != nil {
+		t.Fatalf("read 0072 migration: %v", err)
+	}
+	runDoltSQL(t, dir, seedSQL+"\n"+string(migrationSQL))
+
+	// Wisp half no-oped: no wisp_comments table was created, no error raised.
+	requireDoltCount(t, dir,
+		`SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'wisp_comments'`, "0")
+	// Comments half untouched: both columns and the index are still there.
+	for _, column := range []string{"external_ref", "updated_at"} {
+		requireDoltCount(t, dir,
+			`SELECT COUNT(*) AS c FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'comments' AND COLUMN_NAME = '`+column+`'`, "1")
+	}
+	requireDoltCount(t, dir,
+		`SELECT COUNT(DISTINCT INDEX_NAME) AS c FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'comments' AND INDEX_NAME = 'idx_comments_external_ref'`, "1")
+
+	// Replay stability on a lineage that already has the wisp columns (every
+	// database that ran fork 0024 / main 0072 against a pre-existing table):
+	// the guarded statements are a no-op, not a duplicate-column error.
+	runDoltSQL(t, dir, string(migrationSQL))
+}
+
 // TestMigration0065NoopsWithoutWispCommentsThroughDoltCLI is what licenses
 // cliSubstituteAssumesWispTables: the fresh-bundle substitute for 0065 is a
 // bare MODIFY that aborts the batch with "table not found" on a database that

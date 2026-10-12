@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -581,6 +582,143 @@ func expectUpmergeMainVerification(t *testing.T, mock sqlmock.Sqlmock) {
 	expectHasContentHashColumn(mock, "schema_migrations", true)
 	for _, v := range []int{70, 71, 72, 73} {
 		expectRecordedHash(mock, "schema_migrations", v, forkFileHash(t, mainSource, upmergeMainFiles[v]))
+	}
+}
+
+// TestPlanUpmergeMainCursor_AcceptsPriorContentHashOf0072 pins the gf-4c9
+// row-1 lineage event: every store that migrated through the fork lineage
+// before 2026-10-12 recorded row 72 against the pre-guard bytes of
+// 0072_add_comment_external_ref.up.sql. The in-place guard edit changed the
+// embedded file's hash; the reconciler must still read such a row as this
+// binary's own lineage (migrationPriorContentHashes) rather than refuse the
+// rewrite as "content unknown to this binary".
+func TestPlanUpmergeMainCursor_AcceptsPriorContentHashOf0072(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	prior := migrationPriorContentHashes["0072_add_comment_external_ref.up.sql"]
+	if len(prior) == 0 {
+		t.Fatal("no prior content hash registered for 0072; the lineage event is unrecorded")
+	}
+	if prior[0] == forkFileHash(t, mainSource, upmergeMainFiles[72]) {
+		t.Fatal("the registered prior hash equals the current file hash; the entry records nothing")
+	}
+
+	expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+	expectCursorRowProbe(mock, "schema_migrations", 56, 0)
+	expectMaxVersion(mock, "schema_migrations", 73)
+	expectTableProbe(mock, "linear_label_snapshots", true)
+	expectColumnProbe(mock, "comments", "external_ref", true)
+	expectColumnProbe(mock, "comments", "updated_at", true)
+	expectTableProbe(mock, "attachments", true)
+	expectHasContentHashColumn(mock, "schema_migrations", true)
+	for _, v := range []int{70, 71, 72, 73} {
+		hash := forkFileHash(t, mainSource, upmergeMainFiles[v])
+		if v == 72 {
+			hash = prior[0]
+		}
+		expectRecordedHash(mock, "schema_migrations", v, hash)
+	}
+
+	rewrite, err := planUpmergeMainCursor(context.Background(), db)
+	if err != nil {
+		t.Fatalf("planUpmergeMainCursor refused a row recorded against 0072's prior bytes: %v", err)
+	}
+	if rewrite == nil || rewrite.lo != 70 || rewrite.hi != 73 {
+		t.Fatalf("rewrite = %+v, want schema_migrations rows 70-73", rewrite)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestPlanUpmergeMainCursor_StillRefusesUnknownContentHash is the control:
+// the prior-hash acceptance is per registered (file, hash) pair, not a
+// loosening of the refusal.
+func TestPlanUpmergeMainCursor_StillRefusesUnknownContentHash(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer db.Close()
+
+	expectCursorRowProbe(mock, "schema_migrations", 73, 1)
+	expectCursorRowProbe(mock, "schema_migrations", 56, 0)
+	expectMaxVersion(mock, "schema_migrations", 73)
+	expectTableProbe(mock, "linear_label_snapshots", true)
+	expectColumnProbe(mock, "comments", "external_ref", true)
+	expectColumnProbe(mock, "comments", "updated_at", true)
+	expectTableProbe(mock, "attachments", true)
+	expectHasContentHashColumn(mock, "schema_migrations", true)
+	expectRecordedHash(mock, "schema_migrations", 70, forkFileHash(t, mainSource, upmergeMainFiles[70]))
+	expectRecordedHash(mock, "schema_migrations", 71, forkFileHash(t, mainSource, upmergeMainFiles[71]))
+	expectRecordedHash(mock, "schema_migrations", 72, strings.Repeat("ab", 32))
+
+	_, err = planUpmergeMainCursor(context.Background(), db)
+	if err == nil || !strings.Contains(err.Error(), "does not match fork migration") {
+		t.Fatalf("err = %v, want refusal on a content hash this binary has never seen", err)
+	}
+}
+
+// TestFrozenEditAllowlistMatchesPriorContentHashes keeps the two records of
+// a sanctioned in-place migration edit in step: the hygiene check's
+// migrations/frozen-edit-allowlist.txt (file, prior sha256, justification) and
+// the reconciler's migrationPriorContentHashes. Every allowlist entry must be
+// registered, every registered hash must be allowlisted, and no prior hash may
+// equal the file's current bytes (an entry that records nothing).
+func TestFrozenEditAllowlistMatchesPriorContentHashes(t *testing.T) {
+	data, err := os.ReadFile("migrations/frozen-edit-allowlist.txt")
+	if err != nil {
+		t.Fatalf("read frozen-edit-allowlist.txt: %v", err)
+	}
+	listed := map[string]map[string]bool{}
+	for lineNo, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			t.Fatalf("frozen-edit-allowlist.txt:%d: want <file> <prior sha256> <justification>, got %q", lineNo+1, line)
+		}
+		file, hash := fields[0], fields[1]
+		if len(hash) != 64 || strings.Trim(hash, "0123456789abcdef") != "" {
+			t.Fatalf("frozen-edit-allowlist.txt:%d: %q is not a lowercase hex sha256", lineNo+1, hash)
+		}
+		if listed[file] == nil {
+			listed[file] = map[string]bool{}
+		}
+		listed[file][hash] = true
+	}
+	for file, hashes := range migrationPriorContentHashes {
+		src := mainSource
+		name := file
+		if rest, ok := strings.CutPrefix(file, "ignored/"); ok {
+			src, name = ignoredSource, rest
+		}
+		current := forkFileHash(t, src, name)
+		for _, hash := range hashes {
+			if hash == current {
+				t.Errorf("migrationPriorContentHashes[%q] lists the file's CURRENT hash %s; a prior hash records an earlier content", file, hash)
+			}
+			if !listed[file][hash] {
+				t.Errorf("migrationPriorContentHashes[%q] hash %s is not in migrations/frozen-edit-allowlist.txt", file, hash)
+			}
+		}
+	}
+	for file, hashes := range listed {
+		registered := map[string]bool{}
+		for _, h := range migrationPriorContentHashes[file] {
+			registered[h] = true
+		}
+		for hash := range hashes {
+			if !registered[hash] {
+				t.Errorf("frozen-edit-allowlist.txt lists %s %s, which migrationPriorContentHashes does not register", file, hash)
+			}
+		}
 	}
 }
 

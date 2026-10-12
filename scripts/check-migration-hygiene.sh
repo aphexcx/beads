@@ -201,6 +201,32 @@ else
   # edits are caught too; in CI the tree is clean so this equals the PR diff.
   frozen=$(git diff --name-status --diff-filter=MDR "$merge_base" -- \
     "$MIG_DIR/*.sql" "$MIG_DIR/ignored/*.sql" || true)
+  # A MODIFIED file is sanctioned when migrations/frozen-edit-allowlist.txt
+  # names it together with the sha256 of the bytes it had at the merge base
+  # (the prior content every cursor row recorded): the edit is then a known
+  # lineage event the reconciler also carries (migrationPriorContentHashes in
+  # internal/storage/schema/fork_reconcile.go). Deletions and renames are
+  # never sanctioned.
+  FROZEN_EDIT_ALLOWLIST="$MIG_DIR/frozen-edit-allowlist.txt"
+  if [ -n "$frozen" ] && [ -f "$FROZEN_EDIT_ALLOWLIST" ]; then
+    unsanctioned=""
+    while IFS=$'\t' read -r status path rest; do
+      [ -n "$status" ] || continue
+      if [ "$status" = "M" ]; then
+        rel="${path#"$MIG_DIR"/}"
+        base_hash=$(git show "$merge_base:$path" 2>/dev/null | shasum -a 256 | awk '{print $1}') || base_hash=""
+        if [ -n "$base_hash" ] && grep -Ev '^[[:space:]]*(#|$)' "$FROZEN_EDIT_ALLOWLIST" \
+            | awk -v f="$rel" -v h="$base_hash" '$1 == f && $2 == h && NF >= 3 { found = 1 } END { exit !found }'; then
+          echo "note (frozen migrations) $rel: in-place edit sanctioned by $FROZEN_EDIT_ALLOWLIST (prior sha256 $base_hash)" >&2
+          continue
+        fi
+      fi
+      unsanctioned="${unsanctioned}${status}	${path}${rest:+	$rest}
+"
+    done <<< "$frozen"
+    frozen="${unsanctioned%
+}"
+  fi
   if [ -n "$frozen" ]; then
     fail=1
     echo "FAIL (frozen migrations) files on the base branch were changed:"
