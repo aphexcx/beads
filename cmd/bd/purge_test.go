@@ -51,6 +51,13 @@ func TestParseOlderThan(t *testing.T) {
 		{"106752d", 0, true},
 		{"9223372036854775807d", 0, true},
 		{"99999999999h", 0, true},
+		// A negative day count large enough to overflow the multiplication
+		// used to wrap into a POSITIVE age of about 23h35m, which purge and
+		// prune --force then acted on (gf-jr0 finding 2c; the base rejected
+		// negative values before the multiplication).
+		{"-213503d", 0, true},
+		{"-213503", 0, true},
+		{"-9223372036854775808", 0, true},
 		// The largest representable day count still parses.
 		{"106751d", 106751 * day, false},
 	}

@@ -472,6 +472,9 @@ const maxOlderThanDays = math.MaxInt64 / int64(24*time.Hour)
 var errOlderThanRange = fmt.Errorf("duration out of range (at most %d days)", maxOlderThanDays)
 
 func daysAge(days int64) (time.Duration, error) {
+	if days <= 0 {
+		return 0, fmt.Errorf("duration must be positive")
+	}
 	if days > maxOlderThanDays {
 		return 0, errOlderThanRange
 	}
