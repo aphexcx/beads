@@ -11,16 +11,47 @@ import (
 	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
-// The two sanctioned contents of migration 0072 (gf-4c9 row 1): the bytes
-// every store that migrated through the fork lineage before 2026-10-12
-// recorded as row 72, and the bytes of the guarded file a fresh clone applies
-// today. schema.ContentHashesEquivalent is the source of truth for the pair;
-// the precondition below fails loudly if either value drifts from it.
+// Three sanctioned contents of migration 0072: the bytes every store that
+// migrated through the fork lineage before 2026-10-12 recorded as row 72
+// (gf-4c9 row 1's prior), the gf-4c9 row-1 bytes, and the bytes a fresh clone
+// applies today after the updated_at backfill (gf-pu2 finding 2d).
+// schema.ContentHashesEquivalent is the source of truth for the lineage; the
+// preconditions below fail loudly if a value drifts from it.
 const (
-	hash0072Prior   = "ef072196333301e0fa50a0d6eac9f23f529da8e04b5586d96c753a37da0d78c2"
-	hash0072Current = "0425363f7ff7adbae17329fa32d9ac533eeecb986a3aa1284d26dcf021161066"
-	hash0072Foreign = "1111111111111111111111111111111111111111111111111111111111111111"
+	hash0072Prior    = "ef072196333301e0fa50a0d6eac9f23f529da8e04b5586d96c753a37da0d78c2"
+	hash0072Current  = "0425363f7ff7adbae17329fa32d9ac533eeecb986a3aa1284d26dcf021161066"
+	hash0072Backfill = "4798ce8520665a4e44c998f07679d84bce45c7870c2dfd5152f9f9dae6b74959"
+	hash0072Foreign  = "1111111111111111111111111111111111111111111111111111111111111111"
 )
+
+// TestSchemaMigrationsConflictsAreVintageOnly_SanctionedLineageMerges0072Backfill
+// pins gf-pu2 finding 2d at the merge resolver: a clone that applied the
+// gf-4c9 text (or the older one) and a clone that applied the backfill text
+// carry different row-72 hashes and must still merge as vintage-only.
+func TestSchemaMigrationsConflictsAreVintageOnly_SanctionedLineageMerges0072Backfill(t *testing.T) {
+	for _, older := range []string{hash0072Prior, hash0072Current} {
+		if !schema.ContentHashesEquivalent(72, older, hash0072Backfill) {
+			t.Fatalf("precondition: schema does not sanction the 0072 pair (%s, %s); update the constants", older, hash0072Backfill)
+		}
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		mock.ExpectQuery(regexp.QuoteMeta(schemaMigrationsConflictsSQL)).
+			WillReturnRows(schemaMigrationsConflictRows([]driver.Value{72, 72, older, hash0072Backfill}))
+		ok, err := schemaMigrationsConflictsAreVintageOnly(context.Background(), db)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ok {
+			t.Fatalf("a conflict between %s and the backfill text must be vintage-only (auto-resolvable), got false", older)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+	}
+}
 
 const schemaMigrationsConflictsSQL = `
 		SELECT our_version, their_version, our_content_hash, their_content_hash

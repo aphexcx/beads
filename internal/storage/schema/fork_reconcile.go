@@ -133,10 +133,22 @@ var migrationPriorContentHashes = map[string][]string{
 	// only comment-only edit (the other differences are the fork's own added
 	// files and the byte-identical ignored renames 0025->0028, 0026->0029).
 	"0066_add_events_journal_actor.up.sql": {"a524d42ba0eced9350edbf6402dc2952957ff8f75a896bc8339c4cbc8596c793"},
-	// The pre-gf-4c9 bytes (COLUMNS-only probes on the three wisp statements),
-	// recorded as row 72 by every store that migrated through the fork
-	// lineage before 2026-10-12.
-	"0072_add_comment_external_ref.up.sql": {"ef072196333301e0fa50a0d6eac9f23f529da8e04b5586d96c753a37da0d78c2"},
+	// Every text this file has had, oldest first (gf-pu2 finding 2d: the
+	// registry holds the whole lineage, so a store that applied any of them
+	// opens without a skew refusal and runs no migration):
+	//  - cc12cfba…: the fork's duplicate-numbered 0024, the first shipping
+	//    of these statements;
+	//  - ef072196…: the fork's 0053 and the renumbered 0072 before gf-4c9
+	//    (COLUMNS-only probes on the three wisp statements), recorded as
+	//    row 72 by every store that migrated through the fork lineage
+	//    before 2026-10-12 — all four citadel stores;
+	//  - 0425363f…: the gf-4c9 row-1 bytes (the wisp statements guarded on
+	//    the table's existence), before this round's updated_at backfill.
+	"0072_add_comment_external_ref.up.sql": {
+		"cc12cfba4fcd5e51d6059dafe58056ecc155f188f576258189e95515645e8c8b",
+		"ef072196333301e0fa50a0d6eac9f23f529da8e04b5586d96c753a37da0d78c2",
+		"0425363f7ff7adbae17329fa32d9ac533eeecb986a3aa1284d26dcf021161066",
+	},
 }
 
 // migrationContentHashMatches reports whether recorded is the sha256 of the
