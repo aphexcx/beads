@@ -650,6 +650,13 @@ func MigrateUpTo(ctx context.Context, db DBConn, maxVersion int) (int, error) {
 // MigrateUp returns ErrIgnoredCursorRestoreDeferred with zero applied when an
 // interrupted cursor repair cannot finish. Only explicitly lenient open callers
 // may continue on the preserved scratch cursor; migrations have not completed.
+//
+// db must be ONE session — a pinned *sql.Conn (every production caller:
+// MigrateUpWithLock, the embedded store's open), or a *sql.DB whose pool holds
+// a single connection — because the pass issues session-scoped statements:
+// the fork-lineage cursor rewrites ride one START TRANSACTION … COMMIT
+// (applyForkLineageRewrites), and a pooled *sql.DB could land the COMMIT on a
+// different connection from the DELETEs.
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
 	needed, err := migrationWorkNeeded(ctx, db)
 	if err != nil {
