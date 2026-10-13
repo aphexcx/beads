@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
@@ -551,14 +553,50 @@ func applyForkLineageRewrites(ctx context.Context, db DBConn, rewrites []cursorR
 	return true, nil
 }
 
+// cursorRewriteRollbackTimeout bounds the ROLLBACK a cut leaves to issue: long
+// enough for a live server, short enough that a dead one does not hold the
+// pass's caller past the failure it is already reporting.
+const cursorRewriteRollbackTimeout = 10 * time.Second
+
 // rollbackCursorRewrites discards the cursor rewrite transaction a cut left
 // open, so no chain's DELETE outlives the others'. The rollback's own failure
 // is reported beside the cause, never instead of it.
+//
+// The ROLLBACK runs under its own bounded context, not the pass's: the cause
+// may BE the pass's context (canceled or expired between the DELETEs), and a
+// ROLLBACK sent under it would never reach the database while the pinned
+// session carried the open transaction to its next borrower, whose implicit
+// START TRANSACTION commits the orphaned DELETEs (the uow layer's poisonConn
+// rationale; codex round 1 on gf-c7n 2h). When even the rollback fails, the
+// session's transaction state is unknown and the pinned connection is
+// discarded so the pool closes it instead of handing it out again.
 func rollbackCursorRewrites(ctx context.Context, db DBConn, cause error) error {
-	if _, err := db.ExecContext(ctx, "ROLLBACK"); err != nil {
-		return fmt.Errorf("%w (and rolling the cursor rewrites back failed: %v)", cause, err)
+	rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cursorRewriteRollbackTimeout)
+	defer cancel()
+	if _, err := db.ExecContext(rbCtx, "ROLLBACK"); err != nil {
+		if discardPinnedSession(db) {
+			return fmt.Errorf("%w (and rolling the cursor rewrites back failed: %v; the pinned session was discarded)", cause, err)
+		}
+		return fmt.Errorf("%w (and rolling the cursor rewrites back failed: %v; the session may still hold the open transaction)", cause, err)
 	}
 	return cause
+}
+
+// discardPinnedSession poisons a pinned *sql.Conn whose transaction state is
+// unknown: driver.ErrBadConn from Raw makes database/sql close the underlying
+// connection and drop it from the pool instead of handing it to the next
+// borrower (internal/storage/uow's poisonConn). It reports whether db was a
+// connection it could discard; a DBConn that is not one (a *sql.Tx, a *sql.DB,
+// a mock) has no session to poison.
+func discardPinnedSession(db DBConn) bool {
+	raw, ok := db.(interface {
+		Raw(func(driverConn any) error) error
+	})
+	if !ok {
+		return false
+	}
+	_ = raw.Raw(func(any) error { return driver.ErrBadConn })
+	return true
 }
 
 // forkIgnoredCursorSource selects the rows the untrack repair will leave in

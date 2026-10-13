@@ -2,6 +2,7 @@ package schema
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -98,6 +99,81 @@ func TestApplyForkLineageRewrites_FailedRollbackIsReportedBesideTheCause(t *test
 	}
 	if !strings.Contains(err.Error(), "rollback refused") {
 		t.Fatalf("err = %q, want the rollback failure named beside the cause", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// cancelingConn is the pass's connection whose context is canceled by the
+// second DELETE: the statement returns the cancellation, as a pass whose
+// deadline expires between the DELETEs sees it. Everything else reaches db.
+type cancelingConn struct {
+	DBConn
+	cancel context.CancelFunc
+	table  string
+}
+
+func (c *cancelingConn) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if strings.HasPrefix(query, "DELETE FROM "+c.table+" ") {
+		c.cancel()
+		return nil, ctx.Err()
+	}
+	return c.DBConn.ExecContext(ctx, query, args...)
+}
+
+// A pass canceled between the DELETEs still rolls the first one back: the
+// ROLLBACK runs under its own context, not the canceled one, so it reaches
+// the database and the pinned session is not released with the transaction
+// open (codex round 1 on gf-c7n 2h).
+func TestApplyForkLineageRewrites_CanceledBetweenDeletesStillRollsBack(t *testing.T) {
+	db, mock := newMockDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &cancelingConn{DBConn: db, cancel: cancel, table: "ignored_schema_migrations"}
+
+	mock.ExpectExec(`^START TRANSACTION$`).WillReturnResult(sqlmock.NewResult(0, 0))
+	expectCursorDelete(mock, "schema_migrations", 51, 54)
+	mock.ExpectExec(`^ROLLBACK$`).WillReturnResult(sqlmock.NewResult(0, 0))
+
+	_, err := applyForkLineageRewrites(ctx, conn, forkLineageRewritesForTest())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("applyForkLineageRewrites = %v, want the cancellation as the cause", err)
+	}
+	if strings.Contains(err.Error(), "rolling the cursor rewrites back failed") {
+		t.Fatalf("err = %q: the ROLLBACK did not reach the database", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations (the ROLLBACK must run under its own context): %v", err)
+	}
+}
+
+// When the rollback itself fails on a pinned connection, the session's
+// transaction state is unknown and the connection is discarded: the next
+// statement on it does not reach the database.
+func TestApplyForkLineageRewrites_FailedRollbackDiscardsThePinnedSession(t *testing.T) {
+	db, mock := newMockDB(t)
+	cut := errors.New("connection cut")
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("pin connection: %v", err)
+	}
+	defer conn.Close()
+
+	mock.ExpectExec(`^START TRANSACTION$`).WillReturnResult(sqlmock.NewResult(0, 0))
+	expectCursorDelete(mock, "schema_migrations", 51, 54)
+	mock.ExpectExec(`DELETE FROM ignored_schema_migrations WHERE version BETWEEN \? AND \?`).
+		WithArgs(10, 11).
+		WillReturnError(cut)
+	mock.ExpectExec(`^ROLLBACK$`).WillReturnError(errors.New("rollback refused"))
+	mock.ExpectClose()
+
+	_, err = applyForkLineageRewrites(context.Background(), conn, forkLineageRewritesForTest())
+	if !errors.Is(err, cut) || !strings.Contains(err.Error(), "the pinned session was discarded") {
+		t.Fatalf("applyForkLineageRewrites = %v, want the cut and the discarded session named", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), "SELECT 1"); err == nil {
+		t.Fatal("the discarded connection still serves statements")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet expectations: %v", err)
