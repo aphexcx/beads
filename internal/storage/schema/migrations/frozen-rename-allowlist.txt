@@ -1,0 +1,16 @@
+# Allowlist for scripts/check-migration-hygiene.sh check C (shipped migrations
+# are frozen): the byte-identical RENAMES this lineage carries against an
+# upstream base.
+#
+# Format: <old path relative to migrations/> <whitespace> <new path relative to migrations/> <whitespace> <sha256> <whitespace> <justification>.
+# The sha256 is of the file's bytes, which must be the same at the old path on
+# the base branch and at the new path in the tree: a rename that also edits is
+# never sanctioned, nor is a deletion. Every row here must be a rename the
+# lineage reconciler itself fingerprints — upstreamIgnoredBaseFiles in
+# internal/storage/schema/fork_reconcile.go maps upstream v1.3.1's ignored
+# cursor rows (25, 26) to the files this lineage ships under a later number
+# with identical content — so the script can never sanction a rename the
+# binary does not reconcile; TestFrozenRenameAllowlistMatchesTheReconcilersRows
+# pins the two lists to each other.
+ignored/0025_add_events_journal_actor.up.sql ignored/0028_add_events_journal_actor.up.sql c81ca9edc80c25f6ab4f92d05d6ea412a780b108d1ed83745027440e9723dceb gf-xid finding 2g: upstream v1.3.1's ignored 0025, shipped here as 0028 because this lineage's ignored 0025-0027 are the fork's Linear snapshot tables and the wisp_comments external_ref (the 2026-08 upmerge renumbering); the reconciler recognizes an upstream-origin row 25 by this hash (fork_reconcile.go upstreamIgnoredBaseFiles)
+ignored/0026_dep_rekey_dedup_marker.up.sql ignored/0029_dep_rekey_dedup_marker.up.sql dc5c1b9a74e42184451796068ecba1ca11d8ebd0fe7e8c4bd4900d0cfee30446 gf-xid finding 2g: upstream v1.3.1's ignored 0026, shipped here as 0029 for the same reason; the reconciler recognizes an upstream-origin row 26 by this hash (fork_reconcile.go upstreamIgnoredBaseFiles)

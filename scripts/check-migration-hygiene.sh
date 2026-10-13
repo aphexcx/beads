@@ -23,6 +23,22 @@
 #      exists on the base branch. New files only. Fix-forward with a new
 #      migration instead: applied migration content is content-hashed
 #      (PR 4270), so editing history creates cross-clone hash skew.
+#      Two narrow, registered exceptions, each pinned to the bytes the
+#      lineage reconciler (internal/storage/schema/fork_reconcile.go) itself
+#      recognizes, so the script can never sanction more than the binary
+#      reconciles:
+#        - an in-place EDIT named in migrations/frozen-edit-allowlist.txt
+#          together with the sha256 of the bytes at the merge base (the
+#          prior content every cursor row recorded; the same pair lives in
+#          migrationPriorContentHashes);
+#        - a byte-identical RENAME named in
+#          migrations/frozen-rename-allowlist.txt together with the sha256
+#          of the bytes, which must be the same at the old path on the base
+#          and at the new path in the tree (the reconciler fingerprints
+#          exactly these: upstreamIgnoredBaseFiles maps upstream's ignored
+#          cursor rows to the files this lineage ships under a later number,
+#          byte for byte). A rename that also edits is never sanctioned, and
+#          a deletion never is.
 #   D. A new main-plane migration whose DDL touches a clone-local
 #      (dolt_ignored) table must ship an ignored-series twin in the same
 #      change. Clone-local tables are materialized on fresh clones by the
@@ -74,6 +90,18 @@
 #      so the gap is a follow-up (mybd-q8hy2) rather than a
 #      reason to withhold the guard. A reviewer who sees any of these three
 #      shapes in a new migration should not trust a green check here.
+#      A file named in migrations/prepared-dml-allowlist.txt together with
+#      the sha256 of its CURRENT bytes is exempt: the entry asserts that the
+#      prepared write cannot matter on the one path this check is about,
+#      because cliCompatibleMigrationSQL (cli_migrations.go) substitutes
+#      direct SQL for that file in the fresh bundle, so its prepared text
+#      never reaches `dolt sql` at all
+#      (TestPreparedDMLAllowlistPinsAnOverriddenMigration pins both halves).
+#      The pin is the current bytes on purpose: any later edit of the file
+#      re-trips the check until the entry is re-justified. 0072 is the one
+#      entry: it is "added" against every base that predates the fork
+#      lineage (upstream's), and its guarded backfill UPDATEs are the
+#      deterministic form finding 2d required (gf-xid finding 2g).
 #      This is a going-forward guard, and deliberately new-files-only: seven
 #      shipped main-plane migrations (0035, 0037, 0041, 0047, 0053, 0055,
 #      0058) already PREPARE writes to real tables. They are not a live bug
@@ -205,14 +233,19 @@ else
   # names it together with the sha256 of the bytes it had at the merge base
   # (the prior content every cursor row recorded): the edit is then a known
   # lineage event the reconciler also carries (migrationPriorContentHashes in
-  # internal/storage/schema/fork_reconcile.go). Deletions and renames are
-  # never sanctioned.
+  # internal/storage/schema/fork_reconcile.go). A RENAMED file is sanctioned
+  # when migrations/frozen-rename-allowlist.txt names the old path, the new
+  # path and the sha256 of the bytes, and those bytes are what the old path
+  # had at the merge base AND what the new path has now (a rename that also
+  # edits is never sanctioned): the reconciler fingerprints exactly these
+  # renames (upstreamIgnoredBaseFiles). Deletions are never sanctioned.
   FROZEN_EDIT_ALLOWLIST="$MIG_DIR/frozen-edit-allowlist.txt"
-  if [ -n "$frozen" ] && [ -f "$FROZEN_EDIT_ALLOWLIST" ]; then
+  FROZEN_RENAME_ALLOWLIST="$MIG_DIR/frozen-rename-allowlist.txt"
+  if [ -n "$frozen" ] && { [ -f "$FROZEN_EDIT_ALLOWLIST" ] || [ -f "$FROZEN_RENAME_ALLOWLIST" ]; }; then
     unsanctioned=""
     while IFS=$'\t' read -r status path rest; do
       [ -n "$status" ] || continue
-      if [ "$status" = "M" ]; then
+      if [ "$status" = "M" ] && [ -f "$FROZEN_EDIT_ALLOWLIST" ]; then
         rel="${path#"$MIG_DIR"/}"
         base_hash=$(git show "$merge_base:$path" 2>/dev/null | shasum -a 256 | awk '{print $1}') || base_hash=""
         if [ -n "$base_hash" ] && grep -Ev '^[[:space:]]*(#|$)' "$FROZEN_EDIT_ALLOWLIST" \
@@ -221,11 +254,45 @@ else
           continue
         fi
       fi
+      case "$status" in
+        R*)
+          if [ -f "$FROZEN_RENAME_ALLOWLIST" ] && [ -n "$rest" ] && [ -f "$rest" ]; then
+            old_rel="${path#"$MIG_DIR"/}"
+            new_rel="${rest#"$MIG_DIR"/}"
+            base_hash=$(git show "$merge_base:$path" 2>/dev/null | shasum -a 256 | awk '{print $1}') || base_hash=""
+            new_hash=$(shasum -a 256 "$rest" | awk '{print $1}')
+            if [ -n "$base_hash" ] && [ "$base_hash" = "$new_hash" ] \
+                && grep -Ev '^[[:space:]]*(#|$)' "$FROZEN_RENAME_ALLOWLIST" \
+                | awk -v o="$old_rel" -v n="$new_rel" -v h="$base_hash" '$1 == o && $2 == n && $3 == h && NF >= 4 { found = 1 } END { exit !found }'; then
+              echo "note (frozen migrations) $old_rel -> $new_rel: byte-identical rename sanctioned by $FROZEN_RENAME_ALLOWLIST (sha256 $base_hash)" >&2
+              continue
+            fi
+          fi
+          ;;
+      esac
       unsanctioned="${unsanctioned}${status}	${path}${rest:+	$rest}
 "
     done <<< "$frozen"
     frozen="${unsanctioned%
 }"
+  fi
+  # Rename-allowlist hygiene: every row must name two existing-or-renamed
+  # paths under migrations/ (the new path must exist in the tree), carry a
+  # sha256 and a justification.
+  if [ -f "$FROZEN_RENAME_ALLOWLIST" ]; then
+    while IFS= read -r line; do
+      case "$line" in ''|'#'*) continue ;; esac
+      read -r r_old r_new r_hash r_just <<<"$line"
+      if [ -z "$r_old" ] || [ -z "$r_new" ] || [ -z "$r_hash" ] || [ -z "$r_just" ]; then
+        fail=1
+        echo "FAIL (rename allowlist) entry needs <old> <new> <sha256> <justification>: $line"
+        continue
+      fi
+      if [ ! -f "$MIG_DIR/$r_new" ]; then
+        fail=1
+        echo "FAIL (rename allowlist) stale entry, renamed file does not exist: $r_new"
+      fi
+    done < "$FROZEN_RENAME_ALLOWLIST"
   fi
   if [ -n "$frozen" ]; then
     fail=1
@@ -404,8 +471,43 @@ else
   # Only *.up.sql is embedded into the CLI fresh bundle (`//go:embed
   # migrations/*.up.sql`, schema.go:218), so a .down.sql can never meet the bug
   # this check is about. Scanning it would reject valid work for no reason.
+  # A file named in migrations/prepared-dml-allowlist.txt with the sha256 of
+  # its CURRENT bytes is exempt (see the header): the fresh bundle substitutes
+  # direct SQL for it, so its prepared text never reaches `dolt sql`. An
+  # entry whose hash no longer matches the file is a FAIL, not a skip: the
+  # exemption was written for other bytes.
+  PREPARED_DML_ALLOWLIST="$MIG_DIR/prepared-dml-allowlist.txt"
+  if [ -f "$PREPARED_DML_ALLOWLIST" ]; then
+    while IFS= read -r line; do
+      case "$line" in ''|'#'*) continue ;; esac
+      read -r p_file p_hash p_just <<<"$line"
+      if [ -z "$p_file" ] || [ -z "$p_hash" ] || [ -z "$p_just" ]; then
+        fail=1
+        echo "FAIL (prepared DML allowlist) entry needs <file> <sha256> <justification>: $line"
+        continue
+      fi
+      if [ ! -f "$MIG_DIR/$p_file" ]; then
+        fail=1
+        echo "FAIL (prepared DML allowlist) stale entry, file does not exist: $p_file"
+      fi
+    done < "$PREPARED_DML_ALLOWLIST"
+  fi
   for f in $(grep '\.up\.sql$' <<<"$added_main" || true); do
     [ -f "$f" ] || continue
+    rel="${f#"$MIG_DIR"/}"
+    if [ -f "$PREPARED_DML_ALLOWLIST" ]; then
+      pinned=$(grep -Ev '^[[:space:]]*(#|$)' "$PREPARED_DML_ALLOWLIST" | awk -v f="$rel" '$1 == f && NF >= 3 { print $2; exit }')
+      if [ -n "$pinned" ]; then
+        cur_hash=$(shasum -a 256 "$f" | awk '{print $1}')
+        if [ "$pinned" = "$cur_hash" ]; then
+          echo "note (prepared DML) $rel: exempt by $PREPARED_DML_ALLOWLIST (the fresh bundle substitutes direct SQL for it; sha256 $cur_hash)" >&2
+          continue
+        fi
+        fail=1
+        echo "FAIL (prepared DML) $f changed since its $PREPARED_DML_ALLOWLIST entry was written (pinned $pinned, now $cur_hash); re-justify the entry or restructure the migration."
+        continue
+      fi
+    fi
     stripped=$(sed 's/--.*$//' "$f" | tr '[:upper:]' '[:lower:]')
     declare -A dml_flagged=()
     dml_var=""

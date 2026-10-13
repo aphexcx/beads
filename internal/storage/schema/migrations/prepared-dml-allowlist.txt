@@ -1,0 +1,16 @@
+# Allowlist for scripts/check-migration-hygiene.sh check E (no PREPARE'd DML in
+# new main-plane migrations).
+#
+# Format: <path relative to migrations/> <whitespace> <sha256 of the file's CURRENT bytes> <whitespace> <justification>.
+# An entry asserts that the file's prepared INSERT/UPDATE/DELETE cannot matter
+# on the one path check E protects — the fresh-schema bundle the Dolt CLI
+# batch path builds (dolthub/dolt#11345 silently no-ops a prepared write
+# there) — because cliCompatibleMigrationSQL (internal/storage/schema/
+# cli_migrations.go) substitutes direct SQL for the whole file in that bundle,
+# so its prepared text never reaches `dolt sql`. The hash pins the current
+# bytes on purpose: any later edit of the file re-trips check E until the
+# entry is re-justified. TestPreparedDMLAllowlistPinsAnOverriddenMigration
+# pins both halves (the hash is current; the bundle overrides the file).
+# Runtime migrations run the source text over a real driver connection, where
+# PREPARE/EXECUTE applies normally; this list says nothing about that path.
+0072_add_comment_external_ref.up.sql 3e371652b0e6a5721938f571c4fcb38d6f49d45f69c8c51dd7e610f825c3f3e1 gf-xid finding 2g: the two guarded `UPDATE … SET updated_at = created_at WHERE updated_at IS NULL` backfills are the deterministic form finding 2d required (a one-step ADD COLUMN DEFAULT CURRENT_TIMESTAMP stamped every existing comment with migration time) and they must stay inside the file's prepared, INFORMATION_SCHEMA-guarded shape (wisp_comments may not exist on a clone of an upstream-shaped base); the file counts as added against every base that predates the fork lineage (upstream's), and the fresh bundle never executes it: cliCompatibleMigrationSQL returns cliMigration0072AddCommentExternalRef, direct DDL on an empty schema where a backfill has nothing to touch
