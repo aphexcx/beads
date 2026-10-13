@@ -302,12 +302,10 @@ type cursorRewrite struct {
 	lo, hi  int
 }
 
-func (r cursorRewrite) apply(ctx context.Context, db DBConn) error {
-	if r.prepare != nil {
-		if err := r.prepare(ctx, db); err != nil {
-			return err
-		}
-	}
+// deleteRows is the rewrite itself: the cursor rows the chain verified, gone
+// in one statement. It is only ever issued inside the transaction
+// applyForkLineageRewrites opens over every planned chain.
+func (r cursorRewrite) deleteRows(ctx context.Context, db DBConn) error {
 	//nolint:gosec // G202: r.table is one of the two hardcoded cursor table names.
 	if _, err := db.ExecContext(ctx,
 		"DELETE FROM "+r.table+" WHERE version BETWEEN ? AND ?", r.lo, r.hi); err != nil {
@@ -508,13 +506,59 @@ func planForkLineageCursors(ctx context.Context, db DBConn) ([]cursorRewrite, er
 // staged tables and committed the dolt_ignore seed, and before pending
 // versions are computed. Returns whether any cursor was changed. The DELETEs
 // only touch the cursor tables and are committed with the rest of the pass.
+//
+// Every chain's DELETE rides ONE transaction on the pass's connection (each
+// caller of MigrateUp pins a *sql.Conn, so START TRANSACTION and COMMIT land
+// where the DELETEs do), and a cut between them rolls the ones issued back.
+// Before, each DELETE autocommitted on its own: a pass cut between the bd-dn6
+// main DELETE (rows 51-54) and the ignored one (rows 10-11) left row 54 gone
+// and row 11 standing, and because the ignored fingerprint is only read
+// beside the main one (upstream also owns an ignored 0011,
+// planForkLineageRewrites), the retry planned nothing for the ignored chain
+// and resumed above 11 — upstream's ignored 0010 (drop_wisp_id_defaults) and
+// 0011 (cleanup_orphaned_child_counters) were never applied while the
+// cursor went on to report latest (gf-c7n finding 2h, the gf-xid vs-v1.3.1
+// gate on af1eaddfc). With both fingerprints intact after a cut, the next
+// pass plans both chains again.
+//
+// The prepare writes (the bd-dn6 pre-squash drift repair: per-column guarded
+// ALTERs and their own Dolt commit) run before the transaction opens. A Dolt
+// commit inside an open SQL transaction is not a shape this pass relies on,
+// and a repair cut short is re-probed, re-verified and re-planned on the
+// next pass like every other write here.
 func applyForkLineageRewrites(ctx context.Context, db DBConn, rewrites []cursorRewrite) (bool, error) {
+	if len(rewrites) == 0 {
+		return false, nil
+	}
 	for _, r := range rewrites {
-		if err := r.apply(ctx, db); err != nil {
-			return true, err
+		if r.prepare != nil {
+			if err := r.prepare(ctx, db); err != nil {
+				return true, err
+			}
 		}
 	}
-	return len(rewrites) > 0, nil
+	if _, err := db.ExecContext(ctx, "START TRANSACTION"); err != nil {
+		return true, fmt.Errorf("opening the cursor rewrite transaction: %w", err)
+	}
+	for _, r := range rewrites {
+		if err := r.deleteRows(ctx, db); err != nil {
+			return true, rollbackCursorRewrites(ctx, db, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		return true, rollbackCursorRewrites(ctx, db, fmt.Errorf("committing the cursor rewrites: %w", err))
+	}
+	return true, nil
+}
+
+// rollbackCursorRewrites discards the cursor rewrite transaction a cut left
+// open, so no chain's DELETE outlives the others'. The rollback's own failure
+// is reported beside the cause, never instead of it.
+func rollbackCursorRewrites(ctx context.Context, db DBConn, cause error) error {
+	if _, err := db.ExecContext(ctx, "ROLLBACK"); err != nil {
+		return fmt.Errorf("%w (and rolling the cursor rewrites back failed: %v)", cause, err)
+	}
+	return cause
 }
 
 // forkIgnoredCursorSource selects the rows the untrack repair will leave in

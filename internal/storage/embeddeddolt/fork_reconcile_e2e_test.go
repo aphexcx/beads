@@ -40,6 +40,107 @@ func TestForkLineageReconciliationEndToEnd(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	conn, fileHash := openPreMergeForkFixture(t, ctx)
+
+	// --- Run the merged binary's migration pass ---
+	if _, err := schema.MigrateUp(ctx, conn); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+
+	// Cursor state: fork rows moved to their new numbers, with the old
+	// numbers now recorded with upstream content.
+	assertScalar(t, ctx, conn, "SELECT COALESCE(MAX(version),0) FROM schema_migrations", schema.LatestVersion())
+	assertScalar(t, ctx, conn, "SELECT COALESCE(MAX(version),0) FROM ignored_schema_migrations", schema.LatestIgnoredVersion())
+
+	cursorHashes := map[string]struct {
+		table   string
+		version int
+		file    string
+	}{
+		"upstream 0051":         {"schema_migrations", 51, "0051_drop_aux_id_defaults.up.sql"},
+		"upstream 0052":         {"schema_migrations", 52, "0052_add_date_indexes.up.sql"},
+		"upstream 0053":         {"schema_migrations", 53, "0053_repair_rig_wisps.up.sql"},
+		"upstream 0054":         {"schema_migrations", 54, "0054_add_lease_columns.up.sql"},
+		"fork 0070":             {"schema_migrations", 70, "0070_create_linear_label_snapshots.up.sql"},
+		"fork 0071":             {"schema_migrations", 71, "0071_linear_snapshots_dolt_ignore.up.sql"},
+		"fork 0072":             {"schema_migrations", 72, "0072_add_comment_external_ref.up.sql"},
+		"fork 0073":             {"schema_migrations", 73, "0073_create_attachments.up.sql"},
+		"upstream ignored 0010": {"ignored_schema_migrations", 10, "ignored/0010_drop_wisp_id_defaults.up.sql"},
+		"upstream ignored 0011": {"ignored_schema_migrations", 11, "ignored/0011_cleanup_orphaned_child_counters.up.sql"},
+		"fork ignored 0025":     {"ignored_schema_migrations", 25, "ignored/0025_create_linear_issue_snapshots.up.sql"},
+		"fork ignored 0026":     {"ignored_schema_migrations", 26, "ignored/0026_create_linear_project_snapshots.up.sql"},
+	}
+	for desc, tc := range cursorHashes {
+		var recorded sql.NullString
+		//nolint:gosec // test-only, table names are constants above
+		err := conn.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT content_hash FROM %s WHERE version = %d", tc.table, tc.version)).Scan(&recorded)
+		if err != nil {
+			t.Errorf("%s: reading recorded hash: %v", desc, err)
+			continue
+		}
+		if !recorded.Valid || recorded.String != fileHash(tc.file) {
+			t.Errorf("%s: recorded hash %v, want hash of %s", desc, recorded, tc.file)
+		}
+	}
+
+	// Upstream 0051 effect: aux id DEFAULTs dropped (would have been silently
+	// skipped without reconciliation).
+	for _, table := range []string{"events", "comments", "issue_snapshots", "compaction_snapshots", "wisp_events", "wisp_comments"} {
+		var columnDefault sql.NullString
+		if err := conn.QueryRowContext(ctx, `
+			SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'id'
+		`, table).Scan(&columnDefault); err != nil {
+			t.Fatalf("reading %s.id default: %v", table, err)
+		}
+		if columnDefault.Valid {
+			t.Errorf("%s.id still has DEFAULT %q; upstream 0051/ignored 0010 was skipped", table, columnDefault.String)
+		}
+	}
+
+	// Upstream 0052 effect: date indexes replaced the single-column status
+	// index.
+	// STATISTICS has one row per column of an index, so count index names.
+	assertScalar(t, ctx, conn, "SELECT COUNT(DISTINCT INDEX_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = 'idx_issues_status_updated_at'", 1)
+	assertScalar(t, ctx, conn, "SELECT COUNT(DISTINCT INDEX_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = 'idx_issues_defer_until'", 1)
+	assertScalar(t, ctx, conn, "SELECT COUNT(DISTINCT INDEX_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = 'idx_issues_status'", 0)
+
+	// Fork DDL survived the re-run untouched.
+	for _, table := range []string{"linear_label_snapshots", "attachments", "linear_issue_snapshots", "linear_project_snapshots"} {
+		if _, err := conn.ExecContext(ctx, "SELECT 1 FROM `"+table+"` LIMIT 0"); err != nil {
+			t.Errorf("fork table %s not queryable after reconciliation: %v", table, err)
+		}
+	}
+	assertScalar(t, ctx, conn, "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'comments' AND COLUMN_NAME = 'external_ref'", 1)
+
+	// Doctor-facing verification agrees.
+	report, err := schema.VerifyForkLineageState(ctx, conn)
+	if err != nil {
+		t.Fatalf("VerifyForkLineageState (post): %v", err)
+	}
+	if report.Status != schema.ForkLineageReconciled {
+		t.Fatalf("post-migration lineage = %q (problems: %v), want %q", report.Status, report.Problems, schema.ForkLineageReconciled)
+	}
+
+	// Second pass: nothing to do, nothing re-fires.
+	applied, err := schema.MigrateUp(ctx, conn)
+	if err != nil {
+		t.Fatalf("MigrateUp (second pass): %v", err)
+	}
+	if applied != 0 {
+		t.Errorf("second MigrateUp applied %d migrations, want 0", applied)
+	}
+}
+
+// openPreMergeForkFixture rebuilds a database exactly as a pre-merge fork
+// binary left it — main migrations 1-50 plus the fork's 0051-0054 (recorded
+// under those numbers), ignored 1-9 plus the fork's 0010-0011 — committed,
+// and returns the pinned connection the merged binary's MigrateUp runs on
+// and a reader of the embedded migration files' hashes. Shared by the
+// end-to-end reconciliation test and the interruption test (gf-c7n 2h).
+func openPreMergeForkFixture(t *testing.T, ctx context.Context) (*sql.Conn, func(rel string) string) {
+	t.Helper()
 	dataDir := filepath.Join(t.TempDir(), ".beads", "embeddeddolt")
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -167,96 +268,7 @@ func TestForkLineageReconciliationEndToEnd(t *testing.T) {
 	if report.Status != schema.ForkLineagePreMerge {
 		t.Fatalf("pre-migration lineage = %q, want %q", report.Status, schema.ForkLineagePreMerge)
 	}
-
-	// --- Run the merged binary's migration pass ---
-	if _, err := schema.MigrateUp(ctx, conn); err != nil {
-		t.Fatalf("MigrateUp: %v", err)
-	}
-
-	// Cursor state: fork rows moved to their new numbers, with the old
-	// numbers now recorded with upstream content.
-	assertScalar(t, ctx, conn, "SELECT COALESCE(MAX(version),0) FROM schema_migrations", schema.LatestVersion())
-	assertScalar(t, ctx, conn, "SELECT COALESCE(MAX(version),0) FROM ignored_schema_migrations", schema.LatestIgnoredVersion())
-
-	cursorHashes := map[string]struct {
-		table   string
-		version int
-		file    string
-	}{
-		"upstream 0051":         {"schema_migrations", 51, "0051_drop_aux_id_defaults.up.sql"},
-		"upstream 0052":         {"schema_migrations", 52, "0052_add_date_indexes.up.sql"},
-		"upstream 0053":         {"schema_migrations", 53, "0053_repair_rig_wisps.up.sql"},
-		"upstream 0054":         {"schema_migrations", 54, "0054_add_lease_columns.up.sql"},
-		"fork 0070":             {"schema_migrations", 70, "0070_create_linear_label_snapshots.up.sql"},
-		"fork 0071":             {"schema_migrations", 71, "0071_linear_snapshots_dolt_ignore.up.sql"},
-		"fork 0072":             {"schema_migrations", 72, "0072_add_comment_external_ref.up.sql"},
-		"fork 0073":             {"schema_migrations", 73, "0073_create_attachments.up.sql"},
-		"upstream ignored 0010": {"ignored_schema_migrations", 10, "ignored/0010_drop_wisp_id_defaults.up.sql"},
-		"upstream ignored 0011": {"ignored_schema_migrations", 11, "ignored/0011_cleanup_orphaned_child_counters.up.sql"},
-		"fork ignored 0025":     {"ignored_schema_migrations", 25, "ignored/0025_create_linear_issue_snapshots.up.sql"},
-		"fork ignored 0026":     {"ignored_schema_migrations", 26, "ignored/0026_create_linear_project_snapshots.up.sql"},
-	}
-	for desc, tc := range cursorHashes {
-		var recorded sql.NullString
-		//nolint:gosec // test-only, table names are constants above
-		err := conn.QueryRowContext(ctx,
-			fmt.Sprintf("SELECT content_hash FROM %s WHERE version = %d", tc.table, tc.version)).Scan(&recorded)
-		if err != nil {
-			t.Errorf("%s: reading recorded hash: %v", desc, err)
-			continue
-		}
-		if !recorded.Valid || recorded.String != fileHash(tc.file) {
-			t.Errorf("%s: recorded hash %v, want hash of %s", desc, recorded, tc.file)
-		}
-	}
-
-	// Upstream 0051 effect: aux id DEFAULTs dropped (would have been silently
-	// skipped without reconciliation).
-	for _, table := range []string{"events", "comments", "issue_snapshots", "compaction_snapshots", "wisp_events", "wisp_comments"} {
-		var columnDefault sql.NullString
-		if err := conn.QueryRowContext(ctx, `
-			SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS
-			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'id'
-		`, table).Scan(&columnDefault); err != nil {
-			t.Fatalf("reading %s.id default: %v", table, err)
-		}
-		if columnDefault.Valid {
-			t.Errorf("%s.id still has DEFAULT %q; upstream 0051/ignored 0010 was skipped", table, columnDefault.String)
-		}
-	}
-
-	// Upstream 0052 effect: date indexes replaced the single-column status
-	// index.
-	// STATISTICS has one row per column of an index, so count index names.
-	assertScalar(t, ctx, conn, "SELECT COUNT(DISTINCT INDEX_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = 'idx_issues_status_updated_at'", 1)
-	assertScalar(t, ctx, conn, "SELECT COUNT(DISTINCT INDEX_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = 'idx_issues_defer_until'", 1)
-	assertScalar(t, ctx, conn, "SELECT COUNT(DISTINCT INDEX_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'issues' AND INDEX_NAME = 'idx_issues_status'", 0)
-
-	// Fork DDL survived the re-run untouched.
-	for _, table := range []string{"linear_label_snapshots", "attachments", "linear_issue_snapshots", "linear_project_snapshots"} {
-		if _, err := conn.ExecContext(ctx, "SELECT 1 FROM `"+table+"` LIMIT 0"); err != nil {
-			t.Errorf("fork table %s not queryable after reconciliation: %v", table, err)
-		}
-	}
-	assertScalar(t, ctx, conn, "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'comments' AND COLUMN_NAME = 'external_ref'", 1)
-
-	// Doctor-facing verification agrees.
-	report, err = schema.VerifyForkLineageState(ctx, conn)
-	if err != nil {
-		t.Fatalf("VerifyForkLineageState (post): %v", err)
-	}
-	if report.Status != schema.ForkLineageReconciled {
-		t.Fatalf("post-migration lineage = %q (problems: %v), want %q", report.Status, report.Problems, schema.ForkLineageReconciled)
-	}
-
-	// Second pass: nothing to do, nothing re-fires.
-	applied, err := schema.MigrateUp(ctx, conn)
-	if err != nil {
-		t.Fatalf("MigrateUp (second pass): %v", err)
-	}
-	if applied != 0 {
-		t.Errorf("second MigrateUp applied %d migrations, want 0", applied)
-	}
+	return conn, fileHash
 }
 
 func assertScalar(t *testing.T, ctx context.Context, conn *sql.Conn, query string, want int) {

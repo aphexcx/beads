@@ -129,7 +129,7 @@ func TestForkCursorRecoveryPlansRestoredRows(t *testing.T) {
 					t.Fatalf("missing live cursor rewrite %d-%d: %+v", lo, hi, rewrites)
 				}
 				expectCursorRewrite(mock, ignoredSource.cursorTable, lo, hi)
-				if err := ignoredRewrite.apply(ctx, db); err != nil {
+				if _, err := applyForkLineageRewrites(ctx, db, []cursorRewrite{*ignoredRewrite}); err != nil {
 					t.Fatal(err)
 				}
 				expectCursorProbe(mock, ignoredSource.cursorTable, true)

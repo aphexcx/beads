@@ -85,10 +85,7 @@ func applyPlanned(ctx context.Context, db DBConn, plan func(context.Context, DBC
 	if err != nil || rewrite == nil {
 		return false, err
 	}
-	if err := rewrite.apply(ctx, db); err != nil {
-		return true, err
-	}
-	return true, nil
+	return applyForkLineageRewrites(ctx, db, []cursorRewrite{*rewrite})
 }
 
 func reconcileForkMainCursor(ctx context.Context, db DBConn) (bool, error) {
@@ -99,10 +96,20 @@ func reconcileForkIgnoredCursor(ctx context.Context, db DBConn) (bool, error) {
 	return applyPlanned(ctx, db, planForkIgnoredCursor)
 }
 
+// expectCursorRewrite queues one chain's rewrite as applyForkLineageRewrites
+// issues it on its own: the DELETE inside the one transaction (gf-c7n 2h).
 func expectCursorRewrite(mock sqlmock.Sqlmock, table string, lo, hi int) {
-	mock.ExpectExec(`DELETE FROM `+table+` WHERE version BETWEEN \? AND \?`).
-		WithArgs(lo, hi).
-		WillReturnResult(sqlmock.NewResult(0, int64(hi-lo+1)))
+	expectCursorRewrites(mock, cursorRewrite{table: table, lo: lo, hi: hi})
+}
+
+// expectCursorRewrites queues the rewrites of every planned chain as one
+// transaction: START TRANSACTION, each chain's DELETE in apply order, COMMIT.
+func expectCursorRewrites(mock sqlmock.Sqlmock, rewrites ...cursorRewrite) {
+	mock.ExpectExec(`^START TRANSACTION$`).WillReturnResult(sqlmock.NewResult(0, 0))
+	for _, r := range rewrites {
+		expectCursorDelete(mock, r.table, r.lo, r.hi)
+	}
+	mock.ExpectExec(`^COMMIT$`).WillReturnResult(sqlmock.NewResult(0, 0))
 }
 
 // expectForkMainVerification queues the happy-path probe sequence for
@@ -1170,8 +1177,9 @@ func TestPlanForkLineageRewrites_AppliesAfterEveryChainVerified(t *testing.T) {
 	for _, v := range []int{20, 21, 22} {
 		expectRecordedHash(mock, "ignored_schema_migrations", v, forkFileHash(t, ignoredSource, upmergeRenumberedIgnoredFiles[v]))
 	}
-	expectCursorRewrite(mock, "schema_migrations", 70, 73)
-	expectCursorRewrite(mock, "ignored_schema_migrations", 20, 22)
+	expectCursorRewrites(mock,
+		cursorRewrite{table: "schema_migrations", lo: 70, hi: 73},
+		cursorRewrite{table: "ignored_schema_migrations", lo: 20, hi: 22})
 
 	rewrites, err := planForkLineageCursors(context.Background(), db)
 	if err != nil {
