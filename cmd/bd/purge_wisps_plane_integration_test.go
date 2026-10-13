@@ -117,6 +117,14 @@ func runPurgeRetentionScenario(t *testing.T, r purgeScenarioRunner) {
 			r.mode, preview)
 	}
 
+	// Without --force the confirmation suggests the caller's own command,
+	// the limit included: a hint that dropped it deleted every eligible row
+	// when followed (gf-c7n finding 2i).
+	if stdout, stderr, err := r.run(t, "purge", "--wisps-plane", "--older-than", "1s", "--limit", "1"); err == nil ||
+		!strings.Contains(stdout+stderr, "bd purge --force --wisps-plane --older-than 1s --limit 1") {
+		t.Fatalf("%s: purge --limit 1 without --force: err=%v; want the hint to carry --limit 1\n%s%s", r.mode, err, stdout, stderr)
+	}
+
 	// --limit drains in bounded runs and says whether more remain.
 	first := r.purgeJSON(t, "--wisps-plane", "--older-than", "1s", "--limit", "1", "--force")
 	if jsonCount(first, "purged_count") != 1 || jsonCount(first, "remaining") != 1 || first["has_more"] != true {

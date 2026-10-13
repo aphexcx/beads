@@ -210,7 +210,7 @@ func runPurgeOrPrune(cmd *cobra.Command, scope purgeScope) error {
 	case dryRun:
 		return emitSweepDryRun(scope, limit, result)
 	case !force:
-		return emitSweepConfirm(scope, olderThan, pattern, result)
+		return emitSweepConfirm(scope, olderThan, pattern, limit, result)
 	}
 
 	commandDidWrite.Store(true)
@@ -354,7 +354,7 @@ func emitSweepDryRun(scope purgeScope, limit int, result issueops.SweepResult) e
 	return nil
 }
 
-func emitSweepConfirm(scope purgeScope, olderThan, pattern string, result issueops.SweepResult) error {
+func emitSweepConfirm(scope purgeScope, olderThan, pattern string, limit int, result issueops.SweepResult) error {
 	fmt.Printf("Found %d %s(s) to %s\n", result.Swept, scope.subjectNoun, scope.cmdName)
 	if result.Skipped.Pinned > 0 {
 		fmt.Printf("Skipping %d pinned bead(s)\n", result.Skipped.Pinned)
@@ -365,6 +365,17 @@ func emitSweepConfirm(scope purgeScope, olderThan, pattern string, result issueo
 	if result.Skipped.Referenced > 0 {
 		fmt.Println(ui.MutedStyle.Render(fmt.Sprintf("Skipping %d referenced bead(s)", result.Skipped.Referenced)))
 	}
+	return HandleErrorWithHint(
+		fmt.Sprintf("would %s %d bead(s)", scope.cmdName, result.Swept),
+		fmt.Sprintf("Use --force to confirm or --dry-run to preview.\n  %s", sweepConfirmHint(scope, olderThan, pattern, limit)))
+}
+
+// sweepConfirmHint is the command the confirmation suggests: the caller's own
+// selection with --force added. Every selector the caller gave is carried,
+// --limit among them — a hint that dropped the limit previewed one deletion
+// and, followed, deleted every eligible row, no-history beads included
+// (gf-c7n finding 2i; upstream main carries the same hint without the limit).
+func sweepConfirmHint(scope purgeScope, olderThan, pattern string, limit int) string {
 	hint := fmt.Sprintf("bd %s --force", scope.cmdName)
 	if scope.tier == issueops.SweepWispsPlane {
 		hint += " --wisps-plane"
@@ -375,9 +386,10 @@ func emitSweepConfirm(scope purgeScope, olderThan, pattern string, result issueo
 	if pattern != "" {
 		hint += " --pattern " + pattern
 	}
-	return HandleErrorWithHint(
-		fmt.Sprintf("would %s %d bead(s)", scope.cmdName, result.Swept),
-		fmt.Sprintf("Use --force to confirm or --dry-run to preview.\n  %s", hint))
+	if limit > 0 {
+		hint += fmt.Sprintf(" --limit %d", limit)
+	}
+	return hint
 }
 
 func emitSweepResult(scope purgeScope, limit int, result issueops.SweepResult) error {
