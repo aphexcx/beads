@@ -18,6 +18,9 @@ import (
 func expectSmartFiringGate(mock sqlmock.Sqlmock, current int) {
 	expectGateCurrentVersion(mock, current) // CurrentVersion
 	expectGateCurrentVersion(mock, current) // PendingVersions -> pending exists
+	if current >= forkPreMergeMainMax {
+		expectNoForkCursorPlan(mock)
+	}
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_remotes`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 }

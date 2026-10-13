@@ -114,6 +114,7 @@ func TestCheckRemoteMigrateGate(t *testing.T) {
 		defer db.Close()
 		expectGateCurrentVersion(mock, latest) // CurrentVersion
 		expectGateCurrentVersion(mock, latest) // PendingVersions -> no pending
+		expectNoForkCursorPlan(mock)
 		if err := CheckRemoteMigrateGate(context.Background(), db); err != nil {
 			t.Fatalf("at-latest DB should be allowed, got %v", err)
 		}
@@ -258,6 +259,7 @@ func TestCheckRemoteMigrateGateWithRemoteCheck(t *testing.T) {
 		defer db.Close()
 		expectGateCurrentVersion(mock, latest) // CurrentVersion
 		expectGateCurrentVersion(mock, latest) // PendingVersions -> none
+		expectNoForkCursorPlan(mock)
 
 		called := false
 		err := checkRemoteMigrateGate(context.Background(), db, "", func() bool {
@@ -367,4 +369,87 @@ func TestRemoteMigrateGateAdoptFastForward(t *testing.T) {
 	if !strings.Contains(msg, "losslessly") && !strings.Contains(msg, "loss-free") {
 		t.Errorf("UserMessage should explain the fast-forward is loss-free:\n%s", msg)
 	}
+}
+
+// A fork cursor at the binary's latest ordinal still has pending migrations
+// when reconciliation would remove its old fork ordinals. The gate must see
+// this before any cursor write, both for remote ancestry and shared consent.
+func TestRemoteMigrateGateBeforeForkCursorRewrite(t *testing.T) {
+	for _, mode := range []string{"behind", "diverged", "shared", "consented"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv(SmartGateEnv, "1")
+			t.Setenv(AllowRemoteMigrateEnv, "0")
+			if mode == "consented" {
+				t.Setenv(AllowRemoteMigrateEnv, "1")
+			}
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			expectGateCurrentVersion(mock, 73)
+			expectGateCurrentVersion(mock, 73)
+			expectPendingForkCursorPlan(t, mock)
+			remotes := 1
+			if mode == "shared" {
+				remotes = 0
+			}
+			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_remotes`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(remotes))
+			fa := &fakeAdopter{ancestorResult: mode == "behind", cleanResult: true}
+			if mode == "diverged" {
+				fa.withAheadBehind = true
+				fa.aheadResult, fa.behindResult = 1, 1
+			}
+			if mode == "behind" || mode == "diverged" {
+				hashes := map[int]string{73: "fork-hash"}
+				expectSmartRemoteRead(mock, hashes, hashes)
+			}
+			err = checkRemoteMigrateGate(context.Background(), db, "", nil, fa.adopter(), mode == "shared")
+			if mode == "consented" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				var gateErr *RemoteMigrateGateError
+				if !errors.As(err, &gateErr) {
+					t.Fatalf("expected migration refusal before any write, got %v", err)
+				}
+				if gateErr.Pending != 15 {
+					t.Fatalf("pending = %d, want all 15 migrations after the remaining cursor 55", gateErr.Pending)
+				}
+				if mode != "shared" && gateErr.FallbackReason != fallbackReasonDataBehind {
+					t.Fatalf("fallback = %q, want data-behind", gateErr.FallbackReason)
+				}
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func expectPendingForkCursorPlan(t *testing.T, mock sqlmock.Sqlmock) {
+	t.Helper()
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectUpmergeMainVerification(t, mock)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
+	expectMaxVersion(mock, "ignored_schema_migrations", 22)
+	expectTableProbe(mock, "linear_issue_snapshots", true)
+	expectTableProbe(mock, "linear_project_snapshots", true)
+	expectColumnProbe(mock, "wisp_comments", "external_ref", true)
+	expectHasContentHashColumn(mock, "ignored_schema_migrations", true)
+	for _, v := range []int{20, 21, 22} {
+		expectRecordedHash(mock, "ignored_schema_migrations", v, forkFileHash(t, ignoredSource, upmergeRenumberedIgnoredFiles[v]))
+	}
+	mock.ExpectQuery(`SELECT version FROM schema_migrations`).WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(55).AddRow(70).AddRow(71).AddRow(72).AddRow(73))
+}
+
+func expectNoForkCursorPlan(mock sqlmock.Sqlmock) {
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
+	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
+	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
+	expectNoUpstreamIgnoredBase(mock)
 }

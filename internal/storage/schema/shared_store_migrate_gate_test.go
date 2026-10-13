@@ -118,12 +118,12 @@ func TestSharedStoreGateNoRemote(t *testing.T) {
 		defer db.Close()
 		expectGateCurrentVersion(mock, latest) // CurrentVersion
 		expectGateCurrentVersion(mock, latest) // PendingVersions -> none
+		expectNoForkCursorPlan(mock)
 
 		if err := sharedGate(t, mock, db); err != nil {
 			t.Fatalf("converged shared database must be allowed, got %v", err)
 		}
 	})
-
 	t.Run("verb consent unlocks with a warning", func(t *testing.T) {
 		resetConsent(t)
 		t.Setenv(AllowRemoteMigrateEnv, "0")

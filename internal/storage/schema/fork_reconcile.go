@@ -1419,3 +1419,48 @@ func tableExists(ctx context.Context, db DBConn, table string) (bool, error) {
 	}
 	return count > 0, nil
 }
+
+// mainVersionAfterForkReconcile projects the verified rewrite plan over the
+// existing cursor rows. A gap below the deleted range is significant: a
+// pre-upmerge cursor loses 70-73 and falls back to 55, not 69.
+func mainVersionAfterForkReconcile(ctx context.Context, db DBConn, current int) (int, error) {
+	rewrites, err := planForkLineageCursors(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	var mainRewrites []cursorRewrite
+	for _, rewrite := range rewrites {
+		if rewrite.table == mainSource.cursorTable {
+			mainRewrites = append(mainRewrites, rewrite)
+		}
+	}
+	if len(mainRewrites) == 0 {
+		return current, nil
+	}
+	rows, err := db.QueryContext(ctx, "SELECT version FROM schema_migrations")
+	if err != nil {
+		return 0, fmt.Errorf("projecting fork cursor rewrites: %w", err)
+	}
+	defer rows.Close()
+	remaining := 0
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return 0, fmt.Errorf("reading fork cursor version: %w", err)
+		}
+		removed := false
+		for _, rewrite := range mainRewrites {
+			if version >= rewrite.lo && version <= rewrite.hi {
+				removed = true
+				break
+			}
+		}
+		if !removed && version > remaining {
+			remaining = version
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("reading fork cursor versions: %w", err)
+	}
+	return remaining, nil
+}

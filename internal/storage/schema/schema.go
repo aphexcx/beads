@@ -571,8 +571,20 @@ func CurrentIgnoredVersion(ctx context.Context, db DBConn) (int, error) {
 	return ignoredSource.currentVersion(ctx, db)
 }
 
+// PendingVersions includes migrations made pending by a verified fork cursor
+// reconciliation, without applying that reconciliation or writing any state.
 func PendingVersions(ctx context.Context, db DBConn) ([]int, error) {
-	return mainSource.pendingVersions(ctx, db)
+	current, err := mainSource.currentVersion(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if current >= forkPreMergeMainMax {
+		current, err = mainVersionAfterForkReconcile(ctx, db, current)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return mainSource.pendingVersionsAfter(current), nil
 }
 
 func PendingIgnoredVersions(ctx context.Context, db DBConn) ([]int, error) {
@@ -1553,6 +1565,10 @@ func (m migrationSource) pendingVersions(ctx context.Context, db DBConn) ([]int,
 	if err != nil {
 		return nil, err
 	}
+	return m.pendingVersionsAfter(current), nil
+}
+
+func (m migrationSource) pendingVersionsAfter(current int) []int {
 	files := m.list()
 	pending := make([]int, 0, len(files))
 	for _, mf := range files {
@@ -1560,7 +1576,7 @@ func (m migrationSource) pendingVersions(ctx context.Context, db DBConn) ([]int,
 			pending = append(pending, mf.version)
 		}
 	}
-	return pending, nil
+	return pending
 }
 
 func (m migrationSource) pendingMigrationDirtyTables(ctx context.Context, db DBConn, dirtyBefore map[string]dirtyTableState) ([]string, error) {
