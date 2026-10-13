@@ -20,6 +20,13 @@ func expectSharedGateProbe(mock sqlmock.Sqlmock, current, remotes int) {
 		mock.ExpectQuery(regexp.QuoteMeta("SELECT COALESCE(MAX(version), 0) FROM schema_migrations")).
 			WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(current))
 	}
+	if current >= 54 {
+		// These fixtures use upstream ordinals, with no fork fingerprints.
+		for _, version := range []int{54, 73} {
+			mock.ExpectQuery(regexp.QuoteMeta("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")).
+				WithArgs(version).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+		}
+	}
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_remotes`).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(remotes))
 }
