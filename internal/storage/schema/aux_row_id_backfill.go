@@ -299,6 +299,24 @@ func clearAuxRekeyDrifted(ctx context.Context, db DBConn) error {
 type auxRekeyTable struct {
 	name    string
 	columns string
+	// pinned names the columns whose value the rewrite must carry across
+	// unchanged although it never names them in the SET list: a column with
+	// an ON UPDATE CURRENT_TIMESTAMP attribute is re-stamped by the engine on
+	// ANY update of its row, so the id rewrite alone moved it to the time of
+	// this clone's migration pass. On comments that undid the deterministic
+	// updated_at backfill of migration 0072 on every store whose pass still
+	// owed a re-key (a main cursor below 61 with ignored 0018 pending, or a
+	// crash/drift resume), and two independently upgraded replicas then
+	// disagreed on identical rows (gf-xid finding 2f). Assigning the column
+	// to itself in the same statement is the SQL-standard way to suppress
+	// the automatic stamp (MySQL: an explicit assignment, its current value
+	// included, takes precedence over ON UPDATE), and it is byte-identical
+	// across clones because it writes nothing new. The rewrite pins a
+	// column only when the table has it, so a schema from before the column
+	// shipped is rewritten as before. Not part of the id derivation: the
+	// digest reads `columns` only, and `pinned` must never be added there
+	// (it would change every derived id).
+	pinned []string
 }
 
 // auxRekeyTables covers the four synced tables whose 0037 backfill randomized
@@ -315,6 +333,9 @@ var auxRekeyTables = []auxRekeyTable{
 	{
 		name:    "comments",
 		columns: "issue_id, author, text, CAST(created_at AS CHAR)",
+		// 0072's comments.updated_at carries ON UPDATE CURRENT_TIMESTAMP; the
+		// other three tables have no automatically stamped column.
+		pinned: []string{"updated_at"},
 	},
 	{
 		name:    "issue_snapshots",
@@ -647,13 +668,38 @@ func rekeyAuxRowTable(ctx context.Context, db DBConn, t auxRekeyTable) (bool, er
 	}
 	// Deterministic UPDATE order (groups is a map) so runs are reproducible.
 	sort.Slice(todo, func(i, j int) bool { return todo[i].oldID < todo[j].oldID })
+	if len(todo) == 0 {
+		return false, nil
+	}
 
+	stmt, err := auxRekeyUpdateStatement(ctx, db, t)
+	if err != nil {
+		return false, err
+	}
 	for _, r := range todo {
-		//nolint:gosec // G201: table name is a hardcoded constant, never user input.
-		if _, err := db.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET id = ? WHERE id = ?`, t.name),
-			r.newID, r.oldID); err != nil {
+		if _, err := db.ExecContext(ctx, stmt, r.newID, r.oldID); err != nil {
 			return true, fmt.Errorf("re-key id %s -> %s: %w", r.oldID, r.newID, err)
 		}
 	}
 	return len(todo) > 0, nil
+}
+
+// auxRekeyUpdateStatement renders the one UPDATE the rewrite issues per row of
+// t: the id, plus every pinned column the table currently has assigned to
+// itself, so an ON UPDATE CURRENT_TIMESTAMP attribute does not re-stamp the
+// row with this clone's migration time (see auxRekeyTable.pinned). The two
+// placeholders are the new id and the old id, in that order.
+func auxRekeyUpdateStatement(ctx context.Context, db DBConn, t auxRekeyTable) (string, error) {
+	set := "id = ?"
+	for _, column := range t.pinned {
+		has, err := columnExists(ctx, db, t.name, column)
+		if err != nil {
+			return "", fmt.Errorf("probing %s.%s before the re-key: %w", t.name, column, err)
+		}
+		if has {
+			set += ", " + column + " = " + column
+		}
+	}
+	//nolint:gosec // G201: table and column names come from the hardcoded auxRekeyTables, never user input.
+	return fmt.Sprintf(`UPDATE %s SET %s WHERE id = ?`, t.name, set), nil
 }

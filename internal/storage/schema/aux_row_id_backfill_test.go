@@ -136,6 +136,12 @@ func commentDigest(issueID, author, text, createdAt string) string {
 	return rowid.Digest([]sql.NullString{nstr(issueID), nstr(author), nstr(text), nstr(createdAt)})
 }
 
+// commentsRekeyUpdate is the statement the rewrite issues per comments row
+// once 0072's updated_at is present: the id, and updated_at assigned to itself
+// so the column's ON UPDATE CURRENT_TIMESTAMP does not re-stamp the row with
+// this clone's migration time (gf-xid finding 2f).
+const commentsRekeyUpdate = "UPDATE comments SET id = ?, updated_at = updated_at WHERE id = ?"
+
 func expectCommentsSelect(mock sqlmock.Sqlmock) *sqlmock.ExpectedQuery {
 	return mock.ExpectQuery(regexp.QuoteMeta(
 		"SELECT id, issue_id, author, text, CAST(created_at AS CHAR) FROM comments"))
@@ -158,11 +164,14 @@ func TestRekeyAuxRowTableConvergesRandomIDs(t *testing.T) {
 			AddRow("random-b", "bd-1", "steve", "second", "2026-06-09 12:00:01"))
 
 	// Updates are issued in sorted-old-id order, each to ordinal 0 of its own
-	// content group.
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE comments SET id = ? WHERE id = ?")).
+	// content group. comments.updated_at (0072) is probed once and pinned in
+	// every UPDATE so its ON UPDATE attribute does not re-stamp the row
+	// (gf-xid finding 2f).
+	expectColumnExists(mock, true)
+	mock.ExpectExec(regexp.QuoteMeta(commentsRekeyUpdate)).
 		WithArgs(rowid.New("comments", 0, commentDigest("bd-1", "steve", "first", "2026-06-09 12:00:00")), "random-a").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE comments SET id = ? WHERE id = ?")).
+	mock.ExpectExec(regexp.QuoteMeta(commentsRekeyUpdate)).
 		WithArgs(rowid.New("comments", 0, commentDigest("bd-1", "steve", "second", "2026-06-09 12:00:01")), "random-b").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -198,10 +207,11 @@ func TestRekeyAuxRowTableDuplicateRowsGetDistinctOrdinals(t *testing.T) {
 
 	// Free rows are assigned in sorted-current-id order: aaa-random takes
 	// ordinal 0, zzz-random takes ordinal 1.
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE comments SET id = ? WHERE id = ?")).
+	expectColumnExists(mock, true)
+	mock.ExpectExec(regexp.QuoteMeta(commentsRekeyUpdate)).
 		WithArgs(rowid.New("comments", 0, digest), "aaa-random").
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE comments SET id = ? WHERE id = ?")).
+	mock.ExpectExec(regexp.QuoteMeta(commentsRekeyUpdate)).
 		WithArgs(rowid.New("comments", 1, digest), "zzz-random").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -238,7 +248,8 @@ func TestRekeyAuxRowTableKeepsHeldTargetsStable(t *testing.T) {
 			AddRow("random-x", "bd-1", "steve", "same text", "2026-06-09 12:00:00"))
 
 	// The held row is untouched; the random row takes the remaining ordinal 0.
-	mock.ExpectExec(regexp.QuoteMeta("UPDATE comments SET id = ? WHERE id = ?")).
+	expectColumnExists(mock, true)
+	mock.ExpectExec(regexp.QuoteMeta(commentsRekeyUpdate)).
 		WithArgs(rowid.New("comments", 0, digest), "random-x").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -252,6 +263,62 @@ func TestRekeyAuxRowTableKeepsHeldTargetsStable(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("unmet sql expectations: %v", err)
 	}
+}
+
+// TestRekeyAuxRowTablePinsUpdatedAtOnlyWhenTheColumnExists pins the two
+// shapes of the comments UPDATE (gf-xid finding 2f): a schema that has 0072's
+// updated_at gets the column assigned to itself in the same statement, so the
+// engine's ON UPDATE CURRENT_TIMESTAMP cannot move the deterministic backfill
+// to this clone's migration time; a schema from before the column shipped is
+// rewritten with the id alone, exactly as before. The other three aux tables
+// pin nothing and issue no probe.
+func TestRekeyAuxRowTablePinsUpdatedAtOnlyWhenTheColumnExists(t *testing.T) {
+	digest := commentDigest("bd-1", "steve", "first", "2026-06-09 12:00:00")
+	for _, tc := range []struct {
+		name    string
+		present bool
+		stmt    string
+	}{
+		{"updated_at present", true, commentsRekeyUpdate},
+		{"updated_at absent", false, "UPDATE comments SET id = ? WHERE id = ?"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock.New: %v", err)
+			}
+			defer db.Close()
+			expectColumnExists(mock, true)
+			expectCommentsSelect(mock).
+				WillReturnRows(sqlmock.NewRows([]string{"id", "issue_id", "author", "text", "created_at"}).
+					AddRow("random-a", "bd-1", "steve", "first", "2026-06-09 12:00:00"))
+			mock.ExpectQuery(`SELECT COUNT\(\*\) FROM INFORMATION_SCHEMA\.COLUMNS`).
+				WithArgs("comments", "updated_at").
+				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(map[bool]int{true: 1, false: 0}[tc.present]))
+			mock.ExpectExec(regexp.QuoteMeta(tc.stmt)).
+				WithArgs(rowid.New("comments", 0, digest), "random-a").
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			if _, err := rekeyAuxRowTable(context.Background(), db, commentsTable); err != nil {
+				t.Fatalf("rekeyAuxRowTable: %v", err)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("unmet sql expectations: %v", err)
+			}
+		})
+	}
+	t.Run("only comments pins a column", func(t *testing.T) {
+		for _, table := range auxRekeyTables {
+			if table.name == "comments" {
+				if len(table.pinned) != 1 || table.pinned[0] != "updated_at" {
+					t.Fatalf("comments pins %v, want [updated_at]", table.pinned)
+				}
+				continue
+			}
+			if len(table.pinned) != 0 {
+				t.Fatalf("%s pins %v; no migration gives it an ON UPDATE column", table.name, table.pinned)
+			}
+		}
+	})
 }
 
 // TestRekeyAuxRowTableIdempotent verifies that when every row already carries a
