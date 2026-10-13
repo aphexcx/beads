@@ -288,8 +288,8 @@ func (s *DoltStore) demoteToWispInTx(ctx context.Context, tx *sql.Tx, id string,
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO wisp_comments (id, issue_id, author, text, created_at)
-		SELECT id, issue_id, author, text, created_at
+		INSERT IGNORE INTO wisp_comments (id, issue_id, author, text, created_at, updated_at)
+		SELECT id, issue_id, author, text, created_at, updated_at
 		FROM comments WHERE issue_id = ?
 	`, id); err != nil {
 		return fmt.Errorf("copy comments for demoted issue %s: %w", id, err)

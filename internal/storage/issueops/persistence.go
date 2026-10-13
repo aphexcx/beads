@@ -222,7 +222,9 @@ func persistenceColumns(table string) (string, string, error) {
 	case "events", "wisp_events":
 		return "id, issue_id, event_type, actor, old_value, new_value, comment, created_at", "issue_id", nil
 	case "comments", "wisp_comments":
-		return "id, issue_id, author, text, created_at", "issue_id", nil
+		// updated_at travels with the row: a copy between planes is the same
+		// comment, so it keeps the stamps it was written with (gf-d7b 2k).
+		return "id, issue_id, author, text, created_at, updated_at", "issue_id", nil
 	case "child_counters", "wisp_child_counters":
 		return "parent_id, last_child", "parent_id", nil
 	default:

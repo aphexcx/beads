@@ -95,8 +95,8 @@ func PromoteFromEphemeralInTx(ctx context.Context, tx DBTX, id string, actor str
 	}
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT IGNORE INTO comments (id, issue_id, author, text, created_at)
-		SELECT id, issue_id, author, text, created_at
+		INSERT IGNORE INTO comments (id, issue_id, author, text, created_at, updated_at)
+		SELECT id, issue_id, author, text, created_at, updated_at
 		FROM wisp_comments WHERE issue_id = ?
 	`, id); err != nil {
 		return fmt.Errorf("copy comments for promoted wisp %s: %w", id, err)

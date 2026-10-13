@@ -831,11 +831,13 @@ func PersistComments(ctx context.Context, tx DBTX, issue *types.Issue) (CreateIs
 		if exists > 0 {
 			continue
 		}
+		// updated_at = created_at explicitly, as InsertDerivedComment writes
+		// it: the imported row must be the same bytes on every replica.
 		//nolint:gosec // G201: table is determined by ephemeral flag
 		_, err := tx.ExecContext(ctx, fmt.Sprintf(`
-			INSERT INTO %s (id, issue_id, author, text, created_at)
-			VALUES (?, ?, ?, ?, ?)
-		`, commentTable), comment.ID, issue.ID, comment.Author, comment.Text, createdAtText)
+			INSERT INTO %s (id, issue_id, author, text, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, commentTable), comment.ID, issue.ID, comment.Author, comment.Text, createdAtText, createdAtText)
 		if err != nil {
 			return result, fmt.Errorf("failed to insert comment for %s: %w", issue.ID, err)
 		}

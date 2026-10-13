@@ -211,6 +211,12 @@ func NextLiveCommentTime(ctx context.Context, tx DBTX, table, issueID string, no
 // (issue_id, author, text, created_at) rather than insert a duplicate. It
 // returns the surviving row's id and whether it already existed.
 //
+// updated_at is written explicitly as created_at, never left to the column's
+// CURRENT_TIMESTAMP default: a comment is immutable, so the row is a pure
+// function of its content on every replica — the same comment imported on
+// two clones at different wall times is the same row, and their merge has
+// nothing to resolve (gf-d7b finding 2k).
+//
 //nolint:gosec // G201: table is a hardcoded routing constant at every call site.
 func InsertDerivedComment(ctx context.Context, tx DBTX, table, issueID, author, text, createdAt string) (id string, existed bool, err error) {
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
@@ -227,9 +233,9 @@ func InsertDerivedComment(ctx context.Context, tx DBTX, table, issueID, author, 
 	digest := rowid.Digest([]sql.NullString{str(issueID), str(author), str(text), str(createdAt)})
 	id = rowid.New(table, 0, digest)
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (id, issue_id, author, text, created_at)
-		VALUES (?, ?, ?, ?, ?)`, table),
-		id, issueID, author, text, createdAt); err != nil {
+		INSERT INTO %s (id, issue_id, author, text, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`, table),
+		id, issueID, author, text, createdAt, createdAt); err != nil {
 		return "", false, fmt.Errorf("add comment to %s: %w", table, err)
 	}
 	return id, false, nil

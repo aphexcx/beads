@@ -159,11 +159,13 @@ func (r *commentSQLRepositoryImpl) InsertRecord(ctx context.Context, comment *ty
 		}
 		copy.ID = id
 	} else {
+		// updated_at = created_at explicitly, as InsertDerivedComment writes
+		// it: the row must be the same bytes on every replica (gf-d7b 2k).
 		//nolint:gosec // G201: commentTable is one of two hardcoded constants
 		if _, err := r.runner.ExecContext(ctx, fmt.Sprintf(`
-			INSERT INTO %s (id, issue_id, author, text, created_at)
-			VALUES (?, ?, ?, ?, ?)
-		`, commentTable), copy.ID, copy.IssueID, copy.Author, copy.Text, createdAtText); err != nil {
+			INSERT INTO %s (id, issue_id, author, text, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, commentTable), copy.ID, copy.IssueID, copy.Author, copy.Text, createdAtText, createdAtText); err != nil {
 			return nil, fmt.Errorf("db: CommentSQLRepository.InsertRecord: %w", err)
 		}
 	}
