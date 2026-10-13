@@ -1424,14 +1424,16 @@ func tableExists(ctx context.Context, db DBConn, table string) (bool, error) {
 // existing cursor rows. A gap below the deleted range is significant: a
 // pre-upmerge cursor loses 70-73 and falls back to 55, not 69.
 func mainVersionAfterForkReconcile(ctx context.Context, db DBConn, current int) (int, error) {
-	rewrites, err := planForkLineageCursors(ctx, db)
-	if err != nil {
-		return 0, err
-	}
+	// Pending main work must not validate clone-local ignored tables. The
+	// migration path verifies every chain before applying any rewrite.
 	var mainRewrites []cursorRewrite
-	for _, rewrite := range rewrites {
-		if rewrite.table == mainSource.cursorTable {
-			mainRewrites = append(mainRewrites, rewrite)
+	for _, plan := range []func(context.Context, DBConn) (*cursorRewrite, error){planForkMainCursor, planUpmergeMainCursor} {
+		rewrite, err := plan(ctx, db)
+		if err != nil {
+			return 0, err
+		}
+		if rewrite != nil {
+			mainRewrites = append(mainRewrites, *rewrite)
 		}
 	}
 	if len(mainRewrites) == 0 {

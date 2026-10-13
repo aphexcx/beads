@@ -431,25 +431,38 @@ func TestRemoteMigrateGateBeforeForkCursorRewrite(t *testing.T) {
 func expectPendingForkCursorPlan(t *testing.T, mock sqlmock.Sqlmock) {
 	t.Helper()
 	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
-	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectUpmergeMainVerification(t, mock)
-	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 1)
-	expectCursorRowProbe(mock, "ignored_schema_migrations", 14, 0)
-	expectMaxVersion(mock, "ignored_schema_migrations", 22)
-	expectTableProbe(mock, "linear_issue_snapshots", true)
-	expectTableProbe(mock, "linear_project_snapshots", true)
-	expectColumnProbe(mock, "wisp_comments", "external_ref", true)
-	expectHasContentHashColumn(mock, "ignored_schema_migrations", true)
-	for _, v := range []int{20, 21, 22} {
-		expectRecordedHash(mock, "ignored_schema_migrations", v, forkFileHash(t, ignoredSource, upmergeRenumberedIgnoredFiles[v]))
-	}
 	mock.ExpectQuery(`SELECT version FROM schema_migrations`).WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(55).AddRow(70).AddRow(71).AddRow(72).AddRow(73))
 }
 
 func expectNoForkCursorPlan(mock sqlmock.Sqlmock) {
 	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
-	expectSchemaTableExists(mock, ignoredSource.cursorTable, true)
 	expectCursorRowProbe(mock, "schema_migrations", 73, 0)
-	expectCursorRowProbe(mock, "ignored_schema_migrations", 22, 0)
-	expectNoUpstreamIgnoredBase(mock)
+}
+
+// Ignored tables are clone-local and may be incomplete. Reading or committing
+// without migrating must still receive the typed remote gate, which those
+// callers can tolerate, instead of an unrelated ignored-chain validation error.
+func TestRemoteGateMainProjectionDoesNotValidateIgnoredTables(t *testing.T) {
+	t.Setenv(SmartGateEnv, "0")
+	t.Setenv(AllowRemoteMigrateEnv, "0")
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	expectGateCurrentVersion(mock, 73)
+	expectGateCurrentVersion(mock, 73)
+	expectCursorRowProbe(mock, "schema_migrations", 54, 0)
+	expectUpmergeMainVerification(t, mock)
+	mock.ExpectQuery(`SELECT version FROM schema_migrations`).WillReturnRows(sqlmock.NewRows([]string{"version"}).AddRow(55).AddRow(73))
+	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM dolt_remotes`).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	err = CheckRemoteMigrateGate(context.Background(), db)
+	var gateErr *RemoteMigrateGateError
+	if !errors.As(err, &gateErr) {
+		t.Fatalf("want typed gate refusal, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
