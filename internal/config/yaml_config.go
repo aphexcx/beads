@@ -967,12 +967,17 @@ func commentOutYamlKey(content, key string) string {
 	segments := strings.Split(key, ".")
 
 	var result []string
-	// depth tracks how many segments of the key have been matched so far, and
-	// indents holds the indentation each was found at, so a key is only
-	// commented out when it is nested under its OWN parents rather than under
-	// some other section that happens to share a leaf name.
-	depth := 0
-	var indents []int
+	// parents is the full ancestry of the current line: every mapping key
+	// still open above it, by indentation. A key line first closes the
+	// entries at or deeper than its own indentation and then, unless it is
+	// the key being unset, opens itself. The key is commented out only when
+	// the names on that stack are exactly the requested path's parents —
+	// never when an intermediate parent went unmatched. Tracking the matched
+	// segments alone let sync.backup.remote, listed before sync.remote, be
+	// taken for sync.remote: the backup's setting was removed and the
+	// requested one left live (gf-c7n finding 2j; the gf-xid vs-integrated
+	// gate at yaml_config.go:1019).
+	var parents []yamlOpenKey
 	// blockIndent is the indentation of the key that opened a literal or folded
 	// block scalar, or -1 outside one. Everything indented past that key is the
 	// value the user typed, not structure: `notes: |` with an indented
@@ -1010,31 +1015,47 @@ func commentOutYamlKey(content, key string) string {
 
 		if len(segments) > 1 {
 			if name, indent, ok := yamlKeyOnLine(line); ok {
-				// Leaving a block: drop every segment matched at an indent at
-				// or deeper than this line's.
-				for depth > 0 && indent <= indents[depth-1] {
-					depth--
-					indents = indents[:depth]
+				// Leaving a block: close every key opened at an indent at or
+				// deeper than this line's.
+				for len(parents) > 0 && indent <= parents[len(parents)-1].indent {
+					parents = parents[:len(parents)-1]
 				}
-				if depth < len(segments) && name == segments[depth] {
-					if depth == len(segments)-1 {
-						result = append(result, strings.Repeat(" ", indent)+"# "+strings.TrimLeft(line, " \t"))
-						depth, indents = 0, nil
-						if yamlValueContinuesBelow(line) {
-							i = commentOutYamlValueBlock(&result, lines, i+1, indent) - 1
-							blockIndent = -1
-						}
-						continue
+				if name == segments[len(segments)-1] && yamlAncestryIs(parents, segments[:len(segments)-1]) {
+					result = append(result, strings.Repeat(" ", indent)+"# "+strings.TrimLeft(line, " \t"))
+					if yamlValueContinuesBelow(line) {
+						i = commentOutYamlValueBlock(&result, lines, i+1, indent) - 1
+						blockIndent = -1
 					}
-					indents = append(indents, indent)
-					depth++
+					continue
 				}
+				parents = append(parents, yamlOpenKey{name: name, indent: indent})
 			}
 		}
 		result = append(result, line)
 	}
 
 	return strings.Join(result, "\n")
+}
+
+// yamlOpenKey is a mapping key still open above the line being scanned, with
+// the indentation it was declared at.
+type yamlOpenKey struct {
+	name   string
+	indent int
+}
+
+// yamlAncestryIs reports whether the open keys above a line are, name for
+// name and nothing more, the parents of the requested dotted path.
+func yamlAncestryIs(parents []yamlOpenKey, path []string) bool {
+	if len(parents) != len(path) {
+		return false
+	}
+	for i, p := range parents {
+		if p.name != path[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // blockScalarIndent reports the indentation of a key whose value is a literal
